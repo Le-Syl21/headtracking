@@ -1,9 +1,10 @@
 //! Kinect v1 head tracker backend (libfreenect via the `freenect` crate).
 //!
-//! Same blob-centroid algorithm as the v2 backend, adapted for v1's u16
-//! depth frames. libfreenect doesn't expose factory intrinsics, so we use
-//! the published Microsoft nominal values; per-cab calibration can refine
-//! them later via `tools/ht-calibrate`.
+//! Same algorithm as the v2 backend (face detection on the colour stream
+//! → median depth inside the bbox → IR deprojection), adapted for v1's
+//! 640×480 sensor and u16 depth frames. libfreenect doesn't expose
+//! factory intrinsics, so we use the published Microsoft nominal values;
+//! per-cab calibration can refine them later via `tools/ht-calibrate`.
 //!
 //! Untested on hardware (Sylvain only has a v2 sensor). Compile-time
 //! parity is what we check in CI; hardware runs come later.
@@ -14,29 +15,36 @@ use tracing::{info, warn};
 
 use freenect::{CX, CY, Context, DEPTH_HEIGHT, DEPTH_WIDTH, DepthFrame, Device, FX, FY};
 
+use super::face_depth::{Intrinsics, head_from_face_depth, pick_largest_face};
 use super::{HeadTracker, Pose};
 
-const DEPTH_MIN_MM: u16 = 500;
-const DEPTH_MAX_MM: u16 = 2_500;
-const WINDOW_HALF: i32 = 25;
-const MIN_VALID_PIXELS: u32 = 100;
+/// Kinect v1 RGB and depth share the same 640×480 grid (different sensors,
+/// same factory framing); the linear rescale in `head_from_face_depth`
+/// becomes identity.
+const RGB_W: u32 = DEPTH_WIDTH;
+const RGB_H: u32 = DEPTH_HEIGHT;
 
 pub struct KinectV1Backend {
     // Drop order (declaration order): device first, then context.
     device: Device,
     _ctx: Context,
+    intrinsics: Intrinsics,
+    detector: face::Detector,
+    last_faces: Vec<face::FaceDetection>,
+    last_depth: Vec<f32>,
     started_at: Instant,
 }
 
 impl KinectV1Backend {
-    pub fn open() -> Result<Self, freenect::Error> {
+    pub fn open() -> Result<Self, Error> {
         let ctx = Context::new()?;
         let count = ctx.enumerate();
         if count <= 0 {
-            return Err(freenect::Error::NoDevice);
+            return Err(Error::Freenect(freenect::Error::NoDevice));
         }
         let mut device = ctx.open(0)?;
         device.start()?;
+        let detector = face::Detector::new()?;
         info!(
             n_devices = count,
             fx = FX,
@@ -48,79 +56,58 @@ impl KinectV1Backend {
         Ok(Self {
             device,
             _ctx: ctx,
+            intrinsics: Intrinsics {
+                fx: FX,
+                fy: FY,
+                cx: CX,
+                cy: CY,
+            },
+            detector,
+            last_faces: Vec::new(),
+            last_depth: Vec::new(),
             started_at: Instant::now(),
         })
     }
 
-    fn frame_to_pose(&self, frame: &DepthFrame) -> Option<Pose> {
+    fn refresh_face_from_rgb(&mut self) {
+        if let Some(rgb) = self.device.poll_rgb() {
+            // libfreenect's RGB stream is already RGB888 at 640×480.
+            self.last_faces = self.detector.detect(&rgb.data, rgb.width, rgb.height);
+        }
+    }
+
+    fn frame_to_pose(&mut self, frame: &DepthFrame) -> Option<Pose> {
         debug_assert_eq!(frame.width, DEPTH_WIDTH);
         debug_assert_eq!(frame.height, DEPTH_HEIGHT);
-        let w = DEPTH_WIDTH as i32;
-        let h = DEPTH_HEIGHT as i32;
 
-        // Pass 1: closest valid pixel in the play range.
-        let valid_range = DEPTH_MIN_MM..=DEPTH_MAX_MM;
-        let mut min_z: u16 = u16::MAX;
-        let mut min_idx: i32 = -1;
-        for (i, &z) in frame.data.iter().enumerate() {
-            if !valid_range.contains(&z) {
-                continue;
-            }
-            if z < min_z {
-                min_z = z;
-                min_idx = i as i32;
-            }
-        }
-        if min_idx < 0 {
-            return None;
-        }
-        let cu = min_idx % w;
-        let cv = min_idx / w;
+        // Widen u16 mm into f32 once per frame; reuse the buffer to avoid
+        // per-frame allocation.
+        self.last_depth.clear();
+        self.last_depth.reserve(frame.data.len());
+        self.last_depth
+            .extend(frame.data.iter().map(|&z| f32::from(z)));
 
-        // Pass 2: average valid pixels in a 50x50 window inside a 150 mm
-        // depth slab around the closest sample.
-        let z_max = min_z.saturating_add(150);
-        let mut sum_x = 0.0_f64;
-        let mut sum_y = 0.0_f64;
-        let mut sum_z = 0.0_f64;
-        let mut count: u32 = 0;
-        let u0 = (cu - WINDOW_HALF).max(0);
-        let u1 = (cu + WINDOW_HALF).min(w - 1);
-        let v0 = (cv - WINDOW_HALF).max(0);
-        let v1 = (cv + WINDOW_HALF).min(h - 1);
-        for v in v0..=v1 {
-            let row = (v * w) as usize;
-            for u in u0..=u1 {
-                let z = frame.data[row + u as usize];
-                if z < DEPTH_MIN_MM || z > z_max {
-                    continue;
-                }
-                let zf = f64::from(z);
-                let x = f64::from(u as f32 - CX) * zf / f64::from(FX);
-                let y = f64::from(v as f32 - CY) * zf / f64::from(FY);
-                sum_x += x;
-                sum_y += y;
-                sum_z += zf;
-                count += 1;
-            }
-        }
-        if count < MIN_VALID_PIXELS {
-            return None;
-        }
-        let n = f64::from(count);
-        let timestamp_us = self.started_at.elapsed().as_micros() as u64;
-        let area = ((u1 - u0 + 1) * (v1 - v0 + 1)) as f32;
-        let confidence = (count as f32 / area).clamp(0.0, 1.0);
+        let face = pick_largest_face(&self.last_faces)?;
+        let xyz = head_from_face_depth(
+            face,
+            RGB_W,
+            RGB_H,
+            &self.last_depth,
+            frame.width,
+            frame.height,
+            &self.intrinsics,
+        )?;
         Some(Pose {
-            position_mm: [(sum_x / n) as f32, (sum_y / n) as f32, (sum_z / n) as f32],
-            timestamp_us,
-            confidence,
+            position_mm: xyz,
+            timestamp_us: self.started_at.elapsed().as_micros() as u64,
+            confidence: face.confidence.clamp(0.0, 1.0),
         })
     }
 }
 
 impl HeadTracker for KinectV1Backend {
     fn poll(&mut self) -> Option<Pose> {
+        self.refresh_face_from_rgb();
         let frame = self.device.poll_depth()?;
         self.frame_to_pose(&frame)
     }
@@ -134,4 +121,12 @@ impl HeadTracker for KinectV1Backend {
             warn!(?e, "kinect-v1: stop failed");
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("libfreenect: {0}")]
+    Freenect(#[from] freenect::Error),
+    #[error("face detector init: {0}")]
+    Face(#[from] face::Error),
 }

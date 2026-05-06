@@ -25,14 +25,17 @@ description = "Head tracking plugin for Visual Pinball X 10.8.1+"
 
 [lib]
 # `cdylib` so VPX's plugin loader can dlopen us; `rlib` so workspace
-# binaries (`ht-debug`, `ht-calibrate`) can pull the shared algorithms
+# binaries (`headtracking-demo`, `ht-calibrate`) can pull the shared algorithms
 # (one-euro filter, lockbar detection, …) without duplication.
 crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-kinect-v1 = ["dep:freenect"]
-kinect-v2 = ["dep:freenect2"]
+# Each Kinect backend pulls the face-detection crate alongside libfreenect[2]
+# — the depth-blob heuristic was retired in favour of YuNet bbox + face-anchored
+# depth median, which means no Kinect path compiles without `face`.
+kinect-v1 = ["dep:freenect", "dep:face"]
+kinect-v2 = ["dep:freenect2", "dep:face"]
 all-trackers = ["kinect-v1", "kinect-v2"]
 
 [dependencies]
@@ -44,6 +47,7 @@ nalgebra = "0.33"
 thiserror = "2"
 freenect = { path = "crates/freenect", optional = true }
 freenect2 = { path = "crates/freenect2", optional = true }
+face = { path = "crates/face", optional = true }
 
 [build-dependencies]
 bindgen = "0.71"

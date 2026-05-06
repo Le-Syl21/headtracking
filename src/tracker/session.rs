@@ -15,7 +15,7 @@ use super::kinect_v1::KinectV1Backend;
 #[cfg(feature = "kinect-v2")]
 use super::kinect_v2::KinectV2Backend;
 use super::{HeadTracker, Pose};
-use crate::filter::OneEuroPose3D;
+use crate::filter::{OneEuroParams, OneEuroPose3D};
 
 /// Owns the tracker thread and exposes the latest pose.
 ///
@@ -79,7 +79,17 @@ impl TrackerSession {
             .name(format!("headtracking-{backend_name}"))
             .spawn(move || {
                 info!(backend = backend_name, "tracker thread started");
-                let mut filter = OneEuroPose3D::with_defaults();
+                // Per-axis 1€ params: X/Y use the library defaults; Z gets a
+                // tighter cutoff because depth-camera readings are inherently
+                // noisier (the median over a small bbox window fluctuates as
+                // the face shifts a pixel or two between frames).
+                let xy = OneEuroParams::default();
+                let z = OneEuroParams {
+                    min_cutoff_hz: 0.4,
+                    beta: 0.05,
+                    derivative_cutoff_hz: 1.0,
+                };
+                let mut filter = OneEuroPose3D::new_per_axis([xy, xy, z]);
                 while !stop_for_thread.load(Ordering::Relaxed) {
                     if let Some(raw) = backend.poll() {
                         let smoothed = filter.update(raw.position_mm, raw.timestamp_us);
@@ -134,11 +144,11 @@ pub enum SpawnError {
 
     #[cfg(feature = "kinect-v2")]
     #[error("Kinect v2 open failed: {0}")]
-    OpenKinectV2(#[from] freenect2::Error),
+    OpenKinectV2(#[from] super::kinect_v2::Error),
 
     #[cfg(feature = "kinect-v1")]
     #[error("Kinect v1 open failed: {0}")]
-    OpenKinectV1(#[from] freenect::Error),
+    OpenKinectV1(#[from] super::kinect_v1::Error),
 
     #[error("failed to spawn tracker thread: {0}")]
     Spawn(std::io::Error),

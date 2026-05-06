@@ -1,5 +1,7 @@
 //! Head tracker abstraction shared by Kinect v1/v2 and webcam backends.
 
+#[cfg(any(feature = "kinect-v1", feature = "kinect-v2"))]
+pub mod face_depth;
 #[cfg(feature = "kinect-v1")]
 pub mod kinect_v1;
 #[cfg(feature = "kinect-v2")]
