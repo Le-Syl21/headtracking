@@ -161,6 +161,9 @@ struct Active {
     v1_controls: Option<V1Controls>,
     pose_filter: filter_alias::OneEuroPose3D,
     started_at: Instant,
+    /// Run lockbar detection on each depth frame and overlay it.
+    lockbar_enabled: bool,
+    last_lockbar: Option<headtracking::calibration::LockbarObservation>,
 }
 
 mod filter_alias {
@@ -329,6 +332,14 @@ impl App {
                     );
                     capture_baseline(&mut active.baseline, smoothed);
                     active.last_head = smoothed;
+                    if active.lockbar_enabled {
+                        active.last_lockbar = headtracking::calibration::detect_lockbar(
+                            &depth.data,
+                            depth.width,
+                            depth.height,
+                            &headtracking::calibration::LockbarParams::default(),
+                        );
+                    }
                 }
             }
             Inner::KinectV1 { device, .. } => {
@@ -349,6 +360,14 @@ impl App {
                     );
                     capture_baseline(&mut active.baseline, smoothed);
                     active.last_head = smoothed;
+                    if active.lockbar_enabled {
+                        active.last_lockbar = headtracking::calibration::detect_lockbar(
+                            &f32_data,
+                            depth.width,
+                            depth.height,
+                            &headtracking::calibration::LockbarParams::default(),
+                        );
+                    }
                 }
             }
             Inner::Webcam { camera } => {
@@ -548,6 +567,29 @@ impl eframe::App for App {
                     self.refresh_available();
                 }
                 ui.separator();
+                if let Some(active) = self.active.as_mut()
+                    && active.inner.has_head_tracker()
+                {
+                    ui.checkbox(&mut active.lockbar_enabled, "lockbar");
+                    if !active.lockbar_enabled {
+                        active.last_lockbar = None;
+                    }
+                    if let Some(bar) = active.last_lockbar {
+                        ui.label(
+                            RichText::new(format!(
+                                "row {}, width {} px, depth {:.0} mm (σ {:.1})",
+                                bar.row,
+                                bar.width_px(),
+                                bar.mean_depth_mm,
+                                bar.depth_stddev_mm,
+                            ))
+                            .color(Color32::from_rgb(0xff, 0x40, 0x80))
+                            .monospace()
+                            .size(11.0),
+                        );
+                    }
+                    ui.separator();
+                }
                 if let Some(active) = self.active.as_ref() {
                     let label = self.label_for(active.backend);
                     if !active.inner.has_head_tracker() {
@@ -730,6 +772,9 @@ impl eframe::App for App {
                     if let Some(head) = active.last_head {
                         draw_crosshair(ui.painter(), rect, head);
                     }
+                    if let Some(bar) = active.last_lockbar {
+                        draw_lockbar(ui.painter(), rect, bar);
+                    }
                 } else {
                     centered(ui, rect, "waiting for first RGB frame…");
                 }
@@ -754,6 +799,38 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
         text,
         egui::FontId::proportional(16.0),
         Color32::LIGHT_GRAY,
+    );
+}
+
+fn draw_lockbar(
+    painter: &egui::Painter,
+    rect: Rect,
+    bar: headtracking::calibration::LockbarObservation,
+) {
+    if bar.frame_width == 0 || bar.frame_height == 0 {
+        return;
+    }
+    // Same caveat as the head crosshair: depth frame and RGB frame on the
+    // Kinect v2 are not co-axial, so the bar visualisation is a few pixels
+    // off the true RGB position. Good enough for "is it locked on?".
+    let v_norm = bar.row as f32 / bar.frame_height as f32;
+    let l_norm = bar.left_col as f32 / bar.frame_width as f32;
+    let r_norm = bar.right_col as f32 / bar.frame_width as f32;
+    let p_left = rect.left_top() + Vec2::new(l_norm * rect.width(), v_norm * rect.height());
+    let p_right = rect.left_top() + Vec2::new(r_norm * rect.width(), v_norm * rect.height());
+    let pink = Color32::from_rgb(0xff, 0x40, 0x80);
+    painter.line_segment([p_left, p_right], Stroke::new(3.0, pink));
+    // Tick marks at each end.
+    painter.line_segment(
+        [p_left + Vec2::new(0.0, -8.0), p_left + Vec2::new(0.0, 8.0)],
+        Stroke::new(2.0, pink),
+    );
+    painter.line_segment(
+        [
+            p_right + Vec2::new(0.0, -8.0),
+            p_right + Vec2::new(0.0, 8.0),
+        ],
+        Stroke::new(2.0, pink),
     );
 }
 
@@ -817,6 +894,8 @@ fn open_kinect_v2() -> Result<Active, String> {
         v1_controls: None,
         pose_filter: filter_alias::OneEuroPose3D::with_defaults(),
         started_at: Instant::now(),
+        lockbar_enabled: false,
+        last_lockbar: None,
     })
 }
 
@@ -862,6 +941,8 @@ fn open_kinect_v1() -> Result<Active, String> {
         v1_controls: Some(controls),
         pose_filter: filter_alias::OneEuroPose3D::with_defaults(),
         started_at: Instant::now(),
+        lockbar_enabled: false,
+        last_lockbar: None,
     })
 }
 
@@ -884,6 +965,8 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         v1_controls: None,
         pose_filter: filter_alias::OneEuroPose3D::with_defaults(),
         started_at: Instant::now(),
+        lockbar_enabled: false,
+        last_lockbar: None,
     })
 }
 
