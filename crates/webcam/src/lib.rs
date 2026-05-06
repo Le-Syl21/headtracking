@@ -21,6 +21,7 @@ use tracing::{info, warn};
 use sdl3_sys::camera as sdl_cam;
 use sdl3_sys::camera::SDL_CameraID;
 use sdl3_sys::error::SDL_GetError;
+use sdl3_sys::events::SDL_PumpEvents;
 use sdl3_sys::init::{SDL_INIT_CAMERA, SDL_Init};
 use sdl3_sys::pixels::{SDL_Colorspace, SDL_PIXELFORMAT_RGB24};
 use sdl3_sys::surface::{SDL_ConvertSurface, SDL_DestroySurface, SDL_Surface};
@@ -87,6 +88,14 @@ pub struct RgbFrame {
 /// Enumerate all webcams visible to the OS. Cheap (no streams opened).
 pub fn list() -> Result<Vec<CameraInfo>, Error> {
     ensure_subsystem()?;
+    // SDL_GetCameras returns a snapshot of an internal device list which
+    // is only refreshed when SDL processes its camera ADDED / REMOVED
+    // events. Without an event pump, hot-plugged webcams stay invisible.
+    // SAFETY: SDL_PumpEvents is callable from any thread once SDL_Init has
+    // succeeded.
+    unsafe {
+        SDL_PumpEvents();
+    }
     let mut count: c_int = 0;
     // SAFETY: SDL_GetCameras takes a writable c_int pointer and returns a
     // SDL-allocated array of SDL_CameraID. We must free the array via
