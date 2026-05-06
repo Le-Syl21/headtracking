@@ -1,0 +1,13 @@
+[package]
+name = "freenect"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0 OR GPL-2.0-only"
+description = "Safe Rust wrapper around libfreenect (Kinect v1)"
+publish = false
+
+[dependencies]
+freenect-sys = { path = "../freenect-sys" }
+parking_lot = "0.12"
+thiserror = "2"
+tracing = "0.1"

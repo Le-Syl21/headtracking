@@ -1,7 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/freenect2-sys", "crates/freenect2"]
-# crates/freenect-sys, crates/freenect (Kinect v1) will follow.
+members = [
+    "crates/freenect-sys",
+    "crates/freenect",
+    "crates/freenect2-sys",
+    "crates/freenect2",
+]
 
 [workspace.package]
 edition = "2024"
@@ -21,7 +25,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
-kinect-v1 = []
+kinect-v1 = ["dep:freenect"]
 kinect-v2 = ["dep:freenect2"]
 all-trackers = ["kinect-v1", "kinect-v2"]
 
@@ -32,6 +36,7 @@ arc-swap = "1"
 parking_lot = "0.12"
 nalgebra = "0.33"
 thiserror = "2"
+freenect = { path = "crates/freenect", optional = true }
 freenect2 = { path = "crates/freenect2", optional = true }
 
 [build-dependencies]

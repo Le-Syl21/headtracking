@@ -10,6 +10,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tracing::{error, info};
 
+#[cfg(feature = "kinect-v1")]
+use super::kinect_v1::KinectV1Backend;
 #[cfg(feature = "kinect-v2")]
 use super::kinect_v2::KinectV2Backend;
 use super::{HeadTracker, Pose};
@@ -27,11 +29,17 @@ pub struct TrackerSession {
 
 impl TrackerSession {
     /// Spawn the tracker thread for the first compiled-in backend.
-    /// Order of preference (matches feature flag priority): Kinect v2, ...
+    /// Order of preference: Kinect v2 (more accurate), then Kinect v1. The
+    /// `not(feature = "kinect-v2")` guard on the v1 arm avoids an
+    /// unreachable-code warning when both features are enabled.
     pub fn spawn() -> Result<Self, SpawnError> {
         #[cfg(feature = "kinect-v2")]
         {
             return Self::spawn_kinect_v2();
+        }
+        #[cfg(all(feature = "kinect-v1", not(feature = "kinect-v2")))]
+        {
+            return Self::spawn_kinect_v1();
         }
         #[allow(unreachable_code)]
         Err(SpawnError::NoBackendCompiled)
@@ -40,6 +48,15 @@ impl TrackerSession {
     #[cfg(feature = "kinect-v2")]
     fn spawn_kinect_v2() -> Result<Self, SpawnError> {
         let backend = KinectV2Backend::open().map_err(SpawnError::OpenKinectV2)?;
+        Self::spawn_with(Box::new(backend))
+    }
+
+    #[cfg(feature = "kinect-v1")]
+    // When v2 is also compiled in, `spawn()` always picks it; v1 stays
+    // available for callers that explicitly disable the v2 feature.
+    #[cfg_attr(feature = "kinect-v2", allow(dead_code))]
+    fn spawn_kinect_v1() -> Result<Self, SpawnError> {
+        let backend = KinectV1Backend::open().map_err(SpawnError::OpenKinectV1)?;
         Self::spawn_with(Box::new(backend))
     }
 
@@ -112,6 +129,10 @@ pub enum SpawnError {
     #[cfg(feature = "kinect-v2")]
     #[error("Kinect v2 open failed: {0}")]
     OpenKinectV2(#[from] freenect2::Error),
+
+    #[cfg(feature = "kinect-v1")]
+    #[error("Kinect v1 open failed: {0}")]
+    OpenKinectV1(#[from] freenect::Error),
 
     #[error("failed to spawn tracker thread: {0}")]
     Spawn(std::io::Error),

@@ -242,6 +242,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "freenect"
+version = "0.1.0"
+dependencies = [
+ "freenect-sys",
+ "parking_lot",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "freenect-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cmake",
+ "pkg-config",
+]
+
+[[package]]
 name = "freenect2"
 version = "0.1.0"
 dependencies = [
@@ -280,6 +299,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bindgen",
+ "freenect",
  "freenect2",
  "nalgebra",
  "parking_lot",
