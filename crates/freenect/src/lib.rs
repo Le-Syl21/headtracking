@@ -67,6 +67,66 @@ pub const FY: f32 = 580.0;
 pub const CX: f32 = (DEPTH_WIDTH as f32) / 2.0;
 pub const CY: f32 = (DEPTH_HEIGHT as f32) / 2.0;
 
+/// Mechanical tilt range advertised by the Kinect v1 motor (in degrees).
+pub const TILT_MIN_DEG: f32 = -31.0;
+pub const TILT_MAX_DEG: f32 = 31.0;
+
+/// LED colours / blink patterns the Kinect v1 base supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedState {
+    Off,
+    Green,
+    Red,
+    Yellow,
+    BlinkGreen,
+    BlinkRedYellow,
+}
+
+impl LedState {
+    fn to_raw(self) -> u32 {
+        // Values from `freenect.h`. There is no value 5 — historical hole.
+        match self {
+            LedState::Off => 0,
+            LedState::Green => 1,
+            LedState::Red => 2,
+            LedState::Yellow => 3,
+            LedState::BlinkGreen => 4,
+            LedState::BlinkRedYellow => 6,
+        }
+    }
+}
+
+/// Snapshot of the motor / accelerometer state.
+#[derive(Debug, Clone, Copy)]
+pub struct TiltState {
+    /// Current tilt in degrees (zero = horizontal, positive = looking up).
+    pub angle_deg: f32,
+    pub status: TiltStatus,
+    /// Gravity vector reported by the on-board accelerometer, in m/s².
+    /// Useful to know how the cab is oriented or whether it's been moved.
+    pub accel_mks: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TiltStatus {
+    Stopped,
+    Limit,
+    Moving,
+    Unknown,
+}
+
+impl TiltStatus {
+    fn from_raw(raw: i32) -> Self {
+        // libfreenect tilt status codes: 0 = stopped, 1 = limit, 4 = moving.
+        match raw {
+            0 => TiltStatus::Stopped,
+            1 => TiltStatus::Limit,
+            4 => TiltStatus::Moving,
+            _ => TiltStatus::Unknown,
+        }
+    }
+}
+
 /// libfreenect context. Holds the USB context and the list of open devices.
 pub struct Context {
     handle: Arc<CtxHandle>,
@@ -92,10 +152,15 @@ impl Context {
         if rc < 0 || raw.is_null() {
             return Err(Error::ContextInit(rc));
         }
-        // We only care about the camera subdevice (not the motor/audio).
+        // Claim camera + motor (so we can drive the tilt and LED). Audio
+        // stays off.
         // SAFETY: `raw` is non-null per the check above.
         unsafe {
-            sys::freenect_select_subdevices(raw, sys::freenect_device_flags_FREENECT_DEVICE_CAMERA);
+            sys::freenect_select_subdevices(
+                raw,
+                sys::freenect_device_flags_FREENECT_DEVICE_CAMERA
+                    | sys::freenect_device_flags_FREENECT_DEVICE_MOTOR,
+            );
         }
         Ok(Self {
             handle: Arc::new(CtxHandle {
@@ -311,6 +376,65 @@ impl Device {
     pub fn poll_rgb(&self) -> Option<RgbFrame> {
         self.slots.video.poll()
     }
+
+    /// Drive the motorised base to `angle_deg` (clamped to the
+    /// `[TILT_MIN_DEG, TILT_MAX_DEG]` range). The call returns once the
+    /// command has been queued; mechanical motion takes a beat.
+    pub fn set_tilt_degrees(&self, angle_deg: f32) -> Result<(), Error> {
+        let clamped = angle_deg.clamp(TILT_MIN_DEG, TILT_MAX_DEG);
+        let _g = self.ctx.api_lock.lock();
+        // SAFETY: device is open and the motor subdevice was claimed at
+        // open time.
+        let rc = unsafe { sys::freenect_set_tilt_degs(self.raw, f64::from(clamped)) };
+        if rc < 0 {
+            return Err(Error::TiltFailed(rc));
+        }
+        Ok(())
+    }
+
+    /// Set the LED on the front of the base.
+    pub fn set_led(&self, state: LedState) -> Result<(), Error> {
+        let _g = self.ctx.api_lock.lock();
+        // SAFETY: device is open and the motor subdevice was claimed.
+        let rc = unsafe { sys::freenect_set_led(self.raw, state.to_raw()) };
+        if rc < 0 {
+            return Err(Error::LedFailed(rc));
+        }
+        Ok(())
+    }
+
+    /// Force a USB roundtrip to refresh the tilt + accelerometer state and
+    /// return a snapshot. Cheap (~1 ms) but not free; throttle to a few
+    /// times per second if you're polling continuously.
+    pub fn tilt_state(&self) -> Result<TiltState, Error> {
+        let _g = self.ctx.api_lock.lock();
+        // SAFETY: device is open with motor claimed.
+        let rc = unsafe { sys::freenect_update_tilt_state(self.raw) };
+        if rc < 0 {
+            return Err(Error::TiltStateFailed(rc));
+        }
+        // SAFETY: device pointer is valid; libfreenect returns a pointer to
+        // its internal raw state struct, valid until the next update_tilt
+        // call on this device.
+        let raw_state = unsafe { sys::freenect_get_tilt_state(self.raw) };
+        if raw_state.is_null() {
+            return Err(Error::TiltStateFailed(-1));
+        }
+        // SAFETY: pointer non-null per check above.
+        let angle = unsafe { sys::freenect_get_tilt_degs(raw_state) } as f32;
+        // SAFETY: same.
+        let status_raw = unsafe { sys::freenect_get_tilt_status(raw_state) };
+        let mut ax = 0.0_f64;
+        let mut ay = 0.0_f64;
+        let mut az = 0.0_f64;
+        // SAFETY: out-pointers are valid stack locations.
+        unsafe { sys::freenect_get_mks_accel(raw_state, &mut ax, &mut ay, &mut az) };
+        Ok(TiltState {
+            angle_deg: angle,
+            status: TiltStatus::from_raw(status_raw as i32),
+            accel_mks: [ax as f32, ay as f32, az as f32],
+        })
+    }
 }
 
 impl Drop for Device {
@@ -505,4 +629,10 @@ pub enum Error {
     StopFailed(i32),
     #[error("failed to spawn event thread: {0}")]
     Spawn(std::io::Error),
+    #[error("freenect_set_tilt_degs failed (rc={0})")]
+    TiltFailed(i32),
+    #[error("freenect_set_led failed (rc={0})")]
+    LedFailed(i32),
+    #[error("freenect_update_tilt_state / get failed (rc={0})")]
+    TiltStateFailed(i32),
 }

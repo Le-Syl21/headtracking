@@ -10,13 +10,14 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, TextureHandle, TopBottomPanel, Vec2,
 };
 use parking_lot::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -153,6 +154,35 @@ struct Active {
     last_head: Option<HeadPixel>,
     baseline: Option<Baseline>,
     inner: Inner,
+    /// `Some` only when [`Inner::KinectV1`] — drives the motorised base.
+    v1_controls: Option<V1Controls>,
+}
+
+/// State for the Kinect v1 tilt + LED panel. The desired values are kept
+/// here so the user can drag the slider freely; we only push commands to
+/// the device on `drag_stopped` / combo change to avoid hammering the
+/// fragile motor gears.
+struct V1Controls {
+    desired_tilt_deg: f32,
+    last_sent_tilt_deg: f32,
+    selected_led: freenect::LedState,
+    last_sent_led: freenect::LedState,
+    last_state: Option<freenect::TiltState>,
+    last_refresh: Instant,
+}
+
+impl V1Controls {
+    fn new() -> Self {
+        Self {
+            desired_tilt_deg: 0.0,
+            last_sent_tilt_deg: 0.0,
+            selected_led: freenect::LedState::Green,
+            last_sent_led: freenect::LedState::Green,
+            last_state: None,
+            // Seed with a stale instant so the first poll triggers a refresh.
+            last_refresh: Instant::now() - Duration::from_secs(60),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -307,6 +337,115 @@ impl App {
     }
 }
 
+impl App {
+    /// Render the Kinect v1 tilt + LED panel just below the toolbar.
+    /// No-op when the active backend is anything else.
+    fn show_v1_controls(&mut self, egui_ctx: &egui::Context) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        let (Inner::KinectV1 { device, .. }, Some(controls)) =
+            (&mut active.inner, active.v1_controls.as_mut())
+        else {
+            return;
+        };
+
+        // Refresh tilt + accel every 500 ms (USB roundtrip).
+        if controls.last_refresh.elapsed() >= Duration::from_millis(500) {
+            match device.tilt_state() {
+                Ok(state) => controls.last_state = Some(state),
+                Err(e) => warn!(?e, "kinect v1: tilt_state refresh failed"),
+            }
+            controls.last_refresh = Instant::now();
+        }
+
+        TopBottomPanel::top("v1-controls").show(egui_ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Kinect v1").strong());
+                ui.separator();
+                let response = ui.add(
+                    egui::Slider::new(
+                        &mut controls.desired_tilt_deg,
+                        freenect::TILT_MIN_DEG..=freenect::TILT_MAX_DEG,
+                    )
+                    .text("tilt °")
+                    .step_by(1.0),
+                );
+                let drag_release = response.drag_stopped();
+                let typed_commit = response.lost_focus();
+                if (drag_release || typed_commit)
+                    && (controls.desired_tilt_deg - controls.last_sent_tilt_deg).abs() > 0.01
+                {
+                    if let Err(e) = device.set_tilt_degrees(controls.desired_tilt_deg) {
+                        warn!(?e, "set_tilt failed");
+                    } else {
+                        controls.last_sent_tilt_deg = controls.desired_tilt_deg;
+                        info!(angle = controls.desired_tilt_deg, "tilt command sent");
+                    }
+                }
+
+                ui.separator();
+                ui.label("LED:");
+                let prev_led = controls.selected_led;
+                ComboBox::from_id_salt("led")
+                    .selected_text(led_label(controls.selected_led))
+                    .show_ui(ui, |ui| {
+                        for led in LED_OPTIONS {
+                            ui.selectable_value(&mut controls.selected_led, *led, led_label(*led));
+                        }
+                    });
+                if controls.selected_led != prev_led {
+                    if let Err(e) = device.set_led(controls.selected_led) {
+                        warn!(?e, "set_led failed");
+                    } else {
+                        controls.last_sent_led = controls.selected_led;
+                    }
+                }
+
+                ui.separator();
+                if let Some(state) = controls.last_state {
+                    ui.label(
+                        RichText::new(format!(
+                            "current {:>+5.1}°  status {:?}  accel ({:>+5.2}, {:>+5.2}, {:>+5.2}) m/s²",
+                            state.angle_deg,
+                            state.status,
+                            state.accel_mks[0],
+                            state.accel_mks[1],
+                            state.accel_mks[2],
+                        ))
+                        .monospace()
+                        .color(Color32::GRAY),
+                    );
+                } else {
+                    ui.label(RichText::new("waiting for motor state…").color(Color32::GRAY));
+                }
+            });
+            ui.add_space(2.0);
+        });
+    }
+}
+
+const LED_OPTIONS: &[freenect::LedState] = &[
+    freenect::LedState::Off,
+    freenect::LedState::Green,
+    freenect::LedState::Red,
+    freenect::LedState::Yellow,
+    freenect::LedState::BlinkGreen,
+    freenect::LedState::BlinkRedYellow,
+];
+
+fn led_label(state: freenect::LedState) -> &'static str {
+    match state {
+        freenect::LedState::Off => "off",
+        freenect::LedState::Green => "green",
+        freenect::LedState::Red => "red",
+        freenect::LedState::Yellow => "yellow",
+        freenect::LedState::BlinkGreen => "blink green",
+        freenect::LedState::BlinkRedYellow => "blink red/yellow",
+    }
+}
+
 fn upload_texture(ctx: &egui::Context, slot: &mut Option<TextureHandle>, img: ColorImage) {
     match slot.as_mut() {
         Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
@@ -398,6 +537,9 @@ impl eframe::App for App {
             });
             ui.add_space(4.0);
         });
+
+        // ----- Optional Kinect v1 controls (tilt + LED)
+        self.show_v1_controls(egui_ctx);
 
         // ----- Bottom split: logs (left) + VPX delta panel (right)
         TopBottomPanel::bottom("debug-panels")
@@ -623,6 +765,7 @@ fn open_kinect_v2() -> Result<Active, String> {
         last_head: None,
         baseline: None,
         inner: Inner::KinectV2 { device, _ctx: ctx },
+        v1_controls: None,
     })
 }
 
@@ -636,6 +779,23 @@ fn open_kinect_v1() -> Result<Active, String> {
     device
         .start_streams(true, true)
         .map_err(|e| format!("freenect start_streams: {e}"))?;
+
+    // Seed the v1 controls with the device's current tilt so the slider
+    // doesn't snap on first use. Failures are non-fatal — we just log.
+    let mut controls = V1Controls::new();
+    match device.tilt_state() {
+        Ok(state) => {
+            controls.desired_tilt_deg = state.angle_deg;
+            controls.last_sent_tilt_deg = state.angle_deg;
+            controls.last_state = Some(state);
+            controls.last_refresh = Instant::now();
+        }
+        Err(e) => warn!(?e, "kinect v1: tilt_state read at open failed"),
+    }
+    if let Err(e) = device.set_led(controls.selected_led) {
+        warn!(?e, "kinect v1: initial set_led failed");
+    }
+
     Ok(Active {
         backend: Backend::KinectV1,
         intrinsics: Intrinsics {
@@ -648,6 +808,7 @@ fn open_kinect_v1() -> Result<Active, String> {
         last_head: None,
         baseline: None,
         inner: Inner::KinectV1 { device, _ctx: ctx },
+        v1_controls: Some(controls),
     })
 }
 
@@ -667,6 +828,7 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         last_head: None,
         baseline: None,
         inner: Inner::Webcam { camera },
+        v1_controls: None,
     })
 }
 
