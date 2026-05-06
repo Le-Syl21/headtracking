@@ -1,0 +1,17 @@
+[package]
+name = "freenect2-sys"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0 OR GPL-2.0-only"
+description = "Low-level bindings to libfreenect2 (Kinect v2) via cxx, with vendored static build"
+publish = false
+
+[lib]
+
+[dependencies]
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
+cmake = "0.1"
+pkg-config = "0.3"

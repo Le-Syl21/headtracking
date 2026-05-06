@@ -1,0 +1,6 @@
+[submodule "crates/freenect2-sys/vendor/libfreenect2"]
+	path = crates/freenect2-sys/vendor/libfreenect2
+	url = https://github.com/OpenKinect/libfreenect2
+[submodule "crates/freenect-sys/vendor/libfreenect"]
+	path = crates/freenect-sys/vendor/libfreenect
+	url = https://github.com/OpenKinect/libfreenect

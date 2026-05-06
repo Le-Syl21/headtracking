@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = ["crates/freenect2-sys", "crates/freenect2"]
+# crates/freenect-sys, crates/freenect (Kinect v1) will follow.
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Le-Syl21/headtracking"
+
+[package]
+name = "headtracking"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Head tracking plugin for Visual Pinball X 10.8.1+"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+kinect-v1 = []
+kinect-v2 = ["dep:freenect2"]
+all-trackers = ["kinect-v1", "kinect-v2"]
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arc-swap = "1"
+parking_lot = "0.12"
+nalgebra = "0.33"
+thiserror = "2"
+freenect2 = { path = "crates/freenect2", optional = true }
+
+[build-dependencies]
+bindgen = "0.71"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
