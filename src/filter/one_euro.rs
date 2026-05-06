@@ -125,6 +125,20 @@ impl OneEuroPose3D {
         Self::new(OneEuroParams::default())
     }
 
+    /// Build a 3D filter where each axis carries its own params. Useful
+    /// when one axis has a different noise profile than the others — e.g.
+    /// depth-camera Z is noisier than X/Y because the median over a small
+    /// pixel window jitters as the face bbox shifts a pixel or two.
+    pub fn new_per_axis(params: [OneEuroParams; 3]) -> Self {
+        Self {
+            axes: [
+                OneEuro::new(params[0]),
+                OneEuro::new(params[1]),
+                OneEuro::new(params[2]),
+            ],
+        }
+    }
+
     pub fn reset(&mut self) {
         for a in &mut self.axes {
             a.reset();
