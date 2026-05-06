@@ -5,6 +5,7 @@ members = [
     "crates/freenect",
     "crates/freenect2-sys",
     "crates/freenect2",
+    "crates/webcam",
     "tools/ht-debug",
 ]
 

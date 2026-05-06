@@ -54,28 +54,32 @@ enum Backend {
     None,
     KinectV1,
     KinectV2,
+    /// Index in the enumerated webcam list.
+    Webcam(u32),
 }
 
-impl Backend {
-    fn label(self) -> &'static str {
-        match self {
-            Backend::None => "None (off)",
-            Backend::KinectV1 => "Kinect v1",
-            Backend::KinectV2 => "Kinect v2",
-        }
-    }
+#[derive(Debug, Clone)]
+struct BackendEntry {
+    backend: Backend,
+    label: String,
 }
 
-/// Probe USB for connected Kinect sensors. Always returns `None` first; the
+/// Probe USB for connected sensors. Always returns `None (off)` first; the
 /// other entries are added when the corresponding library reports a device.
-fn detect_backends() -> Vec<Backend> {
-    let mut out = vec![Backend::None];
+fn detect_backends() -> Vec<BackendEntry> {
+    let mut out = vec![BackendEntry {
+        backend: Backend::None,
+        label: "None (off)".to_string(),
+    }];
 
     match freenect2::Context::new() {
         Ok(ctx) => {
             let n = ctx.enumerate();
             if n > 0 {
-                out.push(Backend::KinectV2);
+                out.push(BackendEntry {
+                    backend: Backend::KinectV2,
+                    label: "Kinect v2".to_string(),
+                });
                 info!(count = n, "kinect v2 detected");
             }
         }
@@ -86,11 +90,32 @@ fn detect_backends() -> Vec<Backend> {
         Ok(ctx) => {
             let n = ctx.enumerate();
             if n > 0 {
-                out.push(Backend::KinectV1);
+                out.push(BackendEntry {
+                    backend: Backend::KinectV1,
+                    label: "Kinect v1".to_string(),
+                });
                 info!(count = n, "kinect v1 detected");
             }
         }
         Err(e) => info!(?e, "kinect v1 enumerate failed"),
+    }
+
+    match webcam::list() {
+        Ok(cams) => {
+            for cam in cams {
+                let label = if cam.name.is_empty() {
+                    format!("Webcam #{}", cam.index)
+                } else {
+                    format!("Webcam: {}", cam.name)
+                };
+                info!(index = cam.index, name = %cam.name, "webcam detected");
+                out.push(BackendEntry {
+                    backend: Backend::Webcam(cam.index),
+                    label,
+                });
+            }
+        }
+        Err(e) => info!(?e, "webcam enumerate failed"),
     }
 
     out
@@ -100,10 +125,25 @@ fn detect_backends() -> Vec<Backend> {
 
 struct App {
     selected: Backend,
-    available: Vec<Backend>,
+    available: Vec<BackendEntry>,
     active: Option<Active>,
     error: Option<String>,
     logs: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl App {
+    fn label_for(&self, backend: Backend) -> String {
+        self.available
+            .iter()
+            .find(|e| e.backend == backend)
+            .map(|e| e.label.clone())
+            .unwrap_or_else(|| match backend {
+                Backend::None => "None (off)".to_string(),
+                Backend::KinectV1 => "Kinect v1".to_string(),
+                Backend::KinectV2 => "Kinect v2".to_string(),
+                Backend::Webcam(i) => format!("Webcam #{i}"),
+            })
+    }
 }
 
 struct Active {
@@ -132,6 +172,17 @@ enum Inner {
         device: freenect::Device,
         _ctx: freenect::Context,
     },
+    Webcam {
+        camera: webcam::Camera,
+    },
+}
+
+impl Inner {
+    /// `true` when this input pipeline produces depth-derived head poses.
+    /// Webcam stays `false` until we wire a face tracker.
+    fn has_head_tracker(&self) -> bool {
+        matches!(self, Inner::KinectV1 { .. } | Inner::KinectV2 { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -245,6 +296,13 @@ impl App {
                     active.last_head = head;
                 }
             }
+            Inner::Webcam { camera } => {
+                if let Some(rgb) = camera.poll_rgb() {
+                    let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
+                    upload_texture(egui_ctx, &mut active.rgb_texture, img);
+                }
+                // No depth → no blob algo. Face tracker lands in P3.
+            }
         }
     }
 }
@@ -285,11 +343,17 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Input:");
+                let selected_label = self.label_for(self.selected);
                 ComboBox::from_id_salt("backend")
-                    .selected_text(self.selected.label())
+                    .selected_text(selected_label)
                     .show_ui(ui, |ui| {
-                        for b in &self.available {
-                            ui.selectable_value(&mut self.selected, *b, b.label());
+                        let entries = self.available.clone();
+                        for entry in &entries {
+                            ui.selectable_value(
+                                &mut self.selected,
+                                entry.backend,
+                                &entry.label,
+                            );
                         }
                     });
                 if ui.small_button("rescan").clicked() {
@@ -297,11 +361,18 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 if let Some(active) = self.active.as_ref() {
-                    if let Some(head) = active.last_head {
+                    let label = self.label_for(active.backend);
+                    if !active.inner.has_head_tracker() {
                         ui.label(
                             RichText::new(format!(
-                                "{}  |  distance {:.0} mm  |  pixel ({}, {})  |  3D ({:.0}, {:.0}, {:.0}) mm",
-                                active.backend.label(),
+                                "{label}  |  capture only — head tracking pending"
+                            ))
+                            .color(Color32::GRAY),
+                        );
+                    } else if let Some(head) = active.last_head {
+                        ui.label(
+                            RichText::new(format!(
+                                "{label}  |  distance {:.0} mm  |  pixel ({}, {})  |  3D ({:.0}, {:.0}, {:.0}) mm",
                                 head.depth_mm,
                                 head.u,
                                 head.v,
@@ -313,7 +384,7 @@ impl eframe::App for App {
                         );
                     } else {
                         ui.label(
-                            RichText::new(format!("{}  |  waiting for head detection…", active.backend.label()))
+                            RichText::new(format!("{label}  |  waiting for head detection…"))
                                 .color(Color32::GRAY),
                         );
                     }
@@ -369,6 +440,18 @@ impl eframe::App for App {
                         active.baseline = None;
                     }
                     if let Some(active) = self.active.as_ref() {
+                        if !active.inner.has_head_tracker() {
+                            cols[1].label(
+                                RichText::new(
+                                    "this input has no head tracker yet\n\
+                                     (face detection / monocular depth comes\n\
+                                     with the webcam tracker — P3 roadmap)",
+                                )
+                                .color(Color32::GRAY)
+                                .monospace(),
+                            );
+                            return;
+                        }
                         match (active.baseline, active.last_head) {
                             (Some(base), Some(head)) => {
                                 let dx_mm = head.x_mm - base.x_mm;
@@ -427,9 +510,14 @@ impl eframe::App for App {
         CentralPanel::default().show(egui_ctx, |ui| {
             let avail = ui.available_size();
             let aspect = match self.active.as_ref() {
-                Some(active) => match active.inner {
-                    Inner::KinectV2 { .. } => 1920.0 / 1080.0,
-                    Inner::KinectV1 { .. } => 640.0 / 480.0,
+                Some(active) => match (&active.inner, active.rgb_texture.as_ref()) {
+                    (_, Some(tex)) => {
+                        let s = tex.size_vec2();
+                        if s.y > 0.0 { s.x / s.y } else { 16.0 / 9.0 }
+                    }
+                    (Inner::KinectV2 { .. }, None) => 1920.0 / 1080.0,
+                    (Inner::KinectV1 { .. }, None) => 640.0 / 480.0,
+                    (Inner::Webcam { .. }, None) => 640.0 / 480.0,
                 },
                 None => 16.0 / 9.0,
             };
@@ -506,6 +594,7 @@ fn open_backend(b: Backend) -> Result<Active, String> {
         Backend::None => Err("no backend selected".to_string()),
         Backend::KinectV2 => open_kinect_v2(),
         Backend::KinectV1 => open_kinect_v1(),
+        Backend::Webcam(idx) => open_webcam(idx),
     }
 }
 
@@ -559,6 +648,25 @@ fn open_kinect_v1() -> Result<Active, String> {
         last_head: None,
         baseline: None,
         inner: Inner::KinectV1 { device, _ctx: ctx },
+    })
+}
+
+fn open_webcam(index: u32) -> Result<Active, String> {
+    let camera = webcam::Camera::open(index).map_err(|e| format!("webcam open: {e}"))?;
+    Ok(Active {
+        backend: Backend::Webcam(index),
+        // Placeholder intrinsics — the webcam tracker (face detection + IOD
+        // depth) will replace these with calibrated values.
+        intrinsics: Intrinsics {
+            fx: 0.0,
+            fy: 0.0,
+            cx: 0.0,
+            cy: 0.0,
+        },
+        rgb_texture: None,
+        last_head: None,
+        baseline: None,
+        inner: Inner::Webcam { camera },
     })
 }
 
