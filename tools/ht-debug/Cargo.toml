@@ -1,0 +1,17 @@
+[package]
+name = "ht-debug"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Standalone visualization of the Kinect head-tracker (RGB + tracked point + distance)"
+publish = false
+
+[[bin]]
+name = "ht-debug"
+path = "src/main.rs"
+
+[dependencies]
+freenect2 = { path = "../../crates/freenect2" }
+minifb = "0.28"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

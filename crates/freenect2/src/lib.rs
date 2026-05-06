@@ -29,7 +29,7 @@ use cxx::UniquePtr;
 use parking_lot::Mutex;
 
 use freenect2_sys as sys;
-pub use freenect2_sys::{DepthFrame, IrCameraParams};
+pub use freenect2_sys::{DepthFrame, IrCameraParams, RgbFrame};
 
 /// Top-level libfreenect2 context. Construct one per process; opening multiple
 /// devices off the same context is supported by libfreenect2 itself.
@@ -80,11 +80,18 @@ pub struct Device {
 impl Device {
     /// Begin streaming depth. Idempotent: returns `Ok` if already started.
     pub fn start(&self) -> Result<(), Error> {
+        self.start_streams(false, true)
+    }
+
+    /// Begin the requested streams. Used by diagnostic tools that need both
+    /// the color and the depth feed; the head-tracker path uses [`Device::start`]
+    /// (depth only) instead.
+    pub fn start_streams(&self, rgb: bool, depth: bool) -> Result<(), Error> {
         if self.running.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         let mut guard = self.inner.lock();
-        if !sys::start_depth(guard.pin_mut()) {
+        if !sys::start_streams(guard.pin_mut(), rgb, depth) {
             self.running.store(false, Ordering::Release);
             return Err(Error::StartFailed);
         }
@@ -114,6 +121,22 @@ impl Device {
             data: Vec::new(),
         };
         if sys::poll_depth(guard.pin_mut(), &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Read the latest color frame (BGRX, 1920×1080), if any.
+    pub fn poll_rgb(&self) -> Option<RgbFrame> {
+        let mut guard = self.inner.lock();
+        let mut out = RgbFrame {
+            width: 0,
+            height: 0,
+            timestamp_raw: 0,
+            data: Vec::new(),
+        };
+        if sys::poll_rgb(guard.pin_mut(), &mut out) {
             Some(out)
         } else {
             None

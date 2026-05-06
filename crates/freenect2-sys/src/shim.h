@@ -20,6 +20,7 @@ namespace freenect2_shim {
 
 // Forward declarations of cxx-generated shared types (defined in lib.rs.h).
 struct DepthFrame;
+struct RgbFrame;
 struct IrCameraParams;
 
 class DepthSink : public libfreenect2::FrameListener {
@@ -39,13 +40,32 @@ private:
     std::vector<float> data_;
 };
 
+class RgbSink : public libfreenect2::FrameListener {
+public:
+    bool onNewFrame(libfreenect2::Frame::Type type, libfreenect2::Frame *frame) override;
+
+    bool poll(uint32_t &width, uint32_t &height, uint32_t &timestamp,
+              std::vector<uint8_t> &data);
+
+private:
+    std::mutex mu_;
+    std::atomic<bool> has_new_{false};
+    uint32_t width_ = 0;
+    uint32_t height_ = 0;
+    uint32_t timestamp_ = 0;
+    // Pixel layout matches libfreenect2's `Frame::BGRX` for the Kinect v2:
+    // 4 bytes per pixel, channel order [B, G, R, X].
+    std::vector<uint8_t> data_;
+};
+
 struct Freenect2Ctx {
     libfreenect2::Freenect2 inner;
 };
 
 struct Freenect2Dev {
     libfreenect2::Freenect2Device *dev = nullptr;
-    DepthSink listener;
+    DepthSink depth_listener;
+    RgbSink rgb_listener;
 
     ~Freenect2Dev();
 
@@ -61,8 +81,10 @@ int32_t enumerate(Freenect2Ctx &ctx);
 std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx);
 
 bool start_depth(Freenect2Dev &dev);
+bool start_streams(Freenect2Dev &dev, bool rgb, bool depth);
 bool stop_device(Freenect2Dev &dev);
 bool poll_depth(Freenect2Dev &dev, DepthFrame &out);
+bool poll_rgb(Freenect2Dev &dev, RgbFrame &out);
 IrCameraParams ir_params(const Freenect2Dev &dev);
 
 }  // namespace freenect2_shim

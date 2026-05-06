@@ -43,6 +43,40 @@ bool DepthSink::poll(uint32_t &w, uint32_t &h, uint32_t &ts,
     return true;
 }
 
+bool RgbSink::onNewFrame(libfreenect2::Frame::Type type,
+                         libfreenect2::Frame *frame) {
+    if (type != libfreenect2::Frame::Color) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    const size_t bytes =
+        static_cast<size_t>(frame->width) * frame->height * frame->bytes_per_pixel;
+    width_ = frame->width;
+    height_ = frame->height;
+    timestamp_ = frame->timestamp;
+    data_.resize(bytes);
+    std::memcpy(data_.data(), frame->data, bytes);
+    has_new_.store(true, std::memory_order_release);
+    return false;  // we copied; libfreenect2 keeps ownership.
+}
+
+bool RgbSink::poll(uint32_t &w, uint32_t &h, uint32_t &ts,
+                   std::vector<uint8_t> &out) {
+    if (!has_new_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!has_new_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    w = width_;
+    h = height_;
+    ts = timestamp_;
+    out = data_;
+    has_new_.store(false, std::memory_order_release);
+    return true;
+}
+
 Freenect2Dev::~Freenect2Dev() {
     if (dev) {
         dev->stop();
@@ -69,13 +103,19 @@ std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx) {
     if (!holder->dev) {
         return nullptr;
     }
-    holder->dev->setIrAndDepthFrameListener(&holder->listener);
+    holder->dev->setIrAndDepthFrameListener(&holder->depth_listener);
+    holder->dev->setColorFrameListener(&holder->rgb_listener);
     return holder;
 }
 
 bool start_depth(Freenect2Dev &dev) {
     if (!dev.dev) return false;
     return dev.dev->startStreams(/*rgb=*/false, /*depth=*/true);
+}
+
+bool start_streams(Freenect2Dev &dev, bool rgb, bool depth) {
+    if (!dev.dev) return false;
+    return dev.dev->startStreams(rgb, depth);
 }
 
 bool stop_device(Freenect2Dev &dev) {
@@ -87,7 +127,7 @@ bool poll_depth(Freenect2Dev &dev, DepthFrame &out) {
     if (!dev.dev) return false;
     uint32_t w = 0, h = 0, ts = 0;
     std::vector<float> data;
-    if (!dev.listener.poll(w, h, ts, data)) {
+    if (!dev.depth_listener.poll(w, h, ts, data)) {
         return false;
     }
     out.width = w;
@@ -97,6 +137,24 @@ bool poll_depth(Freenect2Dev &dev, DepthFrame &out) {
     out.data.reserve(data.size());
     for (float v : data) {
         out.data.push_back(v);
+    }
+    return true;
+}
+
+bool poll_rgb(Freenect2Dev &dev, RgbFrame &out) {
+    if (!dev.dev) return false;
+    uint32_t w = 0, h = 0, ts = 0;
+    std::vector<uint8_t> data;
+    if (!dev.rgb_listener.poll(w, h, ts, data)) {
+        return false;
+    }
+    out.width = w;
+    out.height = h;
+    out.timestamp_raw = ts;
+    out.data.clear();
+    out.data.reserve(data.size());
+    for (uint8_t b : data) {
+        out.data.push_back(b);
     }
     return true;
 }

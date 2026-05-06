@@ -24,6 +24,18 @@ mod ffi {
         pub data: Vec<f32>,
     }
 
+    /// Color frame from the Kinect v2 (1920×1080, BGRX 4 bytes per pixel).
+    /// libfreenect2 decodes the on-wire MJPEG via TurboJPEG transparently;
+    /// we just hand the decoded buffer up.
+    #[derive(Clone)]
+    pub struct RgbFrame {
+        pub width: u32,
+        pub height: u32,
+        pub timestamp_raw: u32,
+        /// Row-major BGRX bytes — `width * height * 4` entries.
+        pub data: Vec<u8>,
+    }
+
     /// IR camera intrinsics (depth camera). Matches `Freenect2Device::IrCameraParams`.
     #[derive(Clone, Copy, Default)]
     pub struct IrCameraParams {
@@ -57,8 +69,12 @@ mod ffi {
         /// null `UniquePtr` if no device is available or opening fails.
         fn open_default(ctx: Pin<&mut Freenect2Ctx>) -> UniquePtr<Freenect2Dev>;
 
-        /// Start the depth stream (RGB stays off — we don't need it).
+        /// Start the depth stream (RGB stays off — the head-tracker path).
         fn start_depth(dev: Pin<&mut Freenect2Dev>) -> bool;
+
+        /// Start the requested streams. Useful for diagnostic tools that
+        /// need both RGB and depth (e.g. `ht-debug`).
+        fn start_streams(dev: Pin<&mut Freenect2Dev>, rgb: bool, depth: bool) -> bool;
 
         /// Stop the device. Idempotent.
         fn stop_device(dev: Pin<&mut Freenect2Dev>) -> bool;
@@ -67,14 +83,18 @@ mod ffi {
         /// frame has arrived since the last call.
         fn poll_depth(dev: Pin<&mut Freenect2Dev>, out: &mut DepthFrame) -> bool;
 
-        /// IR / depth camera intrinsics, available after `start_depth`.
+        /// Read the most recent color frame, if any.
+        fn poll_rgb(dev: Pin<&mut Freenect2Dev>, out: &mut RgbFrame) -> bool;
+
+        /// IR / depth camera intrinsics, available after the device starts.
         fn ir_params(dev: &Freenect2Dev) -> IrCameraParams;
     }
 }
 
-pub use ffi::{DepthFrame, Freenect2Ctx, Freenect2Dev, IrCameraParams};
+pub use ffi::{DepthFrame, Freenect2Ctx, Freenect2Dev, IrCameraParams, RgbFrame};
 pub use ffi::{
-    enumerate, ir_params, new_context, open_default, poll_depth, start_depth, stop_device,
+    enumerate, ir_params, new_context, open_default, poll_depth, poll_rgb, start_depth,
+    start_streams, stop_device,
 };
 
 // SAFETY: libfreenect2 spawns its own internal worker threads; the
