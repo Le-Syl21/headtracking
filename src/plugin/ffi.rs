@@ -16,12 +16,11 @@ use super::messages::{
     VPXPI_NAMESPACE,
 };
 use super::vpx_sys::{MsgPluginAPI, VPXPluginAPI, VPXViewSetupDef};
+use crate::camera::mapping::pose_delta_to_view_delta;
+use crate::tracker::Pose;
+use crate::tracker::session::TrackerSession;
 
 /// Lifecycle state captured at `PluginLoad` and torn down at `PluginUnload`.
-///
-/// Held behind a `Mutex` because VPX may invoke `PluginUnload` on a thread
-/// other than the one that handled `PluginLoad`, and the plugin API itself
-/// is documented as not thread-safe.
 struct PluginState {
     msg_api: *const MsgPluginAPI,
     vpx_api: *mut VPXPluginAPI,
@@ -45,6 +44,24 @@ struct SubscribedMsgs {
 unsafe impl Send for PluginState {}
 
 static STATE: Mutex<Option<PluginState>> = Mutex::new(None);
+
+/// Live tracker for the current game session. `Some` between `OnGameStart`
+/// and `OnGameEnd`, otherwise `None`.
+struct GameSession {
+    tracker: TrackerSession,
+    /// First valid pose seen this game, plus the matching `(viewX, viewY, viewZ)`
+    /// snapshot. Subsequent frames apply the head-motion delta on top of this
+    /// baseline so the table's authored POV is the neutral resting state.
+    baseline: Option<Baseline>,
+}
+
+#[derive(Clone, Copy)]
+struct Baseline {
+    pose: Pose,
+    view_xyz: [f32; 3],
+}
+
+static GAME: Mutex<Option<GameSession>> = Mutex::new(None);
 
 /// `dlsym` target invoked by VPX after loading the cdylib.
 ///
@@ -80,6 +97,8 @@ pub unsafe extern "C" fn HeadTrackingPluginLoad(session_id: u32, api: *const Msg
 pub unsafe extern "C" fn HeadTrackingPluginUnload() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         info!("HeadTracking plugin: unload");
+        // Drop any in-flight game session before tearing down the message bus.
+        GAME.lock().take();
         // SAFETY: matches the load contract.
         unsafe { do_unload() };
     }));
@@ -135,8 +154,8 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     info!("VPX plugin API resolved");
 
     // Subscribe to game lifecycle + per-frame hook.
-    // SAFETY: callbacks are FFI-safe (extern "C" fn with the documented signature),
-    // userData is null because we route all state through the global STATE mutex.
+    // SAFETY: callbacks are FFI-safe (extern "C" fn with the documented
+    // signature), userData is null because we route all state through globals.
     unsafe {
         subscribe(
             session_id,
@@ -210,33 +229,98 @@ unsafe fn do_unload() {
 extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         info!("VPX event: OnGameStart");
+        match TrackerSession::spawn() {
+            Ok(tracker) => {
+                let backend = tracker.backend_name();
+                *GAME.lock() = Some(GameSession {
+                    tracker,
+                    baseline: None,
+                });
+                info!(backend, "tracker session active");
+            }
+            Err(err) => {
+                warn!(?err, "tracker session failed to start; running passthrough");
+            }
+        }
     }));
 }
 
 extern "C" fn on_game_end(_msg_id: u32, _context: *mut c_void, _data: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         info!("VPX event: OnGameEnd");
+        // Drop joins the tracker thread and tears the device down.
+        GAME.lock().take();
     }));
 }
 
 extern "C" fn on_prepare_frame(_msg_id: u32, _context: *mut c_void, _data: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        // Stub: real implementation will read the latest tracker pose, map it
-        // to a `VPXViewSetupDef`, and call `vpxApi->SetActiveViewSetup`.
-        let _ = read_view_setup_stub();
-    }));
+    let _ = catch_unwind(AssertUnwindSafe(apply_pose_to_view));
 }
 
-fn read_view_setup_stub() -> Option<VPXViewSetupDef> {
-    let guard = STATE.lock();
-    let state = guard.as_ref()?;
-    // SAFETY: pointer captured from the host at load time, alive until unload.
-    let vpx = unsafe { &*state.vpx_api };
-    let getter = vpx.GetActiveViewSetup?;
+fn apply_pose_to_view() {
+    // 1. Snapshot the VPX API pointer (brief lock on STATE).
+    let vpx_api_ptr = match STATE.lock().as_ref() {
+        Some(s) => s.vpx_api,
+        None => return,
+    };
+    if vpx_api_ptr.is_null() {
+        return;
+    }
+
+    // 2. Hold the GAME lock for the rest. The tracker pose lookup is lock-free
+    //    (ArcSwap), and OnPrepareFrame is single-threaded by VPX, so there is
+    //    no contention.
+    let mut game_guard = GAME.lock();
+    let Some(game) = game_guard.as_mut() else {
+        return;
+    };
+
+    let pose = game.tracker.latest_pose();
+    if pose.confidence <= 0.0 {
+        return;
+    }
+
+    // SAFETY: vpx_api_ptr was set non-null at load time and the host keeps
+    // the API live through the plugin session.
+    let vpx = unsafe { &*vpx_api_ptr };
+    let Some(getter) = vpx.GetActiveViewSetup else {
+        return;
+    };
+    let Some(setter) = vpx.SetActiveViewSetup else {
+        return;
+    };
+
     let mut view = VPXViewSetupDef::default();
     // SAFETY: `view` is a valid out-pointer; getter follows the FFI contract.
     unsafe { getter(&raw mut view) };
-    Some(view)
+
+    let baseline = match game.baseline {
+        Some(b) => b,
+        None => {
+            // First frame with a real pose: capture both anchors and skip
+            // applying any delta — the table's authored POV stands.
+            let new_baseline = Baseline {
+                pose: *pose,
+                view_xyz: [view.viewX, view.viewY, view.viewZ],
+            };
+            game.baseline = Some(new_baseline);
+            info!(
+                x = pose.position_mm[0],
+                y = pose.position_mm[1],
+                z = pose.position_mm[2],
+                "tracker baseline captured"
+            );
+            return;
+        }
+    };
+
+    let delta = pose_delta_to_view_delta(&pose, &baseline.pose);
+    view.viewX = baseline.view_xyz[0] + delta.dx;
+    view.viewY = baseline.view_xyz[1] + delta.dy;
+    view.viewZ = baseline.view_xyz[2] + delta.dz;
+
+    // SAFETY: setter follows the FFI contract; we own `view`.
+    unsafe { setter(&raw mut view) };
 }
 
 fn init_tracing_once() {

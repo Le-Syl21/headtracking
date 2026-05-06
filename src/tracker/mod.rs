@@ -3,6 +3,8 @@
 #[cfg(feature = "kinect-v2")]
 pub mod kinect_v2;
 
+pub mod session;
+
 /// 3D head pose in the device coordinate frame, with monotonic timestamp.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pose {

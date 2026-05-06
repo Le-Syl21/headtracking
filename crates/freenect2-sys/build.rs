@@ -42,10 +42,15 @@ fn main() {
     // libfreenect2 hard-requires TurboJPEG at cmake time (FindTurboJPEG.cmake
     // is REQUIRED) for the RGB JPEG decoder. We never use the RGB stream, but
     // the symbols still end up linked into libfreenect2.a, so we must satisfy
-    // them. Static-link the system libturbojpeg.a so end-users don't need to
-    // install anything. (TODO: vendor libjpeg-turbo via a -sys crate to fully
-    // remove the dev-side `libturbojpeg0-dev` install requirement.)
-    println!("cargo:rustc-link-lib=static=turbojpeg");
+    // them.
+    //
+    // Ubuntu's `libturbojpeg.a` is built without `-fPIC` and refuses to land
+    // in a `cdylib`, so we link against the shared `libturbojpeg.so.0`
+    // instead. This brings back a small runtime user dep on Linux/macOS.
+    // TODO (task #11): patch libfreenect2's CMakeLists to make TurboJPEG
+    // genuinely optional so we can drop the dep entirely; or vendor
+    // libjpeg-turbo with PIC and link statically.
+    println!("cargo:rustc-link-lib=dylib=turbojpeg");
 
     // libfreenect2 USB transport — system libusb on Linux/macOS for now.
     // Switching to a vendored libusb (libusb1-sys/static) is the next step
