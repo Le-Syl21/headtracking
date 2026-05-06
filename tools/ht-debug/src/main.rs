@@ -164,6 +164,11 @@ struct Active {
     /// Run lockbar detection on each depth frame and overlay it.
     lockbar_enabled: bool,
     last_lockbar: Option<headtracking::calibration::LockbarObservation>,
+    /// `Some` when face detection is enabled (currently auto-enabled for
+    /// the webcam backend). Cheap to keep around — YuNet runs in <10 ms
+    /// at 320×320 on CPU.
+    face_detector: Option<face::Detector>,
+    last_faces: Vec<face::FaceDetection>,
 }
 
 mod filter_alias {
@@ -224,10 +229,60 @@ enum Inner {
 }
 
 impl Inner {
-    /// `true` when this input pipeline produces depth-derived head poses.
-    /// Webcam stays `false` until we wire a face tracker.
+    /// `true` when this input pipeline produces 3D head poses (depth blob
+    /// for Kinect, face landmarks + IOD triangulation for webcam).
     fn has_head_tracker(&self) -> bool {
-        matches!(self, Inner::KinectV1 { .. } | Inner::KinectV2 { .. })
+        matches!(
+            self,
+            Inner::KinectV1 { .. } | Inner::KinectV2 { .. } | Inner::Webcam { .. }
+        )
+    }
+}
+
+/// Pick the largest detected face by bounding-box area. The largest face is
+/// usually the one closest to the camera, which on a pincab is the player.
+fn pick_largest_face(faces: &[face::FaceDetection]) -> Option<&face::FaceDetection> {
+    faces.iter().max_by(|a, b| {
+        let area_a = a.width * a.height;
+        let area_b = b.width * b.height;
+        area_a
+            .partial_cmp(&area_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+/// Build a [`HeadPixel`] from a face detection. Z is triangulated from the
+/// interpupillary pixel distance assuming a 63 mm physical IOD and a
+/// nominal `fx ≈ 0.85 × frame_width` (typical 60° HFOV webcam). These
+/// numbers are placeholders until `ht-calibrate` measures the real focal
+/// length via the lockbar fiducial.
+fn face_to_head(face: &face::FaceDetection, frame_w: u32, frame_h: u32) -> HeadPixel {
+    const IOD_MM: f32 = 63.0;
+    let fx = 0.85 * frame_w as f32;
+    let fy = fx;
+    let cx = (frame_w as f32) / 2.0;
+    let cy = (frame_h as f32) / 2.0;
+
+    let dx = face.left_eye_x - face.right_eye_x;
+    let dy = face.left_eye_y - face.right_eye_y;
+    let pixel_iod = (dx * dx + dy * dy).sqrt().max(1.0);
+    let depth_mm = IOD_MM * fx / pixel_iod;
+
+    // Eye-midpoint as the head pixel.
+    let u = (face.left_eye_x + face.right_eye_x) * 0.5;
+    let v = (face.left_eye_y + face.right_eye_y) * 0.5;
+
+    let x_mm = (u - cx) * depth_mm / fx;
+    let y_mm = (v - cy) * depth_mm / fy;
+
+    HeadPixel {
+        u: u.max(0.0) as u32,
+        v: v.max(0.0) as u32,
+        frame_w,
+        frame_h,
+        depth_mm,
+        x_mm,
+        y_mm,
     }
 }
 
@@ -372,10 +427,27 @@ impl App {
             }
             Inner::Webcam { camera } => {
                 if let Some(rgb) = camera.poll_rgb() {
+                    // Face detection on the raw camera frame (before the
+                    // ColorImage conversion strips the contiguous bytes).
+                    if let Some(detector) = active.face_detector.as_mut() {
+                        active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
+                        if let Some(face) = pick_largest_face(&active.last_faces) {
+                            let head = face_to_head(face, rgb.width, rgb.height);
+                            let smoothed = smooth_head(
+                                Some(head),
+                                &active.intrinsics,
+                                &mut active.pose_filter,
+                                active.started_at,
+                            );
+                            capture_baseline(&mut active.baseline, smoothed);
+                            active.last_head = smoothed;
+                        } else {
+                            active.last_head = None;
+                        }
+                    }
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                 }
-                // No depth → no blob algo. Face tracker lands in P3.
             }
         }
     }
@@ -896,6 +968,8 @@ fn open_kinect_v2() -> Result<Active, String> {
         started_at: Instant::now(),
         lockbar_enabled: false,
         last_lockbar: None,
+        face_detector: None,
+        last_faces: Vec::new(),
     })
 }
 
@@ -943,15 +1017,31 @@ fn open_kinect_v1() -> Result<Active, String> {
         started_at: Instant::now(),
         lockbar_enabled: false,
         last_lockbar: None,
+        face_detector: None,
+        last_faces: Vec::new(),
     })
 }
 
 fn open_webcam(index: u32) -> Result<Active, String> {
     let camera = webcam::Camera::open(index).map_err(|e| format!("webcam open: {e}"))?;
+    let detector = match face::Detector::new() {
+        Ok(d) => {
+            info!("face detector initialised (YuNet)");
+            Some(d)
+        }
+        Err(e) => {
+            warn!(
+                ?e,
+                "face detector failed to initialise; webcam will run capture-only"
+            );
+            None
+        }
+    };
     Ok(Active {
         backend: Backend::Webcam(index),
-        // Placeholder intrinsics — the webcam tracker (face detection + IOD
-        // depth) will replace these with calibrated values.
+        // Without lockbar/disc calibration, fx ≈ 0.85 × frame_width is a
+        // reasonable placeholder for a generic 60° HFOV webcam. The values
+        // get replaced by ht-calibrate output when that lands.
         intrinsics: Intrinsics {
             fx: 0.0,
             fy: 0.0,
@@ -967,6 +1057,8 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         started_at: Instant::now(),
         lockbar_enabled: false,
         last_lockbar: None,
+        face_detector: detector,
+        last_faces: Vec::new(),
     })
 }
 

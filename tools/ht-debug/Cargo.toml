@@ -11,6 +11,7 @@ name = "ht-debug"
 path = "src/main.rs"
 
 [dependencies]
+face = { path = "../../crates/face" }
 freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
 webcam = { path = "../../crates/webcam" }
