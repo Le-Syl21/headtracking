@@ -166,14 +166,15 @@ Décision : **un seul chemin de code par capteur**, pas d'utilisation des SDK pr
 
 | Backend     | Cross-platform via         | Statut         | Crate Rust                              |
 |-------------|----------------------------|----------------|-----------------------------------------|
-| Kinect v1   | `libfreenect` (C API)      | P2 (à coder)   | `freenect-sys` (bindgen) + `freenect`   |
-| Kinect v2   | `libfreenect2` (C++ API)   | P1 ✅ opérationnel | `freenect2-sys` (cxx) + `freenect2`     |
-| Webcam      | `sdl3` + `rust-faces` ONNX | P3             | (à venir)                               |
+| Kinect v1   | `libfreenect` (C API)      | P2 ✅ capture + algo blob | `freenect-sys` (bindgen) + `freenect`   |
+| Kinect v2   | `libfreenect2` (C++ API)   | P1 ✅ capture + algo blob | `freenect2-sys` (cxx) + `freenect2`     |
+| Webcam      | **SDL3** `SDL_Camera`       | capture ✅, tracker P3 | `webcam` (sdl3-sys + safe wrapper) ; tracker via `rust-faces` ONNX (P3) |
 
 **Stratégie "zéro dep utilisateur final"** :
 - libfreenect / libfreenect2 compilés en static via `cmake` dans `build.rs` (CPU pipeline only pour libfreenect2 — pas de GPU dep).
 - libjpeg-turbo (requis par libfreenect2 même si on n'utilise pas le RGB) tiré du crate `turbojpeg-sys` feature `cmake` : build static PIC depuis les sources vendorées du crate. Le linker élimine en dead-code l'encodeur JPEG (libfreenect2 n'appelle que `tjInitDecompress` / `tjDecompress2` / `tjGetErrorStr` / `tjDestroy`).
 - Lien statique imposé dans `build.rs` **après** `libfreenect2` (les archives `.a` sont scannées une seule fois ; libfreenect2 référence les symboles `tj*` donc libturbojpeg.a doit suivre).
+- SDL3 vendoré via `sdl3-sys` features `build-from-source-static` + `sdl-camera` + `sdl-video`. Aucun dep utilisateur sur SDL3 (qui n'est de toute façon pas encore packagé partout).
 - `libusb-1.0` reste linké dynamiquement contre la lib système (universelle sur Linux/macOS).
 
 Compilation conditionnelle via features Cargo :

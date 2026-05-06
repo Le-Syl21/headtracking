@@ -104,13 +104,13 @@ fn detect_backends() -> Vec<BackendEntry> {
         Ok(cams) => {
             for cam in cams {
                 let label = if cam.name.is_empty() {
-                    format!("Webcam #{}", cam.index)
+                    format!("Webcam #{}", cam.id)
                 } else {
                     format!("Webcam: {}", cam.name)
                 };
-                info!(index = cam.index, name = %cam.name, "webcam detected");
+                info!(index = cam.id, name = %cam.name, "webcam detected");
                 out.push(BackendEntry {
-                    backend: Backend::Webcam(cam.index),
+                    backend: Backend::Webcam(cam.id),
                     label,
                 });
             }
