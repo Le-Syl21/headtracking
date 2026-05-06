@@ -15,6 +15,7 @@ use super::kinect_v1::KinectV1Backend;
 #[cfg(feature = "kinect-v2")]
 use super::kinect_v2::KinectV2Backend;
 use super::{HeadTracker, Pose};
+use crate::filter::OneEuroPose3D;
 
 /// Owns the tracker thread and exposes the latest pose.
 ///
@@ -78,9 +79,14 @@ impl TrackerSession {
             .name(format!("headtracking-{backend_name}"))
             .spawn(move || {
                 info!(backend = backend_name, "tracker thread started");
+                let mut filter = OneEuroPose3D::with_defaults();
                 while !stop_for_thread.load(Ordering::Relaxed) {
-                    if let Some(pose) = backend.poll() {
-                        latest_for_thread.store(Arc::new(pose));
+                    if let Some(raw) = backend.poll() {
+                        let smoothed = filter.update(raw.position_mm, raw.timestamp_us);
+                        latest_for_thread.store(Arc::new(Pose {
+                            position_mm: smoothed,
+                            ..raw
+                        }));
                     } else {
                         // No new frame yet; brief sleep instead of a spin.
                         thread::sleep(Duration::from_millis(2));

@@ -151,11 +151,24 @@ struct Active {
     backend: Backend,
     intrinsics: Intrinsics,
     rgb_texture: Option<TextureHandle>,
+    /// 1€-smoothed head pose. Same shape as the raw `HeadPixel` but the
+    /// position values come out of [`OneEuroPose3D`] so the crosshair and
+    /// the VPX delta panel stop jittering at the pixel level.
     last_head: Option<HeadPixel>,
     baseline: Option<Baseline>,
     inner: Inner,
     /// `Some` only when [`Inner::KinectV1`] — drives the motorised base.
     v1_controls: Option<V1Controls>,
+    pose_filter: filter_alias::OneEuroPose3D,
+    started_at: Instant,
+}
+
+mod filter_alias {
+    // The plugin's filter module isn't exposed as a sibling crate, but it's
+    // a standalone in-tree module — duplicate it here would mean another
+    // copy of identical code. Instead, ht-debug pulls it directly via the
+    // workspace's `headtracking` crate path.
+    pub use headtracking::filter::OneEuroPose3D;
 }
 
 /// State for the Kinect v1 tilt + LED panel. The desired values are kept
@@ -308,8 +321,14 @@ impl App {
                 if let Some(depth) = device.poll_depth() {
                     let head =
                         find_head_f32(&depth.data, depth.width, depth.height, &active.intrinsics);
-                    capture_baseline(&mut active.baseline, head);
-                    active.last_head = head;
+                    let smoothed = smooth_head(
+                        head,
+                        &active.intrinsics,
+                        &mut active.pose_filter,
+                        active.started_at,
+                    );
+                    capture_baseline(&mut active.baseline, smoothed);
+                    active.last_head = smoothed;
                 }
             }
             Inner::KinectV1 { device, .. } => {
@@ -322,8 +341,14 @@ impl App {
                     let f32_data: Vec<f32> = depth.data.iter().map(|&v| f32::from(v)).collect();
                     let head =
                         find_head_f32(&f32_data, depth.width, depth.height, &active.intrinsics);
-                    capture_baseline(&mut active.baseline, head);
-                    active.last_head = head;
+                    let smoothed = smooth_head(
+                        head,
+                        &active.intrinsics,
+                        &mut active.pose_filter,
+                        active.started_at,
+                    );
+                    capture_baseline(&mut active.baseline, smoothed);
+                    active.last_head = smoothed;
                 }
             }
             Inner::Webcam { camera } => {
@@ -335,6 +360,30 @@ impl App {
             }
         }
     }
+}
+
+/// Apply the 1€ filter to the head pose in millimetres, then re-project
+/// the smoothed (x, y, z) to pixel coordinates so the crosshair tracks the
+/// same smoothed point. Returns `None` if the input was already `None`.
+fn smooth_head(
+    raw: Option<HeadPixel>,
+    intr: &Intrinsics,
+    filter: &mut filter_alias::OneEuroPose3D,
+    started_at: Instant,
+) -> Option<HeadPixel> {
+    let mut head = raw?;
+    let t_us = started_at.elapsed().as_micros() as u64;
+    let smoothed = filter.update([head.x_mm, head.y_mm, head.depth_mm], t_us);
+    head.x_mm = smoothed[0];
+    head.y_mm = smoothed[1];
+    head.depth_mm = smoothed[2];
+    if head.depth_mm > 0.0 && intr.fx > 0.0 && intr.fy > 0.0 {
+        let u = intr.cx + head.x_mm * intr.fx / head.depth_mm;
+        let v = intr.cy + head.y_mm * intr.fy / head.depth_mm;
+        head.u = u.max(0.0) as u32;
+        head.v = v.max(0.0) as u32;
+    }
+    Some(head)
 }
 
 impl App {
@@ -766,6 +815,8 @@ fn open_kinect_v2() -> Result<Active, String> {
         baseline: None,
         inner: Inner::KinectV2 { device, _ctx: ctx },
         v1_controls: None,
+        pose_filter: filter_alias::OneEuroPose3D::with_defaults(),
+        started_at: Instant::now(),
     })
 }
 
@@ -809,6 +860,8 @@ fn open_kinect_v1() -> Result<Active, String> {
         baseline: None,
         inner: Inner::KinectV1 { device, _ctx: ctx },
         v1_controls: Some(controls),
+        pose_filter: filter_alias::OneEuroPose3D::with_defaults(),
+        started_at: Instant::now(),
     })
 }
 
@@ -829,6 +882,8 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         baseline: None,
         inner: Inner::Webcam { camera },
         v1_controls: None,
+        pose_filter: filter_alias::OneEuroPose3D::with_defaults(),
+        started_at: Instant::now(),
     })
 }
 

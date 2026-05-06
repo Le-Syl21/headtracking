@@ -14,6 +14,7 @@ path = "src/main.rs"
 freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
 webcam = { path = "../../crates/webcam" }
+headtracking = { path = "../.." }
 eframe = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 parking_lot = "0.12"
 tracing = "0.1"

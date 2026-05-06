@@ -1176,6 +1176,7 @@ dependencies = [
  "eframe",
  "freenect",
  "freenect2",
+ "headtracking",
  "parking_lot",
  "tracing",
  "tracing-subscriber",
