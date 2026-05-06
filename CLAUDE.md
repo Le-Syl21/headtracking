@@ -32,27 +32,46 @@ Plugin de **head tracking temps réel pour Visual Pinball X (VPX) 10.8.1+** qui 
 │   │   ├── plugin/              ← integration plugin VPX (msg bus, registration)
 │   │   │   ├── mod.rs
 │   │   │   ├── ffi.rs           ← #[no_mangle] extern "C" entry points
-│   │   │   └── messages.rs      ← parsing/dispatch des messages VPX
-│   │   ├── tracker/             ← trait HeadTracker + backends
+│   │   │   ├── messages.rs      ← &CStr constants pour les msg IDs VPX
+│   │   │   └── vpx_sys.rs       ← include! des bindings bindgen générés
+│   │   ├── tracker/             ← trait HeadTracker + backends + session thread
 │   │   │   ├── mod.rs
-│   │   │   ├── kinect_v1.rs     ← feature = "kinect-v1"
-│   │   │   ├── kinect_v2.rs     ← feature = "kinect-v2"
-│   │   │   └── webcam.rs        ← feature = "webcam"
+│   │   │   ├── session.rs       ← TrackerSession (thread + ArcSwap<Pose>)
+│   │   │   ├── kinect_v1.rs     ← feature = "kinect-v1" (P2)
+│   │   │   ├── kinect_v2.rs     ← feature = "kinect-v2" (P1, opérationnel)
+│   │   │   └── webcam.rs        ← feature = "webcam" (P3)
 │   │   ├── filter/              ← one-euro / Kalman pour lisser le pose
-│   │   ├── camera/              ← mapping pose → POV VPX (Player X/Y/Z)
+│   │   ├── camera/              ← mapping Pose → ViewSetupDef
+│   │   │   ├── mod.rs
+│   │   │   ├── mapping.rs       ← Pose → ViewDelta (mm → VPU + axis flip)
+│   │   │   └── units.rs         ← MM ↔ VPU (50 VPU = 1.0625" = 26.9875 mm)
 │   │   └── calibration/         ← lecture/écriture toml, repère device→VPX
-│   ├── build.rs                 ← bindgen sur headers VPX
-│   ├── Cargo.toml
+│   ├── crates/                  ← bindings Rust maison (in-tree workspace members)
+│   │   ├── freenect2-sys/       ← cxx::bridge sur libfreenect2 (Kinect v2)
+│   │   │   ├── build.rs         ← cmake static + cxx-build
+│   │   │   ├── src/lib.rs       ← #[cxx::bridge]
+│   │   │   ├── src/shim.{h,cpp} ← C++ shim (DepthSink FrameListener)
+│   │   │   └── vendor/libfreenect2/  ← submodule, pinned v0.2.1
+│   │   ├── freenect2/           ← safe wrapper (Context, Device, ...)
+│   │   ├── freenect-sys/        ← bindgen sur libfreenect (Kinect v1, P2)
+│   │   │   └── vendor/libfreenect/   ← submodule, pinned v0.7.5
+│   │   └── freenect/            ← safe wrapper v1
+│   ├── build.rs                 ← bindgen sur les headers plugin VPX
+│   ├── wrapper.h                ← header agrégé consommé par bindgen
+│   ├── plugin.cfg               ← manifest VPX (id="HeadTracking", platforms)
+│   ├── Cargo.toml               ← workspace root + cdylib
 │   ├── tools/
 │   │   └── ht-calibrate/        ← binaire CLI standalone (pas un plugin)
 │   ├── docs/
 │   └── CLAUDE.md                ← ce fichier
 │
 └── vpinball/                    ← READ-ONLY référence (sources VPX)
-    ├── plugins/plugins/         ← exemples de plugins existants à étudier
-    ├── plugins/*.h              ← headers C de l'API plugin (cibles bindgen)
+    ├── plugins/plugins/         ← headers C de l'API plugin (cibles bindgen)
+    │   ├── MsgPlugin.h          ← bus de messages, callbacks, threading
+    │   ├── VPXPlugin.h          ← VPXPluginAPI, ViewSetupDef, événements
+    │   └── LoggingPlugin.h      ← API logging native VPX
+    ├── plugins/<example>/       ← plugins de référence (helloworld, b2s, …)
     ├── docs/View Setup.md       ← sémantique caméra / POV
-    ├── docs/Plugin*.md          ← docs API plugin (à lire avant tout dev)
     └── standalone/              ← infos build cross-platform
 ```
 
@@ -92,10 +111,24 @@ Plugin de **head tracking temps réel pour Visual Pinball X (VPX) 10.8.1+** qui 
 ### 3.2 FFI — règles
 
 - **Tout symbole exporté** est dans `src/plugin/ffi.rs`, jamais ailleurs.
+- **Convention de nommage des entry points** : VPX appelle `dlsym("<id>PluginLoad")` et `dlsym("<id>PluginUnload")` où `<id>` est exactement la valeur du champ `id` de `plugin.cfg`. Notre `id = "HeadTracking"` ⇒ on exporte `HeadTrackingPluginLoad` et `HeadTrackingPluginUnload` (cf. `~/dev/vpinball/src/plugins/MsgPluginManager.cpp`).
 - Chaque `extern "C" fn` exportée est **`catch_unwind`** : un panic ne doit jamais traverser la frontière FFI.
 - Toutes les structures partagées avec VPX sont `#[repr(C)]`, jamais `#[repr(Rust)]`.
-- Bindings VPX générés par `bindgen` dans `build.rs` à partir de `../vpinball/plugins/*.h`. Le résultat est `include!`-é dans un module `vpx_sys`.
+- Bindings VPX générés par `bindgen` dans `build.rs` à partir de **`../vpinball/plugins/plugins/{MsgPlugin,VPXPlugin,LoggingPlugin}.h`** (chemin réel : sous-dossier `plugins/plugins/`). Le résultat est `include!`-é dans `src/plugin/vpx_sys.rs`. Override possible via `VPX_PLUGINS_DIR`.
 - Pas d'`unsafe` en dehors de `plugin/ffi.rs` et `tracker/*` (appels SDK natifs).
+- **Cleanup obligatoire au unload** : chaque `GetMsgID` ⇒ `ReleaseMsgID`, chaque `SubscribeMsg` ⇒ `UnsubscribeMsg`. Sinon UB au prochain reload du plugin.
+
+### 3.2bis API VPX cible (depuis l'audit des sources)
+
+- **Subscribe à** `VPX/OnPrepareFrame` pour modifier la POV chaque frame, plus `VPX/OnGameStart` / `VPX/OnGameEnd` pour le cycle de vie.
+- **Récupérer `VPXPluginAPI`** via `BroadcastMsg(endpoint, GetMsgID("VPX","GetAPI"), &mut ptr)` au load. Le host répond synchroniquement.
+- **Modifier la caméra** : `vpxApi->GetActiveViewSetup(&view)` puis muter `view.viewX/viewY/viewZ` (RW), puis `vpxApi->SetActiveViewSetup(&view)`.
+- **Mode VPX recommandé** pour head tracking : `VLM_CAMERA` (position relative au centre bas de la table). `VLM_WINDOW` est aussi conçu pour ça mais moins testé côté upstream.
+- **Threading** : tous les appels API sont attendus sur le thread principal (assertion côté VPX). Le tracker tourne sur son propre thread et publie via `ArcSwap<Pose>` ; le callback `OnPrepareFrame` (sur main thread) lit sans bloquer. Pour marshaller l'inverse il y a `MsgPluginAPI::RunOnMainThread`.
+
+### 3.2ter Logging
+
+`LoggingPlugin.h` expose une API host (`LPI_LOGI/W/E/D`) qu'il faut récupérer comme `VPXPluginAPI` (broadcast `Logging/GetAPI`). À utiliser plutôt qu'un fichier indépendant, pour que les logs apparaissent dans la console VPX. Pour l'instant on est encore sur `tracing` → stderr ; bascule vers l'API native = TODO.
 
 ### 3.3 Modèle Pose
 
@@ -108,9 +141,10 @@ pub struct Pose {
 }
 ```
 
-Mapping vers VPX (cf. `../vpinball/docs/View Setup.md`, mode "Window projection") :
-- `Pose.position_mm` × matrice calibration → `Player X/Y/Z`
-- Matrice calibration stockée en `~/.config/headtracking/calibration.toml` (Linux/macOS) ou `%APPDATA%\headtracking\calibration.toml` (Windows)
+Mapping vers VPX (cf. `../vpinball/docs/View Setup.md`, mode "Camera" recommandé) :
+- `Pose.position_mm` (repère Kinect) → delta `(viewX, viewY, viewZ)` en VPU via `src/camera/mapping.rs`
+- Conversions VPU↔mm dans `src/camera/units.rs` (50 VPU = 1.0625″ = 26.9875 mm, calculs en `f64` pour matcher la précision du macro `MMTOVPU` de VPX)
+- Matrice de calibration plus complète stockée en `~/.config/headtracking/calibration.toml` (Linux/macOS) ou `%APPDATA%\headtracking\calibration.toml` (Windows)
 
 ### 3.4 Trait tracker
 
@@ -128,25 +162,29 @@ Le tracker tourne dans un thread dédié, partage le dernier pose via `arc_swap:
 
 ## 4. Backends device
 
-| Backend     | Windows                       | Linux              | macOS              | Statut |
-|-------------|-------------------------------|--------------------|--------------------|--------|
-| Kinect v1   | Kinect SDK 1.8 (driver auto)  | libfreenect        | libfreenect        | MVP P1 |
-| Kinect v2   | Kinect SDK 2.0 (driver auto)  | libfreenect2       | libfreenect2       | MVP P1 |
-| Webcam      | ONNX (DirectML EP)            | ONNX (CPU/CUDA EP) | ONNX (CoreML EP)   | P2     |
+Décision : **un seul chemin de code par capteur**, pas d'utilisation des SDK propriétaires Microsoft. On vendore `libfreenect` et `libfreenect2` en submodules et on link statique. Les bindings sont in-tree dans `crates/`.
 
-**Note Windows** : les drivers Kinect sont fournis automatiquement via Windows Update depuis la mise en libre des SDK officiels. Pas besoin de packager les drivers.
+| Backend     | Cross-platform via         | Statut         | Crate Rust                              |
+|-------------|----------------------------|----------------|-----------------------------------------|
+| Kinect v1   | `libfreenect` (C API)      | P2 (à coder)   | `freenect-sys` (bindgen) + `freenect`   |
+| Kinect v2   | `libfreenect2` (C++ API)   | P1 ✅ opérationnel | `freenect2-sys` (cxx) + `freenect2`     |
+| Webcam      | `sdl3` + `rust-faces` ONNX | P3             | (à venir)                               |
 
-**Webcam (P2)** : face landmarks via `ort` crate (ONNX Runtime). Candidats de modèle : MediaPipe Face Mesh exporté ONNX, ou modèle léger type SynergyNet / 3DDFA.
+**Stratégie "zéro dep utilisateur final"** :
+- libfreenect / libfreenect2 compilés en static via `cmake` dans `build.rs` (CPU pipeline only pour libfreenect2 — pas de GPU dep).
+- Limites actuelles côté libfreenect2 :
+  - `TurboJPEG` est `REQUIRED` par le `CMakeLists.txt` upstream pour le décodage MJPEG du flux RGB qu'on n'utilise pas. Patch local prévu (task tracking) pour le rendre optionnel et virer la dep.
+  - `libturbojpeg` linké en **dynamique** parce que la `.a` Ubuntu n'est pas compilée `-fPIC`. À résoudre en vendorant libjpeg-turbo nous-mêmes.
+- `libusb-1.0` reste linké dynamiquement contre la lib système (universelle sur Linux/macOS).
 
 Compilation conditionnelle via features Cargo :
 
 ```toml
 [features]
-default = ["kinect-v2"]
-kinect-v1 = ["dep:freenect"]
-kinect-v2 = ["dep:libfreenect2-sys"]
-webcam    = ["dep:ort", "dep:nokhwa"]
-all-trackers = ["kinect-v1", "kinect-v2", "webcam"]
+default = []
+kinect-v1 = []                  # déclenche `dep:freenect` quand le crate sera prêt
+kinect-v2 = ["dep:freenect2"]   # opérationnel
+all-trackers = ["kinect-v1", "kinect-v2"]
 ```
 
 Activation runtime via la config (toml) : un seul backend actif à la fois pour le MVP.
@@ -157,12 +195,21 @@ Activation runtime via la config (toml) : un seul backend actif à la fois pour 
 
 ### Pré-requis
 
-- Rust stable récent (édition 2024)
-- `bindgen` requiert `libclang` (paquet `clang` / `llvm` / `libclang-dev`)
+- Rust stable récent (édition 2024, testé 1.95)
+- `bindgen` requiert `libclang` (paquet `libclang1-X` ou `clang`). `build.rs` cherche le sysroot dans plusieurs emplacements et tombe sur les headers GCC en dernier recours.
+- `cmake` ≥ 3.20
 - Selon backend :
-  - Linux : `libfreenect-dev`, `libfreenect2-dev`, `libusb-1.0-0-dev`
-  - macOS : `brew install libfreenect libfreenect2`
-  - Windows : Kinect SDK 1.8 et/ou 2.0 installés
+  - Linux : `libusb-1.0-0-dev`, `libturbojpeg0-dev` (TurboJPEG est encore une dep dev tant que le patch optionnel n'est pas appliqué)
+  - macOS : `brew install libusb jpeg-turbo`
+  - Windows : `cargo-xwin` (cible MSVC) ; libusb et libjpeg-turbo via vcpkg
+- **Pas besoin** d'installer `libfreenect-dev` / `libfreenect2-dev` ni de SDK Microsoft : tout est vendoré dans `crates/*-sys/vendor/`.
+- **Cloner avec submodules** : `git clone --recurse-submodules ...` ou `git submodule update --init` après-coup.
+
+### Runtime utilisateur (côté pincab)
+
+Pour exécuter le `.so`/`.dll`/`.dylib` :
+- Linux/macOS : `libusb-1.0`, `libstdc++`, `libturbojpeg` (paquets très répandus, déjà installés sur la majorité des systèmes)
+- Windows : à voir quand on cross-compile
 
 ### Commandes
 
