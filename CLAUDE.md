@@ -172,9 +172,8 @@ Décision : **un seul chemin de code par capteur**, pas d'utilisation des SDK pr
 
 **Stratégie "zéro dep utilisateur final"** :
 - libfreenect / libfreenect2 compilés en static via `cmake` dans `build.rs` (CPU pipeline only pour libfreenect2 — pas de GPU dep).
-- Limites actuelles côté libfreenect2 :
-  - `TurboJPEG` est `REQUIRED` par le `CMakeLists.txt` upstream pour le décodage MJPEG du flux RGB qu'on n'utilise pas. Patch local prévu (task tracking) pour le rendre optionnel et virer la dep.
-  - `libturbojpeg` linké en **dynamique** parce que la `.a` Ubuntu n'est pas compilée `-fPIC`. À résoudre en vendorant libjpeg-turbo nous-mêmes.
+- libjpeg-turbo (requis par libfreenect2 même si on n'utilise pas le RGB) tiré du crate `turbojpeg-sys` feature `cmake` : build static PIC depuis les sources vendorées du crate. Le linker élimine en dead-code l'encodeur JPEG (libfreenect2 n'appelle que `tjInitDecompress` / `tjDecompress2` / `tjGetErrorStr` / `tjDestroy`).
+- Lien statique imposé dans `build.rs` **après** `libfreenect2` (les archives `.a` sont scannées une seule fois ; libfreenect2 référence les symboles `tj*` donc libturbojpeg.a doit suivre).
 - `libusb-1.0` reste linké dynamiquement contre la lib système (universelle sur Linux/macOS).
 
 Compilation conditionnelle via features Cargo :
@@ -199,17 +198,17 @@ Activation runtime via la config (toml) : un seul backend actif à la fois pour 
 - `bindgen` requiert `libclang` (paquet `libclang1-X` ou `clang`). `build.rs` cherche le sysroot dans plusieurs emplacements et tombe sur les headers GCC en dernier recours.
 - `cmake` ≥ 3.20
 - Selon backend :
-  - Linux : `libusb-1.0-0-dev`, `libturbojpeg0-dev` (TurboJPEG est encore une dep dev tant que le patch optionnel n'est pas appliqué)
-  - macOS : `brew install libusb jpeg-turbo`
-  - Windows : `cargo-xwin` (cible MSVC) ; libusb et libjpeg-turbo via vcpkg
-- **Pas besoin** d'installer `libfreenect-dev` / `libfreenect2-dev` ni de SDK Microsoft : tout est vendoré dans `crates/*-sys/vendor/`.
+  - Linux : `libusb-1.0-0-dev`
+  - macOS : `brew install libusb`
+  - Windows : `cargo-xwin` (cible MSVC) ; libusb via vcpkg
+- **Pas besoin** d'installer `libfreenect-dev` / `libfreenect2-dev` / `libturbojpeg0-dev` ni de SDK Microsoft : tout est vendoré.
+  - libfreenect / libfreenect2 : submodules dans `crates/*-sys/vendor/`
+  - libjpeg-turbo : via le crate [`turbojpeg-sys`](https://crates.io/crates/turbojpeg-sys) feature `cmake` (build statique PIC à partir de sources bundled)
 - **Cloner avec submodules** : `git clone --recurse-submodules ...` ou `git submodule update --init` après-coup.
 
 ### Runtime utilisateur (côté pincab)
 
-Pour exécuter le `.so`/`.dll`/`.dylib` :
-- Linux/macOS : `libusb-1.0`, `libstdc++`, `libturbojpeg` (paquets très répandus, déjà installés sur la majorité des systèmes)
-- Windows : à voir quand on cross-compile
+Pour exécuter le `.so`/`.dll`/`.dylib` : aucune dépendance applicative à installer. Les seules `NEEDED` sur Linux sont les libs systèmes universelles : `libusb-1.0`, `libstdc++`, `libgcc_s`, `libm`, `libc`, plus `libudev` / `libcap` via libusb. Toutes déjà présentes par défaut sur Ubuntu/Debian/Fedora/Arch.
 
 ### Commandes
 

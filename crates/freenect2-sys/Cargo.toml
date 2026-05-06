@@ -10,6 +10,10 @@ publish = false
 
 [dependencies]
 cxx = "1.0"
+# Vendored libjpeg-turbo so libfreenect2's RGB packet processor links
+# against a PIC-enabled static archive — Ubuntu's `libturbojpeg.a` is
+# non-PIC and refuses to land in a cdylib.
+turbojpeg-sys = { version = "1", default-features = false, features = ["cmake"] }
 
 [build-dependencies]
 cxx-build = "1.0"

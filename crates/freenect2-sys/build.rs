@@ -1,6 +1,7 @@
 //! Build libfreenect2 statically from the vendored submodule and compile the
 //! cxx shim that bridges its C++ API to Rust.
 
+use std::env;
 use std::path::PathBuf;
 
 fn main() {
@@ -20,8 +21,26 @@ fn main() {
         );
     }
 
+    // libfreenect2's CMakeLists `find_package(TurboJPEG REQUIRED)` — point it
+    // at the vendored libjpeg-turbo built by `turbojpeg-sys` so we don't need
+    // anything from the system. `DEP_TURBOJPEG_*` come from `turbojpeg-sys`'s
+    // build script (Cargo propagates them because that crate declares
+    // `links = "turbojpeg"`).
+    let tj_root = env::var("DEP_TURBOJPEG_ROOT")
+        .or_else(|_| env::var("DEP_TURBOJPEG_OUT_DIR"))
+        .expect(
+            "turbojpeg-sys did not export DEP_TURBOJPEG_ROOT — \
+             ensure freenect2-sys depends on turbojpeg-sys with the `cmake` feature",
+        );
+    let tj_include =
+        env::var("DEP_TURBOJPEG_INCLUDE").unwrap_or_else(|_| format!("{tj_root}/include"));
+    // libturbojpeg.a depends on libjpeg.a internally; pass both as a cmake
+    // list so libfreenect2's TURBOJPEG_WORKS try-compile actually links.
+    let tj_libs = format!("{tj_root}/lib/libturbojpeg.a;{tj_root}/lib/libjpeg.a");
+
     // Build libfreenect2 statically with the CPU packet pipeline only.
-    // No GPU, no OpenNI2, no examples — keeps the dep tree to libusb + libc++.
+    // No GPU, no OpenNI2, no examples — keeps the dep tree to libusb + libc++
+    // plus the static libjpeg-turbo we hand it.
     let dst = cmake::Config::new(&vendor_dir)
         .profile("Release")
         .define("BUILD_SHARED_LIBS", "OFF")
@@ -32,25 +51,27 @@ fn main() {
         .define("ENABLE_CUDA", "OFF")
         .define("ENABLE_VAAPI", "OFF")
         .define("ENABLE_TEGRAJPEG", "OFF")
-        .define("ENABLE_LIBJPEG_TURBO", "OFF")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
+        .define("TurboJPEG_INCLUDE_DIRS", &tj_include)
+        .define("TurboJPEG_LIBRARIES", &tj_libs)
+        // libfreenect2's FindTurboJPEG.cmake runs `check_c_source_compiles`
+        // to validate the lib via try_compile. cmake mangles our `;`-list of
+        // .a paths and that test fails — but we don't actually need it: the
+        // final cdylib link is wired by Cargo through turbojpeg-sys's
+        // transitive link metadata. Pre-cache the success flag.
+        .define("TURBOJPEG_WORKS", "TRUE")
         .build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=freenect2");
-
-    // libfreenect2 hard-requires TurboJPEG at cmake time (FindTurboJPEG.cmake
-    // is REQUIRED) for the RGB JPEG decoder. We never use the RGB stream, but
-    // the symbols still end up linked into libfreenect2.a, so we must satisfy
-    // them.
-    //
-    // Ubuntu's `libturbojpeg.a` is built without `-fPIC` and refuses to land
-    // in a `cdylib`, so we link against the shared `libturbojpeg.so.0`
-    // instead. This brings back a small runtime user dep on Linux/macOS.
-    // TODO (task #11): patch libfreenect2's CMakeLists to make TurboJPEG
-    // genuinely optional so we can drop the dep entirely; or vendor
-    // libjpeg-turbo with PIC and link statically.
-    println!("cargo:rustc-link-lib=dylib=turbojpeg");
+    // Static archives are scanned once in the order they appear on the link
+    // line. libfreenect2.a references tj* / jpeg* symbols, so the JPEG
+    // archives MUST come after it. turbojpeg-sys emits its own link
+    // directives, but they end up before freenect2 (deps come first), so we
+    // re-emit them here to force the right order.
+    println!("cargo:rustc-link-search=native={tj_root}/lib");
+    println!("cargo:rustc-link-lib=static=turbojpeg");
+    println!("cargo:rustc-link-lib=static=jpeg");
 
     // libfreenect2 USB transport — system libusb on Linux/macOS for now.
     // Switching to a vendored libusb (libusb1-sys/static) is the next step
