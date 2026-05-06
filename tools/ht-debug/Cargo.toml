@@ -11,6 +11,7 @@ name = "ht-debug"
 path = "src/main.rs"
 
 [dependencies]
+freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
 eframe = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 parking_lot = "0.12"

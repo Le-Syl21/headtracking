@@ -1,9 +1,9 @@
-//! `ht-debug`: standalone Kinect-v2 viewer for the head-tracker pipeline.
+//! `ht-debug`: standalone Kinect viewer for the head-tracker pipeline.
 //!
-//! Displays the live RGB feed with a crosshair on the detected head, the
-//! current distance, and a scrollable log panel — all in one window.
-//! A dropdown at the top selects the input backend (currently None / Kinect
-//! v2 — Kinect v1 and webcam will plug into the same selector).
+//! Detects connected Kinect v1 / v2 sensors and exposes a dropdown to pick
+//! the active input. The center pane shows the live RGB feed with a
+//! crosshair on the detected head; the bottom panel splits into a tracing
+//! log on the left and the VPX-style view delta on the right.
 //!
 //! Run with `cargo run --release -p ht-debug`.
 
@@ -15,17 +15,11 @@ use eframe::egui::{
     self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, TextureHandle, TopBottomPanel, Vec2,
 };
-use freenect2::{Context, DepthFrame, Device, IrCameraParams, RgbFrame};
 use parking_lot::Mutex;
 use tracing::{error, info};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-const RGB_WIDTH: usize = 1920;
-const RGB_HEIGHT: usize = 1080;
-const DEPTH_WIDTH: usize = 512;
-const DEPTH_HEIGHT: usize = 424;
 
 const DEPTH_MIN_MM: f32 = 500.0;
 const DEPTH_MAX_MM: f32 = 2_500.0;
@@ -58,6 +52,7 @@ fn main() -> eframe::Result {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
     None,
+    KinectV1,
     KinectV2,
 }
 
@@ -65,15 +60,47 @@ impl Backend {
     fn label(self) -> &'static str {
         match self {
             Backend::None => "None (off)",
+            Backend::KinectV1 => "Kinect v1",
             Backend::KinectV2 => "Kinect v2",
         }
     }
 }
 
-// ============================================================ App
+/// Probe USB for connected Kinect sensors. Always returns `None` first; the
+/// other entries are added when the corresponding library reports a device.
+fn detect_backends() -> Vec<Backend> {
+    let mut out = vec![Backend::None];
+
+    match freenect2::Context::new() {
+        Ok(ctx) => {
+            let n = ctx.enumerate();
+            if n > 0 {
+                out.push(Backend::KinectV2);
+                info!(count = n, "kinect v2 detected");
+            }
+        }
+        Err(e) => info!(?e, "kinect v2 enumerate failed"),
+    }
+
+    match freenect::Context::new() {
+        Ok(ctx) => {
+            let n = ctx.enumerate();
+            if n > 0 {
+                out.push(Backend::KinectV1);
+                info!(count = n, "kinect v1 detected");
+            }
+        }
+        Err(e) => info!(?e, "kinect v1 enumerate failed"),
+    }
+
+    out
+}
+
+// ============================================================ App state
 
 struct App {
     selected: Backend,
+    available: Vec<Backend>,
     active: Option<Active>,
     error: Option<String>,
     logs: Arc<Mutex<VecDeque<String>>>,
@@ -81,24 +108,40 @@ struct App {
 
 struct Active {
     backend: Backend,
-    // `device` holds a USB session; keep `_ctx` alive until after `device`
-    // tears down (struct fields drop in declaration order).
-    device: Device,
-    _ctx: Context,
-    intrinsics: IrCameraParams,
+    intrinsics: Intrinsics,
     rgb_texture: Option<TextureHandle>,
     last_head: Option<HeadPixel>,
-    /// First valid head pose since the device opened (or since the user hit
-    /// "reset baseline"). The plugin would capture this on the first frame
-    /// of a game and apply subsequent moves as deltas around it.
     baseline: Option<Baseline>,
+    inner: Inner,
+}
+
+#[derive(Clone, Copy)]
+struct Intrinsics {
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+}
+
+enum Inner {
+    KinectV2 {
+        device: freenect2::Device,
+        _ctx: freenect2::Context,
+    },
+    KinectV1 {
+        device: freenect::Device,
+        _ctx: freenect::Context,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
 struct HeadPixel {
-    /// Pixel coords inside the 512×424 depth grid.
+    /// Pixel coords inside the depth grid (different size per sensor).
     u: u32,
     v: u32,
+    /// Frame width — needed by the painter to map back to display coords.
+    frame_w: u32,
+    frame_h: u32,
     depth_mm: f32,
     x_mm: f32,
     y_mm: f32,
@@ -113,12 +156,25 @@ struct Baseline {
 
 impl App {
     fn new(logs: Arc<Mutex<VecDeque<String>>>) -> Self {
+        let available = detect_backends();
         Self {
             selected: Backend::None,
+            available,
             active: None,
             error: None,
             logs,
         }
+    }
+
+    fn refresh_available(&mut self) {
+        // Drop the active device first — libfreenect[2] can't reliably
+        // enumerate while a sibling context holds an open device on Linux.
+        if let Some(old) = self.active.take() {
+            info!(backend = ?old.backend, "closing backend before scan");
+            drop(old);
+        }
+        self.selected = Backend::None;
+        self.available = detect_backends();
     }
 
     fn ensure_active(&mut self) {
@@ -130,8 +186,6 @@ impl App {
         if !needs_change {
             return;
         }
-
-        // Drop the old device first so libfreenect2 releases its USB session.
         if let Some(old) = self.active.take() {
             info!(backend = ?old.backend, "closing backend");
             drop(old);
@@ -140,7 +194,6 @@ impl App {
         if matches!(self.selected, Backend::None) {
             return;
         }
-
         match open_backend(self.selected) {
             Ok(active) => {
                 info!(
@@ -156,6 +209,7 @@ impl App {
             Err(e) => {
                 error!(?e, "failed to open backend");
                 self.error = Some(e);
+                self.selected = Backend::None;
             }
         }
     }
@@ -164,36 +218,61 @@ impl App {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if let Some(rgb) = active.device.poll_rgb() {
-            let img = bgrx_to_color_image(&rgb);
-            match active.rgb_texture.as_mut() {
-                Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
-                None => {
-                    active.rgb_texture =
-                        Some(egui_ctx.load_texture("rgb", img, egui::TextureOptions::LINEAR));
+        match &mut active.inner {
+            Inner::KinectV2 { device, .. } => {
+                if let Some(rgb) = device.poll_rgb() {
+                    let img = bgrx_to_color_image(rgb.width, rgb.height, &rgb.data);
+                    upload_texture(egui_ctx, &mut active.rgb_texture, img);
+                }
+                if let Some(depth) = device.poll_depth() {
+                    let head =
+                        find_head_f32(&depth.data, depth.width, depth.height, &active.intrinsics);
+                    capture_baseline(&mut active.baseline, head);
+                    active.last_head = head;
+                }
+            }
+            Inner::KinectV1 { device, .. } => {
+                if let Some(rgb) = device.poll_rgb() {
+                    let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
+                    upload_texture(egui_ctx, &mut active.rgb_texture, img);
+                }
+                if let Some(depth) = device.poll_depth() {
+                    // libfreenect ships u16 mm; widen for the shared algo.
+                    let f32_data: Vec<f32> = depth.data.iter().map(|&v| f32::from(v)).collect();
+                    let head =
+                        find_head_f32(&f32_data, depth.width, depth.height, &active.intrinsics);
+                    capture_baseline(&mut active.baseline, head);
+                    active.last_head = head;
                 }
             }
         }
-        if let Some(depth) = active.device.poll_depth() {
-            active.last_head = find_head(&depth, &active.intrinsics);
-            if active.baseline.is_none()
-                && let Some(head) = active.last_head
-            {
-                let baseline = Baseline {
-                    x_mm: head.x_mm,
-                    y_mm: head.y_mm,
-                    z_mm: head.depth_mm,
-                };
-                active.baseline = Some(baseline);
-                info!(
-                    x_mm = baseline.x_mm,
-                    y_mm = baseline.y_mm,
-                    z_mm = baseline.z_mm,
-                    "baseline captured"
-                );
-            }
-        }
     }
+}
+
+fn upload_texture(ctx: &egui::Context, slot: &mut Option<TextureHandle>, img: ColorImage) {
+    match slot.as_mut() {
+        Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+        None => *slot = Some(ctx.load_texture("rgb", img, egui::TextureOptions::LINEAR)),
+    }
+}
+
+fn capture_baseline(slot: &mut Option<Baseline>, head: Option<HeadPixel>) {
+    if slot.is_some() {
+        return;
+    }
+    let Some(head) = head else { return };
+    let baseline = Baseline {
+        x_mm: head.x_mm,
+        y_mm: head.y_mm,
+        z_mm: head.depth_mm,
+    };
+    *slot = Some(baseline);
+    info!(
+        x_mm = baseline.x_mm,
+        y_mm = baseline.y_mm,
+        z_mm = baseline.z_mm,
+        "baseline captured"
+    );
 }
 
 impl eframe::App for App {
@@ -201,6 +280,7 @@ impl eframe::App for App {
         self.ensure_active();
         self.poll(egui_ctx);
 
+        // ----- Top toolbar
         TopBottomPanel::top("toolbar").show(egui_ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -208,37 +288,47 @@ impl eframe::App for App {
                 ComboBox::from_id_salt("backend")
                     .selected_text(self.selected.label())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.selected, Backend::None, Backend::None.label());
-                        ui.selectable_value(
-                            &mut self.selected,
-                            Backend::KinectV2,
-                            Backend::KinectV2.label(),
-                        );
+                        for b in &self.available {
+                            ui.selectable_value(&mut self.selected, *b, b.label());
+                        }
                     });
+                if ui.small_button("rescan").clicked() {
+                    self.refresh_available();
+                }
                 ui.separator();
                 if let Some(active) = self.active.as_ref() {
                     if let Some(head) = active.last_head {
                         ui.label(
                             RichText::new(format!(
-                                "distance {:.0} mm  |  pixel ({}, {})  |  3D ({:.0}, {:.0}, {:.0}) mm",
-                                head.depth_mm, head.u, head.v, head.x_mm, head.y_mm, head.depth_mm
+                                "{}  |  distance {:.0} mm  |  pixel ({}, {})  |  3D ({:.0}, {:.0}, {:.0}) mm",
+                                active.backend.label(),
+                                head.depth_mm,
+                                head.u,
+                                head.v,
+                                head.x_mm,
+                                head.y_mm,
+                                head.depth_mm
                             ))
                             .monospace(),
                         );
                     } else {
                         ui.label(
-                            RichText::new("waiting for head detection…").color(Color32::GRAY),
+                            RichText::new(format!("{}  |  waiting for head detection…", active.backend.label()))
+                                .color(Color32::GRAY),
                         );
                     }
                 } else if let Some(err) = &self.error {
                     ui.colored_label(Color32::LIGHT_RED, err);
+                } else if self.available.len() <= 1 {
+                    ui.label(RichText::new("no input detected — plug a Kinect and click 'rescan'").color(Color32::GRAY));
                 } else {
-                    ui.label(RichText::new("no input selected").color(Color32::GRAY));
+                    ui.label(RichText::new("select an input").color(Color32::GRAY));
                 }
             });
             ui.add_space(4.0);
         });
 
+        // ----- Bottom split: logs (left) + VPX delta panel (right)
         TopBottomPanel::bottom("debug-panels")
             .resizable(true)
             .default_height(220.0)
@@ -246,7 +336,7 @@ impl eframe::App for App {
             .show(egui_ctx, |ui| {
                 ui.add_space(4.0);
                 ui.columns(2, |cols| {
-                    // ----- Left column: tracing event log
+                    // Left: tracing event log
                     cols[0].horizontal(|ui| {
                         ui.label(RichText::new("logs").strong());
                         if ui.small_button("clear").clicked() {
@@ -266,7 +356,7 @@ impl eframe::App for App {
                             });
                         });
 
-                    // ----- Right column: what the plugin would push to VPX
+                    // Right: VPX delta panel
                     let mut reset_baseline = false;
                     cols[1].horizontal(|ui| {
                         ui.label(RichText::new("VPX output (Δ view)").strong());
@@ -333,9 +423,16 @@ impl eframe::App for App {
                 });
             });
 
+        // ----- Center: image with crosshair
         CentralPanel::default().show(egui_ctx, |ui| {
             let avail = ui.available_size();
-            let aspect = RGB_WIDTH as f32 / RGB_HEIGHT as f32;
+            let aspect = match self.active.as_ref() {
+                Some(active) => match active.inner {
+                    Inner::KinectV2 { .. } => 1920.0 / 1080.0,
+                    Inner::KinectV1 { .. } => 640.0 / 480.0,
+                },
+                None => 16.0 / 9.0,
+            };
             let (img_w, img_h) = if avail.x / avail.y > aspect {
                 (avail.y * aspect, avail.y)
             } else {
@@ -366,7 +463,6 @@ impl eframe::App for App {
             }
         });
 
-        // Continuous repaint so the camera frames keep flowing.
         egui_ctx.request_repaint();
     }
 }
@@ -384,10 +480,10 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
 
 fn draw_crosshair(painter: &egui::Painter, rect: Rect, head: HeadPixel) {
     // Map depth-frame pixel coords into the displayed image rectangle. The
-    // IR/RGB sensors aren't co-axial, so this is a few percent off the true
+    // IR/RGB sensors aren't co-axial so this is a few percent off the true
     // RGB pixel (parallax) — fine for "is the tracker on my head?" debugging.
-    let u_norm = head.u as f32 / DEPTH_WIDTH as f32;
-    let v_norm = head.v as f32 / DEPTH_HEIGHT as f32;
+    let u_norm = head.u as f32 / head.frame_w as f32;
+    let v_norm = head.v as f32 / head.frame_h as f32;
     let center = rect.left_top() + Vec2::new(u_norm * rect.width(), v_norm * rect.height());
 
     let yellow = Color32::from_rgb(0xff, 0xee, 0x00);
@@ -409,78 +505,105 @@ fn open_backend(b: Backend) -> Result<Active, String> {
     match b {
         Backend::None => Err("no backend selected".to_string()),
         Backend::KinectV2 => open_kinect_v2(),
+        Backend::KinectV1 => open_kinect_v1(),
     }
 }
 
 fn open_kinect_v2() -> Result<Active, String> {
-    let ctx = Context::new().map_err(|e| format!("Context::new: {e}"))?;
+    let ctx = freenect2::Context::new().map_err(|e| format!("freenect2 Context::new: {e}"))?;
     let count = ctx.enumerate();
     if count <= 0 {
         return Err("no Kinect v2 found on USB".to_string());
     }
     let device = ctx
         .open_default()
-        .map_err(|e| format!("open_default: {e}"))?;
+        .map_err(|e| format!("freenect2 open_default: {e}"))?;
     device
         .start_streams(true, true)
-        .map_err(|e| format!("start_streams: {e}"))?;
-    let intrinsics = device.ir_params();
+        .map_err(|e| format!("freenect2 start_streams: {e}"))?;
+    let p = device.ir_params();
     Ok(Active {
         backend: Backend::KinectV2,
-        device,
-        _ctx: ctx,
-        intrinsics,
+        intrinsics: Intrinsics {
+            fx: p.fx,
+            fy: p.fy,
+            cx: p.cx,
+            cy: p.cy,
+        },
         rgb_texture: None,
         last_head: None,
         baseline: None,
+        inner: Inner::KinectV2 { device, _ctx: ctx },
     })
 }
 
-// ============================================================ VPU mapping
-//
-// Mirrors `crate::camera::mapping::pose_delta_to_view_delta` from the plugin.
-// We don't depend on the `headtracking` cdylib here, so the constants and
-// axis convention are duplicated — keep them in sync if either side changes.
-
-const VPU_PER_MM: f64 = 50.0 / (25.4 * 1.0625);
-
-fn pose_delta_to_view_delta_vpu(dx_mm: f32, dy_mm: f32, dz_mm: f32) -> (f32, f32, f32) {
-    let to_vpu = |mm: f32| (f64::from(mm) * VPU_PER_MM) as f32;
-    // Kinect Y points down (so head going up → -Y) and Z grows away from the
-    // sensor (head approaching → -Z). VPX Camera-mode Y is "forward away from
-    // the player" and Z is upward.
-    (to_vpu(dx_mm), -to_vpu(dz_mm), -to_vpu(dy_mm))
+fn open_kinect_v1() -> Result<Active, String> {
+    let ctx = freenect::Context::new().map_err(|e| format!("freenect Context::new: {e}"))?;
+    let count = ctx.enumerate();
+    if count <= 0 {
+        return Err("no Kinect v1 found on USB".to_string());
+    }
+    let mut device = ctx.open(0).map_err(|e| format!("freenect open: {e}"))?;
+    device
+        .start_streams(true, true)
+        .map_err(|e| format!("freenect start_streams: {e}"))?;
+    Ok(Active {
+        backend: Backend::KinectV1,
+        intrinsics: Intrinsics {
+            fx: freenect::FX,
+            fy: freenect::FY,
+            cx: freenect::CX,
+            cy: freenect::CY,
+        },
+        rgb_texture: None,
+        last_head: None,
+        baseline: None,
+        inner: Inner::KinectV1 { device, _ctx: ctx },
+    })
 }
 
 // ============================================================ Image conversion
 
-fn bgrx_to_color_image(frame: &RgbFrame) -> ColorImage {
-    debug_assert_eq!(frame.width as usize, RGB_WIDTH);
-    debug_assert_eq!(frame.height as usize, RGB_HEIGHT);
-    let mut pixels = Vec::with_capacity(RGB_WIDTH * RGB_HEIGHT);
-    for chunk in frame.data.chunks_exact(4) {
+fn bgrx_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
+    debug_assert_eq!(data.len(), (width * height * 4) as usize);
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for chunk in data.chunks_exact(4) {
         // libfreenect2 ships pixels as B, G, R, X.
         pixels.push(Color32::from_rgb(chunk[2], chunk[1], chunk[0]));
     }
     ColorImage {
-        size: [RGB_WIDTH, RGB_HEIGHT],
+        size: [width as usize, height as usize],
+        pixels,
+    }
+}
+
+fn rgb888_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
+    debug_assert_eq!(data.len(), (width * height * 3) as usize);
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for chunk in data.chunks_exact(3) {
+        // libfreenect ships v1 video as R, G, B.
+        pixels.push(Color32::from_rgb(chunk[0], chunk[1], chunk[2]));
+    }
+    ColorImage {
+        size: [width as usize, height as usize],
         pixels,
     }
 }
 
 // ============================================================ Head blob algo
 
-fn find_head(frame: &DepthFrame, intr: &IrCameraParams) -> Option<HeadPixel> {
-    let w = frame.width as i32;
-    let h = frame.height as i32;
+fn find_head_f32(data: &[f32], width: u32, height: u32, intr: &Intrinsics) -> Option<HeadPixel> {
+    let w = width as i32;
+    let h = height as i32;
     if w <= 0 || h <= 0 {
         return None;
     }
 
+    // Pass 1: closest valid pixel.
     let valid = DEPTH_MIN_MM..=DEPTH_MAX_MM;
     let mut min_z = f32::INFINITY;
     let mut min_idx: i32 = -1;
-    for (i, &z) in frame.data.iter().enumerate() {
+    for (i, &z) in data.iter().enumerate() {
         if !valid.contains(&z) {
             continue;
         }
@@ -495,6 +618,7 @@ fn find_head(frame: &DepthFrame, intr: &IrCameraParams) -> Option<HeadPixel> {
     let cu = min_idx % w;
     let cv = min_idx / w;
 
+    // Pass 2: 50×50 window centroid in [min_z, min_z + 150 mm].
     let z_max = min_z + 150.0;
     let (mut sx, mut sy, mut sz) = (0.0_f64, 0.0_f64, 0.0_f64);
     let (mut wsum_u, mut wsum_v) = (0.0_f64, 0.0_f64);
@@ -506,7 +630,7 @@ fn find_head(frame: &DepthFrame, intr: &IrCameraParams) -> Option<HeadPixel> {
     for v in v0..=v1 {
         let row = (v * w) as usize;
         for u in u0..=u1 {
-            let z = frame.data[row + u as usize];
+            let z = data[row + u as usize];
             if z < DEPTH_MIN_MM || z > z_max {
                 continue;
             }
@@ -526,10 +650,27 @@ fn find_head(frame: &DepthFrame, intr: &IrCameraParams) -> Option<HeadPixel> {
     Some(HeadPixel {
         u: (wsum_u / n) as u32,
         v: (wsum_v / n) as u32,
+        frame_w: width,
+        frame_h: height,
         depth_mm: (sz / n) as f32,
         x_mm: (sx / n) as f32,
         y_mm: (sy / n) as f32,
     })
+}
+
+// ============================================================ VPU mapping
+//
+// Mirrors `crate::camera::mapping::pose_delta_to_view_delta` from the plugin.
+// Keep in sync with `src/camera/mapping.rs` if the axis convention changes.
+
+const VPU_PER_MM: f64 = 50.0 / (25.4 * 1.0625);
+
+fn pose_delta_to_view_delta_vpu(dx_mm: f32, dy_mm: f32, dz_mm: f32) -> (f32, f32, f32) {
+    let to_vpu = |mm: f32| (f64::from(mm) * VPU_PER_MM) as f32;
+    // Kinect Y points down (head going up → -Y) and Z grows away from the
+    // sensor (head approaching → -Z). VPX Camera-mode Y is "forward away
+    // from the player" and Z is upward.
+    (to_vpu(dx_mm), -to_vpu(dz_mm), -to_vpu(dy_mm))
 }
 
 // ============================================================ Tracing capture

@@ -1174,6 +1174,7 @@ name = "ht-debug"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "freenect",
  "freenect2",
  "parking_lot",
  "tracing",

@@ -7,17 +7,19 @@
 //! and tears it down on `stop()` / `Drop`.
 //!
 //! ```text
-//!   user thread       libfreenect event thread     callback (same thread)
-//!   ┌──────────┐     ┌────────────────────────┐   ┌────────────────────┐
-//!   │ open     │     │ process_events_timeout │ → │ depth_cb writes to │
-//!   │ start    │     │   loop until stop      │   │ FrameSlot (mutex)  │
-//!   │ poll(...)│ ←── reads FrameSlot ──────────────────────────────────┘
+//!   user thread       libfreenect event thread          callbacks
+//!   ┌──────────┐     ┌────────────────────────┐   ┌─────────────────────┐
+//!   │ open     │     │ process_events_timeout │ → │ depth_cb → DepthSlot │
+//!   │ start    │     │   loop until stop      │ → │ video_cb → VideoSlot │
+//!   │ poll(...)│ ←── reads from the slots ────────────────────────────────┘
 //!   │ stop     │
 //!   └──────────┘
 //! ```
 //!
-//! Depth mode: `FREENECT_DEPTH_MM` at 640×480 / 30 Hz, i.e. `u16` millimeter
+//! Depth mode: `FREENECT_DEPTH_MM` at 640×480 / 30 Hz, `u16` millimeter
 //! depth values (0 = no data).
+//! Video mode: `FREENECT_VIDEO_RGB` at 640×480 / 30 Hz, raw RGB888 (no
+//! decompression — the v1 sensor doesn't push MJPEG).
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -32,6 +34,8 @@ use freenect_sys as sys;
 
 pub const DEPTH_WIDTH: u32 = 640;
 pub const DEPTH_HEIGHT: u32 = 480;
+pub const VIDEO_WIDTH: u32 = 640;
+pub const VIDEO_HEIGHT: u32 = 480;
 
 /// One depth frame copied out of libfreenect's internal buffer.
 #[derive(Debug, Clone)]
@@ -42,6 +46,17 @@ pub struct DepthFrame {
     pub timestamp_raw: u32,
     /// Row-major `u16` millimeter depths. `0` = no data.
     pub data: Vec<u16>,
+}
+
+/// One color frame copied out of libfreenect's internal buffer.
+/// Layout is row-major RGB888 — `width * height * 3` bytes, channel order
+/// `[R, G, B]` per pixel.
+#[derive(Debug, Clone)]
+pub struct RgbFrame {
+    pub width: u32,
+    pub height: u32,
+    pub timestamp_raw: u32,
+    pub data: Vec<u8>,
 }
 
 /// Pinhole intrinsics for the Kinect v1 IR / depth camera. libfreenect does
@@ -120,17 +135,19 @@ impl Drop for CtxHandle {
     }
 }
 
-/// One Kinect v1 device. Streams depth in millimeters via a background
-/// thread that pumps libfreenect's event loop.
+/// One Kinect v1 device. Streams depth (and optionally RGB video) via a
+/// background thread that pumps libfreenect's event loop.
 pub struct Device {
     // Drop order: stop the event thread first (clears callbacks), close the
-    // device pointer, then release the FrameSlot. Rust drops fields in
+    // device pointer, then release the Slots. Rust drops fields in
     // declaration order — so list event_thread first.
     event_thread: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     raw: *mut sys::freenect_device,
-    frame_slot: Box<FrameSlot>,
+    slots: Box<Slots>,
     started: AtomicBool,
+    depth_running: bool,
+    video_running: bool,
     ctx: Arc<CtxHandle>,
 }
 
@@ -140,77 +157,115 @@ unsafe impl Send for Device {}
 
 impl Device {
     fn wrap(ctx: Arc<CtxHandle>, raw: *mut sys::freenect_device) -> Result<Self, Error> {
-        // FrameSlot must have a stable heap address: we hand its pointer to
-        // libfreenect via freenect_set_user, and the depth callback retrieves
-        // it on every frame.
-        let frame_slot = Box::new(FrameSlot::default());
-        let user_ptr = (&raw const *frame_slot).cast::<c_void>().cast_mut();
+        // The Slots struct must have a stable heap address: we hand its
+        // pointer to libfreenect via freenect_set_user, and both depth and
+        // video callbacks retrieve it on every frame.
+        let slots = Box::new(Slots::default());
+        let user_ptr = (&raw const *slots).cast::<c_void>().cast_mut();
 
-        // Configure depth mode (640x480 mm) and install the callback.
+        // Configure depth (640x480 mm) and video (640x480 RGB888) modes,
+        // then install both callbacks. Streams stay off until start_streams.
         // SAFETY: `raw` is a freshly opened device; the API lock keeps the
-        // ctx single-threaded, the frame mode comes from libfreenect's own
-        // descriptor.
+        // ctx single-threaded, the modes come from libfreenect's descriptor.
         let api = ctx.api_lock.lock();
-        let rc = unsafe {
-            let mode = sys::freenect_find_depth_mode(
+        let setup_rc = unsafe {
+            let depth_mode = sys::freenect_find_depth_mode(
                 sys::freenect_resolution_FREENECT_RESOLUTION_MEDIUM,
                 sys::freenect_depth_format_FREENECT_DEPTH_MM,
             );
-            if mode.is_valid == 0 {
+            let video_mode = sys::freenect_find_video_mode(
+                sys::freenect_resolution_FREENECT_RESOLUTION_MEDIUM,
+                sys::freenect_video_format_FREENECT_VIDEO_RGB,
+            );
+            if depth_mode.is_valid == 0 || video_mode.is_valid == 0 {
                 drop(api);
                 sys::freenect_close_device(raw);
-                return Err(Error::DepthModeUnavailable);
+                return Err(Error::ModeUnavailable);
             }
-            sys::freenect_set_depth_mode(raw, mode)
-        };
-        if rc < 0 {
-            drop(api);
-            // SAFETY: nothing has been started yet.
-            unsafe { sys::freenect_close_device(raw) };
-            return Err(Error::DepthModeUnavailable);
-        }
-        // SAFETY: same API-lock + freshly opened device.
-        unsafe {
+            let rc_d = sys::freenect_set_depth_mode(raw, depth_mode);
+            let rc_v = sys::freenect_set_video_mode(raw, video_mode);
+            if rc_d < 0 || rc_v < 0 {
+                drop(api);
+                sys::freenect_close_device(raw);
+                return Err(Error::ModeUnavailable);
+            }
             sys::freenect_set_user(raw, user_ptr);
             sys::freenect_set_depth_callback(raw, Some(depth_callback));
-        }
+            sys::freenect_set_video_callback(raw, Some(video_callback));
+            0
+        };
         drop(api);
+        if setup_rc < 0 {
+            // unreachable — the early returns above handle the failure
+            // cases — kept for completeness if a future mode call is added.
+            return Err(Error::ModeUnavailable);
+        }
 
         Ok(Self {
             event_thread: None,
             stop: Arc::new(AtomicBool::new(false)),
             raw,
-            frame_slot,
+            slots,
             started: AtomicBool::new(false),
+            depth_running: false,
+            video_running: false,
             ctx,
         })
     }
 
-    /// Start the depth stream and spawn the libfreenect event loop thread.
+    /// Start the depth stream only and spawn the libfreenect event loop.
+    /// Equivalent to `start_streams(false, true)`.
     pub fn start(&mut self) -> Result<(), Error> {
-        if self.started.swap(true, Ordering::AcqRel) {
+        self.start_streams(false, true)
+    }
+
+    /// Start the requested streams. Either or both can be enabled. Once a
+    /// stream is started, only `stop()` (or Drop) turns it off — repeated
+    /// calls are no-ops.
+    pub fn start_streams(&mut self, rgb: bool, depth: bool) -> Result<(), Error> {
+        if !rgb && !depth {
             return Ok(());
         }
         let g = self.ctx.api_lock.lock();
-        // SAFETY: device is open, callback is installed.
-        let rc = unsafe { sys::freenect_start_depth(self.raw) };
-        drop(g);
-        if rc < 0 {
-            self.started.store(false, Ordering::Release);
-            return Err(Error::StartFailed(rc));
+        if depth && !self.depth_running {
+            // SAFETY: device is open, callback is installed.
+            let rc = unsafe { sys::freenect_start_depth(self.raw) };
+            if rc < 0 {
+                drop(g);
+                return Err(Error::StartFailed(rc));
+            }
+            self.depth_running = true;
         }
+        if rgb && !self.video_running {
+            // SAFETY: device is open, video callback is installed.
+            let rc = unsafe { sys::freenect_start_video(self.raw) };
+            if rc < 0 {
+                if depth && self.depth_running {
+                    // SAFETY: we just started the depth stream above.
+                    let _ = unsafe { sys::freenect_stop_depth(self.raw) };
+                    self.depth_running = false;
+                }
+                drop(g);
+                return Err(Error::StartFailed(rc));
+            }
+            self.video_running = true;
+        }
+        drop(g);
 
-        let stop = self.stop.clone();
-        let ctx = self.ctx.clone();
-        let handle = thread::Builder::new()
-            .name("freenect-events".to_string())
-            .spawn(move || event_loop(ctx, stop))
-            .map_err(Error::Spawn)?;
-        self.event_thread = Some(handle);
+        // Spawn the event loop on the first start; subsequent calls reuse it.
+        if !self.started.swap(true, Ordering::AcqRel) {
+            let stop = self.stop.clone();
+            let ctx = self.ctx.clone();
+            let handle = thread::Builder::new()
+                .name("freenect-events".to_string())
+                .spawn(move || event_loop(ctx, stop))
+                .map_err(Error::Spawn)?;
+            self.event_thread = Some(handle);
+        }
         Ok(())
     }
 
-    /// Stop the depth stream and join the event loop thread.
+    /// Stop all streams and join the event loop thread.
     pub fn stop(&mut self) -> Result<(), Error> {
         if !self.started.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -222,10 +277,25 @@ impl Device {
             error!("freenect event thread panicked");
         }
         let g = self.ctx.api_lock.lock();
-        // SAFETY: stream was started; the event thread is no longer pumping.
-        let rc = unsafe { sys::freenect_stop_depth(self.raw) };
+        let mut last_err: Option<i32> = None;
+        if self.depth_running {
+            // SAFETY: depth stream was started.
+            let rc = unsafe { sys::freenect_stop_depth(self.raw) };
+            if rc < 0 {
+                last_err = Some(rc);
+            }
+            self.depth_running = false;
+        }
+        if self.video_running {
+            // SAFETY: video stream was started.
+            let rc = unsafe { sys::freenect_stop_video(self.raw) };
+            if rc < 0 {
+                last_err = Some(rc);
+            }
+            self.video_running = false;
+        }
         drop(g);
-        if rc < 0 {
+        if let Some(rc) = last_err {
             return Err(Error::StopFailed(rc));
         }
         Ok(())
@@ -234,7 +304,12 @@ impl Device {
     /// Read the latest depth frame, if any. Returns `None` when no new
     /// frame has arrived since the last call.
     pub fn poll_depth(&self) -> Option<DepthFrame> {
-        self.frame_slot.poll()
+        self.slots.depth.poll()
+    }
+
+    /// Read the latest color frame (640×480 RGB888), if any.
+    pub fn poll_rgb(&self) -> Option<RgbFrame> {
+        self.slots.video.poll()
     }
 }
 
@@ -246,26 +321,33 @@ impl Drop for Device {
         let _g = self.ctx.api_lock.lock();
         if !self.raw.is_null() {
             // SAFETY: we own raw, the event thread has been joined, the
-            // callback can no longer fire.
+            // callbacks can no longer fire.
             unsafe { sys::freenect_close_device(self.raw) };
         }
     }
 }
 
-/// Thread-safe slot the C callback writes into and Rust polls from.
+/// Aggregates the per-stream slots into a single struct so libfreenect's
+/// single user-data pointer can reach both callbacks.
 #[derive(Default)]
-struct FrameSlot {
-    inner: Mutex<Inner>,
+struct Slots {
+    depth: DepthSlot,
+    video: VideoSlot,
+}
+
+#[derive(Default)]
+struct DepthSlot {
+    inner: Mutex<DepthInner>,
     has_new: AtomicBool,
 }
 
 #[derive(Default)]
-struct Inner {
+struct DepthInner {
     timestamp: u32,
     data: Vec<u16>,
 }
 
-impl FrameSlot {
+impl DepthSlot {
     fn write(&self, data: &[u16], timestamp: u32) {
         let mut g = self.inner.lock();
         g.timestamp = timestamp;
@@ -297,24 +379,85 @@ impl FrameSlot {
     }
 }
 
+#[derive(Default)]
+struct VideoSlot {
+    inner: Mutex<VideoInner>,
+    has_new: AtomicBool,
+}
+
+#[derive(Default)]
+struct VideoInner {
+    timestamp: u32,
+    data: Vec<u8>,
+}
+
+impl VideoSlot {
+    fn write(&self, data: &[u8], timestamp: u32) {
+        let mut g = self.inner.lock();
+        g.timestamp = timestamp;
+        if g.data.len() != data.len() {
+            g.data.resize(data.len(), 0);
+        }
+        g.data.copy_from_slice(data);
+        drop(g);
+        self.has_new.store(true, Ordering::Release);
+    }
+
+    fn poll(&self) -> Option<RgbFrame> {
+        if !self.has_new.load(Ordering::Acquire) {
+            return None;
+        }
+        let g = self.inner.lock();
+        if !self.has_new.load(Ordering::Relaxed) {
+            return None;
+        }
+        let frame = RgbFrame {
+            width: VIDEO_WIDTH,
+            height: VIDEO_HEIGHT,
+            timestamp_raw: g.timestamp,
+            data: g.data.clone(),
+        };
+        drop(g);
+        self.has_new.store(false, Ordering::Release);
+        Some(frame)
+    }
+}
+
 extern "C" fn depth_callback(dev: *mut sys::freenect_device, depth: *mut c_void, timestamp: u32) {
     if dev.is_null() || depth.is_null() {
         return;
     }
-    // SAFETY: set_user was called with a stable Box<FrameSlot> address;
+    // SAFETY: set_user was called with a stable Box<Slots> address;
     // libfreenect just hands the pointer back unchanged.
     let user = unsafe { sys::freenect_get_user(dev) };
     if user.is_null() {
         return;
     }
     // SAFETY: the only writer of `set_user` was Device::wrap, with a
-    // *const FrameSlot. The Box outlives any callback because we join the
+    // *const Slots. The Box outlives any callback because we join the
     // event thread before dropping the box.
-    let slot = unsafe { &*(user as *const FrameSlot) };
+    let slots = unsafe { &*(user as *const Slots) };
     // SAFETY: depth points to width*height u16 in mm (FREENECT_DEPTH_MM mode).
     let pixels = (DEPTH_WIDTH * DEPTH_HEIGHT) as usize;
     let data = unsafe { std::slice::from_raw_parts(depth.cast::<u16>(), pixels) };
-    slot.write(data, timestamp);
+    slots.depth.write(data, timestamp);
+}
+
+extern "C" fn video_callback(dev: *mut sys::freenect_device, video: *mut c_void, timestamp: u32) {
+    if dev.is_null() || video.is_null() {
+        return;
+    }
+    // SAFETY: same pointer round-trip as `depth_callback`.
+    let user = unsafe { sys::freenect_get_user(dev) };
+    if user.is_null() {
+        return;
+    }
+    // SAFETY: see `depth_callback`.
+    let slots = unsafe { &*(user as *const Slots) };
+    // SAFETY: video points to width*height*3 bytes (FREENECT_VIDEO_RGB).
+    let bytes = (VIDEO_WIDTH * VIDEO_HEIGHT * 3) as usize;
+    let data = unsafe { std::slice::from_raw_parts(video.cast::<u8>(), bytes) };
+    slots.video.write(data, timestamp);
 }
 
 fn event_loop(ctx: Arc<CtxHandle>, stop: Arc<AtomicBool>) {
@@ -354,11 +497,11 @@ pub enum Error {
     NoDevice,
     #[error("freenect_open_device failed (rc={0})")]
     OpenFailed(i32),
-    #[error("FREENECT_DEPTH_MM mode is not advertised by the device")]
-    DepthModeUnavailable,
-    #[error("freenect_start_depth failed (rc={0})")]
+    #[error("requested stream mode is not advertised by the device")]
+    ModeUnavailable,
+    #[error("freenect_start_depth or _video failed (rc={0})")]
     StartFailed(i32),
-    #[error("freenect_stop_depth failed (rc={0})")]
+    #[error("freenect_stop_depth or _video failed (rc={0})")]
     StopFailed(i32),
     #[error("failed to spawn event thread: {0}")]
     Spawn(std::io::Error),
