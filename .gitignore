@@ -22,6 +22,6 @@ target
 
 # Random scratch / screenshots from debugging
 /opencv-*.zip
-/size.png
-/webcam.png
+/*.png
+/Image*.png
 
