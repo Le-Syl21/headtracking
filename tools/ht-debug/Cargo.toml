@@ -3,7 +3,7 @@ name = "ht-debug"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Standalone visualization of the Kinect head-tracker (RGB + tracked point + distance)"
+description = "Standalone visualization of the Kinect head-tracker (RGB + tracked point + distance + logs)"
 publish = false
 
 [[bin]]
@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 freenect2 = { path = "../../crates/freenect2" }
-minifb = "0.28"
+eframe = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
