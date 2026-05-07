@@ -396,7 +396,11 @@ impl Device {
     pub fn set_led(&self, state: LedState) -> Result<(), Error> {
         let _g = self.ctx.api_lock.lock();
         // SAFETY: device is open and the motor subdevice was claimed.
-        let rc = unsafe { sys::freenect_set_led(self.raw, state.to_raw()) };
+        // `as _` lets Rust pick the bindgen-generated enum type at the
+        // call site: clang renders C anonymous enums as `u32` on
+        // Linux/macOS, `i32` on Windows MSVC. `LedState::to_raw()`
+        // stays `u32`-typed for our Rust users.
+        let rc = unsafe { sys::freenect_set_led(self.raw, state.to_raw() as _) };
         if rc < 0 {
             return Err(Error::LedFailed(rc));
         }
