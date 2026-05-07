@@ -46,7 +46,7 @@ const DEFAULT_NMS_THRESHOLD: f32 = 0.3;
 ///
 /// Ultraface only emits a bounding box + score. We fake the five
 /// anatomical landmark fields with bbox-relative anchor points so the
-/// downstream consumers (ht-debug, the future plugin face tracker) can
+/// downstream consumers (headtracking-demo, the plugin webcam tracker) can
 /// keep using the same struct as YuNet would have produced.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FaceDetection {
@@ -191,7 +191,7 @@ impl Detector {
             }
             // Anatomically-inspired anchor points. They aren't measured
             // landmarks (Ultraface doesn't predict them) but they let the
-            // ht-debug crosshair, IOD-based depth estimation, and any
+            // headtracking-demo overlays, IOD-based depth estimation, and any
             // downstream consumer keep the same data layout YuNet would
             // have produced. Eyes ≈ 35 % of the way down, mouth ≈ 75 %.
             let cx = x1 + bw * 0.5;

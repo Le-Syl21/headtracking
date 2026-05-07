@@ -1,11 +1,12 @@
-//! `ht-debug`: standalone Kinect viewer for the head-tracker pipeline.
+//! `headtracking-demo`: standalone validation harness for the head-tracker
+//! pipeline.
 //!
-//! Detects connected Kinect v1 / v2 sensors and exposes a dropdown to pick
-//! the active input. The center pane shows the live RGB feed with a
-//! crosshair on the detected head; the bottom panel splits into a tracing
+//! Detects connected Kinect v1 / v2 sensors and webcams, exposes a dropdown
+//! to pick the active input. The centre pane shows the live RGB feed with
+//! the YuNet face bbox overlaid; the bottom panel splits into a tracing
 //! log on the left and the VPX-style view delta on the right.
 //!
-//! Run with `cargo run --release -p ht-debug`.
+//! Run with `cargo run --release -p headtracking-demo`.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -35,12 +36,12 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])
-            .with_title("ht-debug"),
+            .with_title("headtracking-demo"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "ht-debug",
+        "headtracking-demo",
         options,
         Box::new(move |_cc| Ok(Box::new(App::new(logs)))),
     )
@@ -172,7 +173,7 @@ struct Active {
 mod filter_alias {
     // The plugin's filter module isn't exposed as a sibling crate, but it's
     // a standalone in-tree module — duplicate it here would mean another
-    // copy of identical code. Instead, ht-debug pulls it directly via the
+    // copy of identical code. Instead, headtracking-demo pulls it directly via the
     // workspace's `headtracking` crate path.
     pub use headtracking::filter::{OneEuroParams, OneEuroPose3D};
 }

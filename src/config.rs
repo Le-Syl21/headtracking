@@ -75,7 +75,7 @@ impl Default for Config {
             backend: BackendKind::Auto,
             device_index: 0,
             gain: 1.0,
-            // Same defaults as ht-debug — Z gets a tighter cutoff because
+            // Same defaults as headtracking-demo — Z gets a tighter cutoff because
             // depth-camera Z is inherently noisier than X/Y.
             min_cutoff_hz: 0.4,
             beta: 0.05,

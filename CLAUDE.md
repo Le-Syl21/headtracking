@@ -174,7 +174,7 @@ Décision : **un seul chemin de code par capteur**, pas d'utilisation des SDK pr
 - libfreenect / libfreenect2 compilés en static via `cmake` dans `build.rs` (CPU pipeline only pour libfreenect2 — pas de GPU dep).
 - libjpeg-turbo (requis par libfreenect2 même si on n'utilise pas le RGB) tiré du crate `turbojpeg-sys` feature `cmake` : build static PIC depuis les sources vendorées du crate. Le linker élimine en dead-code l'encodeur JPEG (libfreenect2 n'appelle que `tjInitDecompress` / `tjDecompress2` / `tjGetErrorStr` / `tjDestroy`).
 - Lien statique imposé dans `build.rs` **après** `libfreenect2` (les archives `.a` sont scannées une seule fois ; libfreenect2 référence les symboles `tj*` donc libturbojpeg.a doit suivre).
-- SDL3 vendoré via `sdl3-sys` features `build-from-source-static` + `sdl-camera` + `sdl-video` **dans `ht-debug`**. Aucun dep utilisateur sur SDL3 (qui n'est de toute façon pas encore packagé partout).
+- SDL3 vendoré via `sdl3-sys` features `build-from-source-static` + `sdl-camera` + `sdl-video` **dans `headtracking-demo`**. Aucun dep utilisateur sur SDL3 (qui n'est de toute façon pas encore packagé partout).
 - `libusb-1.0` reste linké dynamiquement contre la lib système (universelle sur Linux/macOS).
 
 **Cas particulier SDL3 dans le plugin (P3, à ne pas oublier)** :
@@ -182,7 +182,7 @@ Décision : **un seul chemin de code par capteur**, pas d'utilisation des SDK pr
 - Si on link SDL3 **statiquement** dans le plugin, on aurait deux SDL3 dans le même process avec deux états globaux (event bus, ref count subsystems, claim V4L2). Recette pour des bugs subtils.
 - Plan retenu : au `PluginLoad`, **résoudre les symboles `SDL_*` via `dlsym`** sur `libSDL3.so` déjà chargé par VPX, les stocker dans une struct de pointeurs de fonctions, et router les appels webcam à travers cette struct au lieu du link statique de `sdl3-sys`. La crate `webcam` garde sa surface API actuelle ; on swappe juste le backend FFI.
 - Si SDL3 n'est pas encore initialisé au moment du `PluginLoad`, on peut appeler `SDL_Init(SDL_INIT_CAMERA)` nous-mêmes — SDL3 ref-count les subsystems en interne, donc un init multiple est sans danger.
-- Pas applicable à `ht-debug` (binaire standalone, sans host SDL3) — il garde sa SDL3 statique.
+- Pas applicable à `headtracking-demo` (binaire standalone, sans host SDL3) — il garde sa SDL3 statique.
 
 Compilation conditionnelle via features Cargo :
 

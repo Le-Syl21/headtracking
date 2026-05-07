@@ -1,6 +1,6 @@
 //! Webcam head tracker backend (SDL3 capture via dlsym + YuNet face detection).
 //!
-//! Unlike [`tools/ht-debug`] which links SDL3 statically through the
+//! Unlike `tools/headtracking-demo` which links SDL3 statically through the
 //! `webcam` workspace crate, the plugin resolves SDL3 symbols at runtime
 //! against `libSDL3.so` already loaded by VPX. Two SDL3 state machines in
 //! the same process would race on the V4L2 device claim, the event bus,

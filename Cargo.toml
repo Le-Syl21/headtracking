@@ -7,7 +7,7 @@ members = [
     "crates/freenect2-sys",
     "crates/freenect2",
     "crates/webcam",
-    "tools/ht-debug",
+    "tools/headtracking-demo",
 ]
 
 [workspace.package]
@@ -55,7 +55,7 @@ face = { path = "crates/face", optional = true }
 # libloading powers the runtime SDL3 lookup for the webcam backend: we
 # resolve symbols against `libSDL3.so` already loaded by VPX, instead of
 # linking SDL3 statically into the plugin and ending up with two SDL3
-# state machines in the same process. Standalone tools (ht-debug) keep
+# state machines in the same process. Standalone tools (headtracking-demo) keep
 # the static SDL3 path via the `webcam` workspace crate.
 libloading = { version = "0.8", optional = true }
 

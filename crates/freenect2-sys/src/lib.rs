@@ -73,7 +73,7 @@ mod ffi {
         fn start_depth(dev: Pin<&mut Freenect2Dev>) -> bool;
 
         /// Start the requested streams. Useful for diagnostic tools that
-        /// need both RGB and depth (e.g. `ht-debug`).
+        /// need both RGB and depth (e.g. `headtracking-demo`).
         fn start_streams(dev: Pin<&mut Freenect2Dev>, rgb: bool, depth: bool) -> bool;
 
         /// Stop the device. Idempotent.
