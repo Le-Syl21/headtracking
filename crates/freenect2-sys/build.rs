@@ -98,7 +98,19 @@ fn main() {
     let dst = config.build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
-    println!("cargo:rustc-link-lib=static=freenect2");
+    // libfreenect2's CMakeLists.txt has an MSVC-specific quirk:
+    //   IF(MSVC AND NOT BUILD_SHARED_LIBS)
+    //     set_target_properties(freenect2 PROPERTIES SUFFIX "static.lib")
+    //   ENDIF()
+    // so the static lib is shipped as `freenect2static.lib` on Windows
+    // (default `.lib` suffix replaced by `static.lib`). Match that
+    // naming when linking; everywhere else the lib is plainly
+    // `libfreenect2.a` / `libfreenect2.dylib`.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=static=freenect2static");
+    } else {
+        println!("cargo:rustc-link-lib=static=freenect2");
+    }
     // Static archives are scanned once in the order they appear on the link
     // line. libfreenect2.a references tj* / jpeg* symbols, so the JPEG
     // archives MUST come after it. turbojpeg-sys emits its own link

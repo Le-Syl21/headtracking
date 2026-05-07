@@ -201,7 +201,11 @@ fn patch_libfreenect_skip_shared_on_windows(vendor_dir: &std::path::Path) {
     if original.contains(MARKER) {
         return;
     }
-    let nl = if original.contains("\r\n") { "\r\n" } else { "\n" };
+    let nl = if original.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut out = String::with_capacity(original.len() + 256);
     out.push_str(MARKER);
     out.push_str(nl);
@@ -219,9 +223,7 @@ fn patch_libfreenect_skip_shared_on_windows(vendor_dir: &std::path::Path) {
             for next in iter.by_ref() {
                 out.push_str(next);
                 out.push_str(nl);
-                if next.contains("PROJECT_LIBRARY_INSTALL_DIR")
-                    && next.contains("DESTINATION")
-                {
+                if next.contains("PROJECT_LIBRARY_INSTALL_DIR") && next.contains("DESTINATION") {
                     break;
                 }
             }
