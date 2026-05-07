@@ -62,11 +62,18 @@ jobs:
             archive: zip
             experimental: true
 
-          # macos-x86_64 dropped for 0.0.x. The Intel `macos-13` runner
-          # pool has been in deep backlog since GitHub started its
-          # multi-month deprecation; jobs hang in "Waiting for a runner"
-          # for hours. Re-add as a cross-compile from `macos-latest`
-          # (Apple Silicon) when an Intel beta tester actually asks.
+          # macOS x86_64 is cross-compiled from `macos-latest` (Apple
+          # Silicon). The runner ships ARM Homebrew at /opt/homebrew; we
+          # additionally bring up Rosetta 2 + an Intel Homebrew at
+          # /usr/local in the prep step so brew can hand us an x86_64
+          # libusb. See the `macOS native deps` step.
+          - suffix: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            plugin_lib: libheadtracking.dylib
+            demo_bin: headtracking-demo
+            archive: tar.gz
+            experimental: true
 
           - suffix: macos-aarch64
             os: macos-latest
@@ -119,7 +126,31 @@ jobs:
 
       - name: macOS native deps
         if: startsWith(matrix.os, 'macos')
-        run: brew install libusb cmake
+        shell: bash
+        run: |
+          # ARM brew is preinstalled at /opt/homebrew on macos-latest
+          # (Apple Silicon). Always install the ARM libusb / cmake; the
+          # cmake binary is shared across both arches.
+          /opt/homebrew/bin/brew install libusb cmake
+          if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" ]]; then
+            # Cross-compile to Intel: bring up Rosetta and a separate
+            # Intel Homebrew under /usr/local so we can link an x86_64
+            # libusb. The runner image has Rosetta 2 available but not
+            # always pre-installed; --agree-to-license + --install-rosetta
+            # is idempotent and quick.
+            sudo softwareupdate --install-rosetta --agree-to-license || true
+            # Install Intel Homebrew. The official installer is arch-aware
+            # — when run under Rosetta it lays itself out under /usr/local
+            # automatically.
+            arch -x86_64 /bin/bash -c \
+              "NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+            arch -x86_64 /usr/local/bin/brew install libusb
+            # Point pkg-config / linker at the Intel install. PKG_CONFIG_PATH
+            # ahead of the ARM one so freenect2-sys's pkg_config probe finds
+            # the x86_64 .pc first.
+            echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" >> $GITHUB_ENV
+            echo "LIBRARY_PATH=/usr/local/lib" >> $GITHUB_ENV
+          fi
 
       - name: Windows native deps (libusb via vcpkg + pkgconf)
         if: matrix.os == 'windows-latest'
