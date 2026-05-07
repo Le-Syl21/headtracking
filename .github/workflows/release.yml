@@ -156,6 +156,14 @@ jobs:
             arch -x86_64 /bin/bash -c \
               "NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
             arch -x86_64 /usr/local/bin/brew install libusb
+            # `brew install` doesn't always create the /usr/local/lib
+            # symlinks on a fresh Intel brew install (the post-install
+            # link step can be skipped silently). Force it so the
+            # linker can find `-lusb-1.0` via -L/usr/local/lib.
+            arch -x86_64 /usr/local/bin/brew link --overwrite --force libusb
+            # Sanity check: fail loudly here rather than during link
+            # if the symlink wasn't created.
+            ls -la /usr/local/lib/libusb-1.0.dylib
             # Point pkg-config / linker at the Intel install. PKG_CONFIG_PATH
             # ahead of the ARM one so freenect2-sys's pkg_config probe finds
             # the x86_64 .pc first.
