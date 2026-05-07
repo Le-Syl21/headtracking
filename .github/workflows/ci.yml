@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # libfreenect2's vendored CMakeLists declares a min cmake older than
+  # 3.5; CMake 4.x dropped that compat. Set the policy fallback version
+  # so cmake-rs invocations don't trip on it.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   fmt:

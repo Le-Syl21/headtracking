@@ -23,6 +23,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # libfreenect2's submodule (v0.2.1) declares CMAKE_MINIMUM_REQUIRED < 3.5,
+  # which CMake 4.x removed compatibility for. This env var tells CMake to
+  # accept it. Applied at workflow level so every cmake-rs invocation in
+  # the build picks it up.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   build:
@@ -123,11 +128,22 @@ jobs:
         shell: bash
         run: |
           vcpkg install libusb:x64-windows
-          # libusb-sys / freenect's build.rs look these up via VCPKG_ROOT or
-          # PKG_CONFIG_PATH. Surface the vcpkg installation path to later
-          # cargo invocations.
+          # Both `libusb-sys` (pkg-config based) and the cmake invocation
+          # for `freenect2-sys` need to find vcpkg's libusb. We surface
+          # three things to subsequent steps:
+          #   * VCPKG_ROOT / VCPKG_INSTALLATION_ROOT — used by libusb-sys
+          #   * the bin dir on PATH — for libusb-1.0.dll at runtime
+          #   * CMAKE_TOOLCHAIN_FILE — so `cmake-rs` invocations find vcpkg
+          #     packages via FindLibUSB.cmake (the libfreenect2 cmake
+          #     module looks for LibUSB_LIBRARIES / LibUSB_INCLUDE_DIRS,
+          #     which the vcpkg toolchain wires up).
           echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
           echo "${VCPKG_INSTALLATION_ROOT}/installed/x64-windows/bin" >> $GITHUB_PATH
+          # cmake-rs respects CMAKE_TOOLCHAIN_FILE; convert the Windows
+          # path to a CMake-friendly form (forward slashes).
+          toolchain="${VCPKG_INSTALLATION_ROOT//\\//}/scripts/buildsystems/vcpkg.cmake"
+          echo "CMAKE_TOOLCHAIN_FILE=${toolchain}" >> $GITHUB_ENV
+          echo "VCPKG_TARGET_TRIPLET=x64-windows" >> $GITHUB_ENV
 
       # ---------- Build ----------
 
