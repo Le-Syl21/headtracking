@@ -1,0 +1,201 @@
+name: Release
+
+# Triggered when a `vX.Y.Z` (or `vX.Y.Z-suffix`) tag is pushed. Each
+# matrix target builds the cdylib (`headtracking`) + the standalone demo
+# (`headtracking-demo`), bundles them with `plugin.cfg` and `LICENSE`,
+# uploads as a GitHub Release artifact.
+#
+# Targets that don't build cleanly yet (e.g. cross-compiled aarch64
+# Linux, Windows MSVC w/ vendored cmake projects) are marked
+# `continue-on-error: true` so a partial matrix still produces a
+# release with the working architectures. Fix per-target as they
+# stabilise.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build ${{ matrix.suffix }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suffix: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            plugin_lib: libheadtracking.so
+            demo_bin: headtracking-demo
+            archive: tar.gz
+
+          - suffix: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            plugin_lib: libheadtracking.so
+            demo_bin: headtracking-demo
+            archive: tar.gz
+            cross: true
+            experimental: true
+
+          - suffix: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            plugin_lib: headtracking.dll
+            demo_bin: headtracking-demo.exe
+            archive: zip
+            experimental: true
+
+          - suffix: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            plugin_lib: libheadtracking.dylib
+            demo_bin: headtracking-demo
+            archive: tar.gz
+            experimental: true
+
+          - suffix: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            plugin_lib: libheadtracking.dylib
+            demo_bin: headtracking-demo
+            archive: tar.gz
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          shared-key: release
+
+      # ---------- Platform-specific build deps ----------
+
+      - name: Linux native deps
+        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev \
+            libusb-1.0-0-dev libudev-dev \
+            pkg-config
+
+      - name: Install cross (aarch64 Linux only)
+        if: matrix.cross
+        run: cargo install cross --locked --version ^0.2
+
+      - name: macOS native deps
+        if: startsWith(matrix.os, 'macos')
+        run: brew install libusb cmake
+
+      - name: Windows native deps (libusb via vcpkg)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          vcpkg install libusb:x64-windows
+          # libusb-sys / freenect's build.rs look these up via VCPKG_ROOT or
+          # PKG_CONFIG_PATH. Surface the vcpkg installation path to later
+          # cargo invocations.
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
+          echo "${VCPKG_INSTALLATION_ROOT}/installed/x64-windows/bin" >> $GITHUB_PATH
+
+      # ---------- Build ----------
+
+      - name: Build plugin (cargo)
+        if: '!matrix.cross'
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p headtracking
+
+      - name: Build demo (cargo)
+        if: '!matrix.cross'
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p headtracking-demo
+
+      - name: Build (cross, aarch64 Linux)
+        if: matrix.cross
+        shell: bash
+        run: |
+          cross build --release --target ${{ matrix.target }} -p headtracking
+          cross build --release --target ${{ matrix.target }} -p headtracking-demo
+
+      # ---------- Stage + archive ----------
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="staging-${{ matrix.suffix }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/${{ matrix.plugin_lib }}" "$stage/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.demo_bin }}" "$stage/"
+          cp plugin.cfg "$stage/"
+          [ -f LICENSE ] && cp LICENSE "$stage/" || true
+          [ -f README.md ] && cp README.md "$stage/" || true
+          echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
+          echo "ARTIFACT_BASENAME=headtracking-${version}-${{ matrix.suffix }}" >> "$GITHUB_ENV"
+
+      - name: Tar (Linux / macOS)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          tar -C "${STAGE_DIR}" -czf "${ARTIFACT_BASENAME}.tar.gz" .
+
+      - name: Zip (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "$env:STAGE_DIR\*" -DestinationPath "$env:ARTIFACT_BASENAME.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_BASENAME }}
+          path: ${{ env.ARTIFACT_BASENAME }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Run even if some matrix targets failed — partial release with the
+    # working platforms is better than no release at all.
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lah dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+          generate_release_notes: true
+          # Tags with -alpha / -beta / -rc suffix are flagged as
+          # pre-releases automatically.
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          fail_on_unmatched_files: false
