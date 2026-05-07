@@ -41,7 +41,8 @@ fn main() {
     // Build libfreenect2 statically with the CPU packet pipeline only.
     // No GPU, no OpenNI2, no examples — keeps the dep tree to libusb + libc++
     // plus the static libjpeg-turbo we hand it.
-    let dst = cmake::Config::new(&vendor_dir)
+    let mut config = cmake::Config::new(&vendor_dir);
+    config
         .profile("Release")
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("BUILD_EXAMPLES", "OFF")
@@ -59,8 +60,22 @@ fn main() {
         // .a paths and that test fails — but we don't actually need it: the
         // final cdylib link is wired by Cargo through turbojpeg-sys's
         // transitive link metadata. Pre-cache the success flag.
-        .define("TURBOJPEG_WORKS", "TRUE")
-        .build();
+        .define("TURBOJPEG_WORKS", "TRUE");
+
+    // On Windows, libfreenect2's `find_package(LibUSB)` falls back to
+    // `pkg_check_modules(libusb-1.0)`, which requires a working pkg-config
+    // installation that can resolve vcpkg's .pc files. Even with pkgconf
+    // on PATH and PKG_CONFIG_PATH set, that path fails on the GitHub
+    // runners (the FindPkgConfig module reports "libusb-1.0 not found").
+    // Short-circuit by handing libfreenect2 the LibUSB_* values directly
+    // — find_package then skips pkg_check_modules entirely.
+    if let Some((lib, include)) = vcpkg_libusb() {
+        config
+            .define("LibUSB_LIBRARIES", lib.to_string_lossy().as_ref())
+            .define("LibUSB_INCLUDE_DIRS", include.to_string_lossy().as_ref());
+    }
+
+    let dst = config.build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=freenect2");
@@ -73,13 +88,21 @@ fn main() {
     println!("cargo:rustc-link-lib=static=turbojpeg");
     println!("cargo:rustc-link-lib=static=jpeg");
 
-    // libfreenect2 USB transport — system libusb on Linux/macOS for now.
-    // Switching to a vendored libusb (libusb1-sys/static) is the next step
-    // toward fully self-contained binaries.
-    pkg_config::Config::new()
-        .atleast_version("1.0.20")
-        .probe("libusb-1.0")
-        .expect("libusb-1.0 not found via pkg-config");
+    // libfreenect2 USB transport — system libusb on Linux/macOS, vcpkg on
+    // Windows (pkg-config isn't reliable there even with pkgconf installed).
+    if let Some((lib, _)) = vcpkg_libusb() {
+        if let Some(parent) = lib.parent() {
+            println!("cargo:rustc-link-search=native={}", parent.display());
+        }
+        // The .lib name on Windows is `libusb-1.0.lib`; Rust's link
+        // directive omits the extension and the `lib` prefix on MSVC.
+        println!("cargo:rustc-link-lib=libusb-1.0");
+    } else {
+        pkg_config::Config::new()
+            .atleast_version("1.0.20")
+            .probe("libusb-1.0")
+            .expect("libusb-1.0 not found via pkg-config");
+    }
 
     // C++ runtime
     if cfg!(target_os = "linux") {
@@ -107,4 +130,25 @@ fn main() {
         .flag_if_supported("-std=c++14")
         .flag_if_supported("-Wno-unused-parameter")
         .compile("freenect2-shim");
+}
+
+/// Locate the vcpkg-managed libusb on Windows. Returns
+/// `(import_lib, include_dir)` where `include_dir` is the directory
+/// containing `libusb.h` (i.e. `…/include/libusb-1.0`). Returns `None`
+/// outside Windows or when vcpkg env vars aren't set / libusb isn't
+/// installed.
+fn vcpkg_libusb() -> Option<(PathBuf, PathBuf)> {
+    if env::var_os("CARGO_CFG_TARGET_OS").as_deref() != Some(std::ffi::OsStr::new("windows")) {
+        return None;
+    }
+    let root = env::var_os("VCPKG_ROOT").or_else(|| env::var_os("VCPKG_INSTALLATION_ROOT"))?;
+    let triplet = env::var("VCPKG_TARGET_TRIPLET").unwrap_or_else(|_| "x64-windows".to_string());
+    let installed = PathBuf::from(root).join("installed").join(triplet);
+    let lib = installed.join("lib").join("libusb-1.0.lib");
+    let include = installed.join("include").join("libusb-1.0");
+    if lib.is_file() && include.is_dir() {
+        Some((lib, include))
+    } else {
+        None
+    }
 }

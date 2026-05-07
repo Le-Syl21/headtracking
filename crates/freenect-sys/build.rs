@@ -21,7 +21,8 @@ fn main() {
     }
 
     // Static cmake build. Drop the bits we don't need (audio, OpenNI2, examples).
-    let dst = cmake::Config::new(&vendor_dir)
+    let mut config = cmake::Config::new(&vendor_dir);
+    config
         .profile("Release")
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("BUILD_EXAMPLES", "OFF")
@@ -34,16 +35,39 @@ fn main() {
         .define("BUILD_AUDIO", "OFF")
         .define("BUILD_OPENNI2_DRIVER", "OFF")
         .define("BUILD_REDIST_PACKAGE", "OFF")
-        .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
-        .build();
+        .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
+
+    // Same Windows libusb workaround as freenect2-sys: pre-fill
+    // LibUSB_* so libfreenect's CMakeLists doesn't try pkg_check_modules.
+    if let Some((lib, include)) = vcpkg_libusb() {
+        config
+            .define("LIBUSB_LIBRARIES", lib.to_string_lossy().as_ref())
+            .define("LIBUSB_INCLUDE_DIRS", include.to_string_lossy().as_ref())
+            // libfreenect's cmake module is named LibUSB-1.0 (with dash)
+            // — define both naming conventions defensively.
+            .define("LibUSB-1.0_LIBRARIES", lib.to_string_lossy().as_ref())
+            .define(
+                "LibUSB-1.0_INCLUDE_DIRS",
+                include.to_string_lossy().as_ref(),
+            );
+    }
+
+    let dst = config.build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=freenect");
 
-    pkg_config::Config::new()
-        .atleast_version("1.0.20")
-        .probe("libusb-1.0")
-        .expect("libusb-1.0 not found via pkg-config");
+    if let Some((lib, _)) = vcpkg_libusb() {
+        if let Some(parent) = lib.parent() {
+            println!("cargo:rustc-link-search=native={}", parent.display());
+        }
+        println!("cargo:rustc-link-lib=libusb-1.0");
+    } else {
+        pkg_config::Config::new()
+            .atleast_version("1.0.20")
+            .probe("libusb-1.0")
+            .expect("libusb-1.0 not found via pkg-config");
+    }
 
     // Bindgen on the public header. Resource-dir fallback mirrors the root
     // build.rs (handles dev systems without libclang-common-* installed).
@@ -110,4 +134,22 @@ fn compiler_resource_include_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Locate vcpkg-managed libusb on Windows. Mirrors the same helper in
+/// `freenect2-sys`. See its docstring for the contract.
+fn vcpkg_libusb() -> Option<(PathBuf, PathBuf)> {
+    if env::var_os("CARGO_CFG_TARGET_OS").as_deref() != Some(std::ffi::OsStr::new("windows")) {
+        return None;
+    }
+    let root = env::var_os("VCPKG_ROOT").or_else(|| env::var_os("VCPKG_INSTALLATION_ROOT"))?;
+    let triplet = env::var("VCPKG_TARGET_TRIPLET").unwrap_or_else(|_| "x64-windows".to_string());
+    let installed = PathBuf::from(root).join("installed").join(triplet);
+    let lib = installed.join("lib").join("libusb-1.0.lib");
+    let include = installed.join("include").join("libusb-1.0");
+    if lib.is_file() && include.is_dir() {
+        Some((lib, include))
+    } else {
+        None
+    }
 }

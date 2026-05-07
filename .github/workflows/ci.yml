@@ -13,6 +13,10 @@ env:
   # 3.5; CMake 4.x dropped that compat. Set the policy fallback version
   # so cmake-rs invocations don't trip on it.
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  # Pin the macOS deployment target so cc-rs / cmake / clang and rustc
+  # agree on the same ABI level (otherwise the link errors on
+  # __isPlatformVersionAtLeast). 11.0 = Big Sur. Linux/Windows ignore.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
   fmt:

@@ -28,6 +28,13 @@ env:
   # accept it. Applied at workflow level so every cmake-rs invocation in
   # the build picks it up.
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  # Pin the macOS deployment target so cc-rs / cmake / clang agree on a
+  # single ABI level. Without this, cc-rs picks the runner's SDK version
+  # (e.g. 15.5) for compiled .o files while rustc targets 11.0, and the
+  # final link errors on `___isPlatformVersionAtLeast` (a clang
+  # version-check helper that isn't needed when source SDK == target SDK).
+  # 11.0 (Big Sur, late 2020) is broad enough for any pincab user.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
   build:
