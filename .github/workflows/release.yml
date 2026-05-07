@@ -16,6 +16,10 @@ on:
     tags:
       - 'v*.*.*'
       - 'v*.*.*-*'
+  # Manual dry-run: builds the whole matrix without publishing a release.
+  # Use this to validate that every target builds before pushing the
+  # actual tag.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -246,9 +250,11 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    # Run even if some matrix targets failed — partial release with the
-    # working platforms is better than no release at all.
-    if: always()
+    # Only publish on a real tag push. `workflow_dispatch` runs are
+    # dry-runs to validate the matrix; they upload artifacts but don't
+    # create a GitHub release. `if: always()` lets the publish step run
+    # even when some experimental targets failed (linux-aarch64 cross).
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/download-artifact@v8
         with:
