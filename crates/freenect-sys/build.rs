@@ -20,6 +20,17 @@ fn main() {
         );
     }
 
+    // libfreenect's src/CMakeLists.txt unconditionally declares
+    // `add_library(freenect SHARED ...)` *and*
+    // `add_library(freenectstatic STATIC ... OUTPUT_NAME freenect)`. On
+    // Linux/macOS the two outputs differ by extension (.so/.dylib vs
+    // .a), so cmake is happy. On Windows + Ninja both targets produce
+    // `freenect.lib`, and Ninja errors out with
+    // "multiple rules generate lib/freenect.lib". Wrap the SHARED
+    // target's declaration + install + link lines in `if(NOT WIN32)`
+    // so only the static lib remains on Windows.
+    patch_libfreenect_skip_shared_on_windows(&vendor_dir);
+
     // Static cmake build. Drop the bits we don't need (audio, OpenNI2, examples).
     let mut config = cmake::Config::new(&vendor_dir);
     // Windows: prefer Ninja (single-config) so the static lib lands at
@@ -171,6 +182,73 @@ fn detect_libusb_paths() -> Option<(PathBuf, PathBuf)> {
     }
 
     None
+}
+
+/// Idempotently patch `vendor/libfreenect/src/CMakeLists.txt` to skip
+/// the SHARED `freenect` target on Windows. Without this libfreenect's
+/// SHARED + STATIC libraries both resolve to `freenect.lib` and Ninja
+/// (single-config) errors out. Patch is a no-op outside Windows and
+/// re-runs are idempotent via a marker comment.
+fn patch_libfreenect_skip_shared_on_windows(vendor_dir: &std::path::Path) {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let path = vendor_dir.join("src/CMakeLists.txt");
+    let Ok(original) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    const MARKER: &str = "# freenect-sys: skip SHARED on Windows (Ninja conflict)";
+    if original.contains(MARKER) {
+        return;
+    }
+    let nl = if original.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(original.len() + 256);
+    out.push_str(MARKER);
+    out.push_str(nl);
+
+    let mut iter = original.split(nl);
+    while let Some(line) = iter.next() {
+        let trimmed = line.trim();
+        if trimmed == "add_library (freenect SHARED ${SRC})" {
+            out.push_str("if(NOT WIN32)");
+            out.push_str(nl);
+            out.push_str(line);
+            out.push_str(nl);
+            // Consume up to and including the matching
+            // `install (TARGETS freenect ... DESTINATION …)` block.
+            for next in iter.by_ref() {
+                out.push_str(next);
+                out.push_str(nl);
+                if next.contains("PROJECT_LIBRARY_INSTALL_DIR")
+                    && next.contains("DESTINATION")
+                {
+                    break;
+                }
+            }
+            out.push_str("endif()  # NOT WIN32 (freenect SHARED)");
+            out.push_str(nl);
+            continue;
+        }
+        if trimmed == "target_link_libraries (freenect ${LIBUSB_1_LIBRARIES})" {
+            out.push_str("if(NOT WIN32)");
+            out.push_str(nl);
+            out.push_str(line);
+            out.push_str(nl);
+            out.push_str("endif()");
+            out.push_str(nl);
+            continue;
+        }
+        out.push_str(line);
+        out.push_str(nl);
+    }
+    // Strip the trailing newline we always appended on the final empty
+    // line of `split`.
+    if out.ends_with(nl) && !original.ends_with(nl) {
+        for _ in 0..nl.len() {
+            out.pop();
+        }
+    }
+    let _ = std::fs::write(&path, out);
 }
 
 /// Write a `FindLibUSB.cmake` shim that respects pre-set values. Same
