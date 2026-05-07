@@ -22,6 +22,11 @@ fn main() {
 
     // Static cmake build. Drop the bits we don't need (audio, OpenNI2, examples).
     let mut config = cmake::Config::new(&vendor_dir);
+    // Windows: prefer Ninja (single-config) so the static lib lands at
+    // `<dst>/lib/freenect.lib` rather than `<dst>/lib/Release/...`.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        config.generator("Ninja");
+    }
     config
         .profile("Release")
         .define("BUILD_SHARED_LIBS", "OFF")

@@ -43,6 +43,15 @@ fn main() {
     // No GPU, no OpenNI2, no examples — keeps the dep tree to libusb + libc++
     // plus the static libjpeg-turbo we hand it.
     let mut config = cmake::Config::new(&vendor_dir);
+    // On Windows, force Ninja over the default Visual Studio generator.
+    // VS is multi-config and installs static libs at
+    // `<dst>/lib/Release/freenect2.lib`, but our `rustc-link-search`
+    // points at `<dst>/lib`. Ninja is single-config and aligns the two.
+    // windows-latest runners ship `ninja.exe` in PATH (via Visual Studio
+    // Build Tools / chocolatey).
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        config.generator("Ninja");
+    }
     config
         .profile("Release")
         .define("BUILD_SHARED_LIBS", "OFF")
