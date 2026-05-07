@@ -86,6 +86,15 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     } else if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=dylib=c++");
+        // libfreenect2's VTRgbPacketProcessorImpl uses Apple's
+        // VideoToolbox to decode the JPEG colour stream; CoreMedia /
+        // CoreVideo / CoreFoundation are its transitive dependencies.
+        // Without these frameworks the final link fails with
+        // "Undefined symbols for architecture arm64 …
+        //  VTDecompressionSessionCreate / CMVideoFormatDescription* / …".
+        for framework in ["VideoToolbox", "CoreMedia", "CoreVideo", "CoreFoundation"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
     }
 
     // Compile our cxx bridge + C++ shim, linked against the static
