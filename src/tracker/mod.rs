@@ -6,6 +6,8 @@ pub mod face_depth;
 pub mod kinect_v1;
 #[cfg(feature = "kinect-v2")]
 pub mod kinect_v2;
+#[cfg(feature = "webcam")]
+pub mod webcam;
 
 pub mod session;
 
