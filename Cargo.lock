@@ -1328,12 +1328,12 @@ dependencies = [
  "face",
  "freenect",
  "freenect2",
+ "libloading",
  "nalgebra",
  "parking_lot",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "webcam",
 ]
 
 [[package]]

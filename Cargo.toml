@@ -39,7 +39,7 @@ default = ["all-trackers"]
 # triangulation (webcam).
 kinect-v1 = ["dep:freenect", "dep:face"]
 kinect-v2 = ["dep:freenect2", "dep:face"]
-webcam = ["dep:webcam", "dep:face"]
+webcam = ["dep:libloading", "dep:face"]
 all-trackers = ["kinect-v1", "kinect-v2", "webcam"]
 
 [dependencies]
@@ -51,8 +51,13 @@ nalgebra = "0.33"
 thiserror = "2"
 freenect = { path = "crates/freenect", optional = true }
 freenect2 = { path = "crates/freenect2", optional = true }
-webcam = { path = "crates/webcam", optional = true }
 face = { path = "crates/face", optional = true }
+# libloading powers the runtime SDL3 lookup for the webcam backend: we
+# resolve symbols against `libSDL3.so` already loaded by VPX, instead of
+# linking SDL3 statically into the plugin and ending up with two SDL3
+# state machines in the same process. Standalone tools (ht-debug) keep
+# the static SDL3 path via the `webcam` workspace crate.
+libloading = { version = "0.8", optional = true }
 
 [build-dependencies]
 bindgen = "0.71"
