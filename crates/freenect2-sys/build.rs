@@ -117,8 +117,14 @@ fn main() {
     // directives, but they end up before freenect2 (deps come first), so we
     // re-emit them here to force the right order.
     println!("cargo:rustc-link-search=native={tj_root}/lib");
-    println!("cargo:rustc-link-lib=static=turbojpeg");
-    println!("cargo:rustc-link-lib=static=jpeg");
+    // libjpeg-turbo's CMakeLists names the static libs `turbojpeg-static`
+    // and `jpeg-static` on MSVC (matching `turbojpeg-sys`'s own link
+    // directives). Everywhere else they're plain `libturbojpeg.a` /
+    // `libjpeg.a`.
+    let is_msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let tj_suffix = if is_msvc { "-static" } else { "" };
+    println!("cargo:rustc-link-lib=static=turbojpeg{tj_suffix}");
+    println!("cargo:rustc-link-lib=static=jpeg{tj_suffix}");
 
     // libfreenect2 USB transport. On platforms where pkg-config is
     // unreliable (Windows vcpkg, macOS cross-compile) we already located
