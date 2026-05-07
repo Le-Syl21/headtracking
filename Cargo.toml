@@ -30,13 +30,17 @@ description = "Head tracking plugin for Visual Pinball X 10.8.1+"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
-# Each Kinect backend pulls the face-detection crate alongside libfreenect[2]
-# — the depth-blob heuristic was retired in favour of YuNet bbox + face-anchored
-# depth median, which means no Kinect path compiles without `face`.
+# Default: all three hardware backends compiled in. The runtime `Backend`
+# setting (Auto / Kinect v2 / Kinect v1 / Webcam) selects which one is used,
+# with Auto walking a v2 → v1 → webcam fallback chain.
+default = ["all-trackers"]
+# Each backend pulls the face-detection crate alongside its capture library
+# — every path uses YuNet bbox + face-anchored depth (Kinect) or IOD
+# triangulation (webcam).
 kinect-v1 = ["dep:freenect", "dep:face"]
 kinect-v2 = ["dep:freenect2", "dep:face"]
-all-trackers = ["kinect-v1", "kinect-v2"]
+webcam = ["dep:webcam", "dep:face"]
+all-trackers = ["kinect-v1", "kinect-v2", "webcam"]
 
 [dependencies]
 tracing = "0.1"
@@ -47,6 +51,7 @@ nalgebra = "0.33"
 thiserror = "2"
 freenect = { path = "crates/freenect", optional = true }
 freenect2 = { path = "crates/freenect2", optional = true }
+webcam = { path = "crates/webcam", optional = true }
 face = { path = "crates/face", optional = true }
 
 [build-dependencies]
