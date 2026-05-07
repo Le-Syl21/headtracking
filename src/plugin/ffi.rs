@@ -17,6 +17,7 @@ use super::messages::{
 };
 use super::vpx_sys::{MsgPluginAPI, VPXPluginAPI, VPXViewSetupDef};
 use crate::camera::mapping::pose_delta_to_view_delta;
+use crate::config;
 use crate::tracker::Pose;
 use crate::tracker::session::TrackerSession;
 
@@ -177,6 +178,13 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
         );
     }
 
+    // Register all `[Plugin.HeadTracking]` settings. The host calls our
+    // Set callbacks immediately with the value parsed from VPinballX.ini
+    // (or the declared default when the key is missing), so by the time
+    // OnGameStart fires the config snapshot is already populated.
+    // SAFETY: api_ptr is non-null and live for the plugin session.
+    unsafe { config::register_settings(&*api_ptr, session_id) };
+
     *STATE.lock() = Some(PluginState {
         msg_api: api_ptr,
         vpx_api,
@@ -229,7 +237,16 @@ unsafe fn do_unload() {
 extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         info!("VPX event: OnGameStart");
-        match TrackerSession::spawn() {
+        let cfg = config::current();
+        info!(
+            backend = ?cfg.backend,
+            device_index = cfg.device_index,
+            gain = cfg.gain,
+            min_cutoff_hz = cfg.min_cutoff_hz,
+            beta = cfg.beta,
+            "spawning tracker session with current config"
+        );
+        match TrackerSession::spawn(&cfg) {
             Ok(tracker) => {
                 let backend = tracker.backend_name();
                 *GAME.lock() = Some(GameSession {
@@ -314,10 +331,23 @@ fn apply_pose_to_view() {
         }
     };
 
-    let delta = pose_delta_to_view_delta(&pose, &baseline.pose);
-    view.viewX = baseline.view_xyz[0] + delta.dx;
-    view.viewY = baseline.view_xyz[1] + delta.dy;
-    view.viewZ = baseline.view_xyz[2] + delta.dz;
+    // Read the live config every frame. The lock is uncontended (only the
+    // VPX settings UI ever takes a write lock, and that's rare), so this
+    // is essentially a memcpy.
+    let cfg = config::current();
+
+    // Apply the user's BaselineOffset before computing the delta so the
+    // offset acts as a manual recenter of the neutral pose, not a
+    // post-gain bias.
+    let mut adjusted_baseline_pose = baseline.pose;
+    adjusted_baseline_pose.position_mm[0] += cfg.baseline_offset_x_mm;
+    adjusted_baseline_pose.position_mm[1] += cfg.baseline_offset_y_mm;
+    adjusted_baseline_pose.position_mm[2] += cfg.baseline_offset_z_mm;
+
+    let delta = pose_delta_to_view_delta(&pose, &adjusted_baseline_pose);
+    view.viewX = baseline.view_xyz[0] + delta.dx * cfg.gain;
+    view.viewY = baseline.view_xyz[1] + delta.dy * cfg.gain;
+    view.viewZ = baseline.view_xyz[2] + delta.dz * cfg.gain;
 
     // SAFETY: setter follows the FFI contract; we own `view`.
     unsafe { setter(&raw mut view) };
