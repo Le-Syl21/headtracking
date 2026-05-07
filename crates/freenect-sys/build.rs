@@ -64,11 +64,17 @@ fn main() {
     if let Some((lib, include)) = detect_libusb_paths() {
         let lib_s = lib.to_string_lossy().replace('\\', "/");
         let include_s = include.to_string_lossy().replace('\\', "/");
+        // libfreenect's bundled `cmake_modules/Findlibusb-1.0.cmake`
+        // checks pre-set `LIBUSB_1_LIBRARIES` / `LIBUSB_1_INCLUDE_DIRS`
+        // (with `_1_` underscore-1-underscore) and skips its own
+        // pkg-config probe when both are set. Keep the older
+        // CamelCase / hyphen variants too as defensive fallbacks for
+        // any other module variant that might be in scope.
         config
+            .define("LIBUSB_1_LIBRARIES", &lib_s)
+            .define("LIBUSB_1_INCLUDE_DIRS", &include_s)
             .define("LIBUSB_LIBRARIES", &lib_s)
             .define("LIBUSB_INCLUDE_DIRS", &include_s)
-            // libfreenect's cmake module is named LibUSB-1.0 (with a
-            // hyphen). Define both conventions defensively.
             .define("LibUSB-1.0_LIBRARIES", &lib_s)
             .define("LibUSB-1.0_INCLUDE_DIRS", &include_s);
     }
