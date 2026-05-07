@@ -2,7 +2,8 @@
 //! cxx shim that bridges its C++ API to Rust.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
@@ -62,14 +63,17 @@ fn main() {
         // transitive link metadata. Pre-cache the success flag.
         .define("TURBOJPEG_WORKS", "TRUE");
 
-    // On Windows, libfreenect2's `find_package(LibUSB)` falls back to
-    // `pkg_check_modules(libusb-1.0)`, which requires a working pkg-config
-    // installation that can resolve vcpkg's .pc files. Even with pkgconf
-    // on PATH and PKG_CONFIG_PATH set, that path fails on the GitHub
-    // runners (the FindPkgConfig module reports "libusb-1.0 not found").
-    // Short-circuit by handing libfreenect2 the LibUSB_* values directly
-    // — find_package then skips pkg_check_modules entirely.
-    if let Some((lib, include)) = vcpkg_libusb() {
+    // libfreenect2's bundled FindLibUSB.cmake unconditionally calls
+    // `pkg_check_modules(libusb-1.0)` whenever PKG_CONFIG is found,
+    // ignoring any pre-set LibUSB_* variables. On Windows (vcpkg-managed
+    // libusb) and macOS cross-compile (Intel libusb under /usr/local on
+    // an ARM runner) that path doesn't resolve. Override the module via
+    // CMAKE_MODULE_PATH with a shim that respects pre-set values, then
+    // pre-set them when we know where libusb lives.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let modules_dir = write_findlibusb_shim(&out_dir);
+    config.define("CMAKE_MODULE_PATH", modules_dir.to_string_lossy().as_ref());
+    if let Some((lib, include)) = detect_libusb_paths() {
         config
             .define("LibUSB_LIBRARIES", lib.to_string_lossy().as_ref())
             .define("LibUSB_INCLUDE_DIRS", include.to_string_lossy().as_ref());
@@ -88,14 +92,16 @@ fn main() {
     println!("cargo:rustc-link-lib=static=turbojpeg");
     println!("cargo:rustc-link-lib=static=jpeg");
 
-    // libfreenect2 USB transport — system libusb on Linux/macOS, vcpkg on
-    // Windows (pkg-config isn't reliable there even with pkgconf installed).
-    if let Some((lib, _)) = vcpkg_libusb() {
+    // libfreenect2 USB transport. On platforms where pkg-config is
+    // unreliable (Windows vcpkg, macOS cross-compile) we already located
+    // libusb above; emit the link directives directly. Otherwise let
+    // pkg-config probe the system install.
+    if let Some((lib, _)) = detect_libusb_paths() {
         if let Some(parent) = lib.parent() {
             println!("cargo:rustc-link-search=native={}", parent.display());
         }
-        // The .lib name on Windows is `libusb-1.0.lib`; Rust's link
-        // directive omits the extension and the `lib` prefix on MSVC.
+        // On Windows the import lib is `libusb-1.0.lib`; rustc strips the
+        // .lib extension. On macOS we link the .dylib by name.
         println!("cargo:rustc-link-lib=libusb-1.0");
     } else {
         pkg_config::Config::new()
@@ -107,7 +113,7 @@ fn main() {
     // C++ runtime
     if cfg!(target_os = "linux") {
         println!("cargo:rustc-link-lib=dylib=stdc++");
-    } else if cfg!(target_os = "macos") {
+    } else if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-lib=dylib=c++");
         // libfreenect2's VTRgbPacketProcessorImpl uses Apple's
         // VideoToolbox to decode the JPEG colour stream; CoreMedia /
@@ -117,6 +123,16 @@ fn main() {
         //  VTDecompressionSessionCreate / CMVideoFormatDescription* / …".
         for framework in ["VideoToolbox", "CoreMedia", "CoreVideo", "CoreFoundation"] {
             println!("cargo:rustc-link-lib=framework={framework}");
+        }
+        // SDL3 (and any clang-built object that uses
+        // `__builtin_available()`) emits calls to
+        // `__isPlatformVersionAtLeast`, a runtime version-check helper
+        // that lives in libclang_rt.osx.a. Auto-linking is supposed to
+        // happen, but cmake-rs invocations sometimes drop it. Explicitly
+        // surface the path so the final cdylib / binary link finds it.
+        if let Some(rt_lib_dir) = clang_runtime_lib_dir() {
+            println!("cargo:rustc-link-search=native={}", rt_lib_dir.display());
+            println!("cargo:rustc-link-lib=clang_rt.osx");
         }
     }
 
@@ -132,23 +148,70 @@ fn main() {
         .compile("freenect2-shim");
 }
 
-/// Locate the vcpkg-managed libusb on Windows. Returns
-/// `(import_lib, include_dir)` where `include_dir` is the directory
-/// containing `libusb.h` (i.e. `…/include/libusb-1.0`). Returns `None`
-/// outside Windows or when vcpkg env vars aren't set / libusb isn't
-/// installed.
-fn vcpkg_libusb() -> Option<(PathBuf, PathBuf)> {
-    if env::var_os("CARGO_CFG_TARGET_OS").as_deref() != Some(std::ffi::OsStr::new("windows")) {
+/// Locate libusb for targets where pkg-config can't be trusted:
+/// Windows (vcpkg-managed) and macOS x86_64 cross-compile from an
+/// Apple Silicon runner (Intel libusb under /usr/local from
+/// `arch -x86_64 brew install libusb`). Returns `(library, include_dir)`
+/// or `None` to fall back to pkg-config.
+fn detect_libusb_paths() -> Option<(PathBuf, PathBuf)> {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
+    if target_os == "windows" {
+        let root = env::var_os("VCPKG_ROOT").or_else(|| env::var_os("VCPKG_INSTALLATION_ROOT"))?;
+        let triplet = env::var("VCPKG_TARGET_TRIPLET").unwrap_or_else(|_| "x64-windows".into());
+        let installed = PathBuf::from(root).join("installed").join(triplet);
+        let lib = installed.join("lib").join("libusb-1.0.lib");
+        let include = installed.join("include").join("libusb-1.0");
+        return (lib.is_file() && include.is_dir()).then_some((lib, include));
+    }
+
+    if target_os == "macos" && target_arch == "x86_64" {
+        let lib = PathBuf::from("/usr/local/lib/libusb-1.0.dylib");
+        let include = PathBuf::from("/usr/local/include/libusb-1.0");
+        if lib.is_file() && include.is_dir() {
+            return Some((lib, include));
+        }
+    }
+
+    None
+}
+
+/// Write a `FindLibUSB.cmake` shim into `<out>/cmake_modules/`. The
+/// shim respects pre-set `LibUSB_LIBRARIES` / `LibUSB_INCLUDE_DIRS`
+/// and falls through to libfreenect2's bundled module otherwise.
+/// libfreenect2's vendored module always invokes `pkg_check_modules`
+/// regardless of pre-set values, breaking Windows / cross-compile.
+fn write_findlibusb_shim(out_dir: &Path) -> PathBuf {
+    let modules_dir = out_dir.join("cmake_modules");
+    std::fs::create_dir_all(&modules_dir).expect("create cmake_modules dir");
+    let shim = r#"# Generated by freenect2-sys/build.rs.
+# Honour LibUSB_LIBRARIES / LibUSB_INCLUDE_DIRS already set by the
+# parent cmake-rs invocation; fall through to the bundled module
+# (which does pkg_check_modules) when they aren't.
+if(LibUSB_LIBRARIES AND LibUSB_INCLUDE_DIRS)
+  set(LibUSB_FOUND TRUE)
+  return()
+endif()
+include("${CMAKE_SOURCE_DIR}/cmake_modules/FindLibUSB.cmake")
+"#;
+    std::fs::write(modules_dir.join("FindLibUSB.cmake"), shim).expect("write FindLibUSB shim");
+    modules_dir
+}
+
+/// Locate clang's compiler-rt darwin lib dir (where libclang_rt.osx.a
+/// lives). Asks `clang -print-resource-dir` which returns something
+/// like `/Applications/Xcode.app/.../usr/lib/clang/<version>`; the
+/// runtime lib lives at `<that>/lib/darwin/`.
+fn clang_runtime_lib_dir() -> Option<PathBuf> {
+    let out = Command::new("clang")
+        .arg("-print-resource-dir")
+        .output()
+        .ok()?;
+    if !out.status.success() {
         return None;
     }
-    let root = env::var_os("VCPKG_ROOT").or_else(|| env::var_os("VCPKG_INSTALLATION_ROOT"))?;
-    let triplet = env::var("VCPKG_TARGET_TRIPLET").unwrap_or_else(|_| "x64-windows".to_string());
-    let installed = PathBuf::from(root).join("installed").join(triplet);
-    let lib = installed.join("lib").join("libusb-1.0.lib");
-    let include = installed.join("include").join("libusb-1.0");
-    if lib.is_file() && include.is_dir() {
-        Some((lib, include))
-    } else {
-        None
-    }
+    let resource = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let darwin = resource.join("lib").join("darwin");
+    darwin.is_dir().then_some(darwin)
 }
