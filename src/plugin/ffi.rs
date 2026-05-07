@@ -74,7 +74,14 @@ static GAME: Mutex<Option<GameSession>> = Mutex::new(None);
 pub unsafe extern "C" fn HeadTrackingPluginLoad(session_id: u32, api: *const MsgPluginAPI) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         init_tracing_once();
-        info!(session_id, "HeadTracking plugin: load");
+        info!(
+            session_id,
+            version = env!("CARGO_PKG_VERSION"),
+            os = std::env::consts::OS,
+            arch = std::env::consts::ARCH,
+            family = std::env::consts::FAMILY,
+            "HeadTracking plugin: load"
+        );
 
         if api.is_null() {
             error!("MsgPluginAPI pointer is null at load time; aborting init");

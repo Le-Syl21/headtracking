@@ -33,6 +33,16 @@ fn main() -> eframe::Result {
         Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_LINES)));
     init_tracing(Arc::clone(&logs));
 
+    // Banner: lets a beta tester paste a single line that pins the
+    // build they're running when something misbehaves.
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        family = std::env::consts::FAMILY,
+        "headtracking-demo starting"
+    );
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])
