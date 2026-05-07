@@ -93,14 +93,22 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && !matrix.cross
         run: |
           sudo apt-get update
+          # Full SDL3 build-deps list (per
+          # https://wiki.libsdl.org/SDL3/README-linux) plus libusb / libudev
+          # for libfreenect[2]. Required by the demo's static SDL3 build;
+          # the plugin itself doesn't link SDL3 (resolved via dlsym).
           sudo apt-get install -y --no-install-recommends \
-            cmake clang libclang-dev pkg-config \
+            cmake clang libclang-dev pkg-config ninja-build \
             libusb-1.0-0-dev libudev-dev \
-            libasound2-dev \
+            libasound2-dev libpulse-dev libjack-jackd2-dev \
+            libsndio-dev libpipewire-0.3-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
-            libxi-dev libxinerama-dev libxkbcommon-dev libxss-dev \
-            libgl1-mesa-dev libegl1-mesa-dev \
-            libwayland-dev libdrm-dev libdbus-1-dev libpulse-dev
+            libxfixes-dev libxi-dev libxinerama-dev libxss-dev \
+            libxtst-dev libxkbcommon-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libdrm-dev libgbm-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libdbus-1-dev libibus-1.0-dev
 
       - name: Install cross (aarch64 Linux only)
         if: matrix.cross
