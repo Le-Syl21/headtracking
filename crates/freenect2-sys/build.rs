@@ -72,11 +72,18 @@ fn main() {
     // pre-set them when we know where libusb lives.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let modules_dir = write_findlibusb_shim(&out_dir);
-    config.define("CMAKE_MODULE_PATH", modules_dir.to_string_lossy().as_ref());
+    // CMake on Windows accepts forward slashes; passing native
+    // backslashes triggers "Syntax error in cmake code" inside the
+    // auto-generated try_compile scratch file because cmake interprets
+    // `\` as an escape sequence in `set(...)` arguments.
+    let modules_path = modules_dir.to_string_lossy().replace('\\', "/");
+    config.define("CMAKE_MODULE_PATH", &modules_path);
     if let Some((lib, include)) = detect_libusb_paths() {
+        let lib = lib.to_string_lossy().replace('\\', "/");
+        let include = include.to_string_lossy().replace('\\', "/");
         config
-            .define("LibUSB_LIBRARIES", lib.to_string_lossy().as_ref())
-            .define("LibUSB_INCLUDE_DIRS", include.to_string_lossy().as_ref());
+            .define("LibUSB_LIBRARIES", &lib)
+            .define("LibUSB_INCLUDE_DIRS", &include);
     }
 
     let dst = config.build();

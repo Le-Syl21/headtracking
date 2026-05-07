@@ -41,18 +41,20 @@ fn main() {
     // cross-compile. See freenect2-sys/build.rs for the rationale.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let modules_dir = write_findlibusb_shim(&out_dir);
-    config.define("CMAKE_MODULE_PATH", modules_dir.to_string_lossy().as_ref());
+    // Forward slashes for Windows cmake compatibility (see
+    // freenect2-sys/build.rs comment).
+    let modules_path = modules_dir.to_string_lossy().replace('\\', "/");
+    config.define("CMAKE_MODULE_PATH", &modules_path);
     if let Some((lib, include)) = detect_libusb_paths() {
+        let lib_s = lib.to_string_lossy().replace('\\', "/");
+        let include_s = include.to_string_lossy().replace('\\', "/");
         config
-            .define("LIBUSB_LIBRARIES", lib.to_string_lossy().as_ref())
-            .define("LIBUSB_INCLUDE_DIRS", include.to_string_lossy().as_ref())
+            .define("LIBUSB_LIBRARIES", &lib_s)
+            .define("LIBUSB_INCLUDE_DIRS", &include_s)
             // libfreenect's cmake module is named LibUSB-1.0 (with a
             // hyphen). Define both conventions defensively.
-            .define("LibUSB-1.0_LIBRARIES", lib.to_string_lossy().as_ref())
-            .define(
-                "LibUSB-1.0_INCLUDE_DIRS",
-                include.to_string_lossy().as_ref(),
-            );
+            .define("LibUSB-1.0_LIBRARIES", &lib_s)
+            .define("LibUSB-1.0_INCLUDE_DIRS", &include_s);
     }
 
     let dst = config.build();
