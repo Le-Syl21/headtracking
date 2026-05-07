@@ -94,9 +94,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake clang libclang-dev \
+            cmake clang libclang-dev pkg-config \
             libusb-1.0-0-dev libudev-dev \
-            pkg-config
+            libasound2-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxinerama-dev libxkbcommon-dev libxss-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libwayland-dev libdrm-dev libdbus-1-dev libpulse-dev
 
       - name: Install cross (aarch64 Linux only)
         if: matrix.cross

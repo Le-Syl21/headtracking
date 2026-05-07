@@ -25,3 +25,6 @@ target
 /*.png
 /Image*.png
 
+
+# Claude Code session-local state
+.claude/

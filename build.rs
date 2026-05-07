@@ -2,18 +2,39 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_PLUGINS_DIR: &str = "../vpinball/plugins/plugins";
+/// Developer-local checkout of the upstream `vpinball` repo. Preferred when
+/// present so we always bind against the headers a Sylvain-style dev
+/// environment is editing live.
+const DEV_PLUGINS_DIR: &str = "../vpinball/plugins/plugins";
+/// Vendored copy of the same headers shipped in-tree under
+/// `third_party/vpx-plugin-headers/`. Used by CI / package builds where the
+/// vpinball source tree isn't available; refreshed by hand when upstream
+/// changes the API (see that directory's README).
+const VENDORED_PLUGINS_DIR: &str = "third_party/vpx-plugin-headers";
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=VPX_PLUGINS_DIR");
 
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let plugins_dir = env::var("VPX_PLUGINS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            root.join(DEFAULT_PLUGINS_DIR)
+        .ok()
+        .or_else(|| {
+            let dev = root.join(DEV_PLUGINS_DIR);
+            dev.is_dir().then_some(dev)
+        })
+        .or_else(|| {
+            let vendored = root.join(VENDORED_PLUGINS_DIR);
+            vendored.is_dir().then_some(vendored)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "VPX plugin headers directory not found. Tried VPX_PLUGINS_DIR, \
+                 then {}, then {}. Set VPX_PLUGINS_DIR to override.",
+                DEV_PLUGINS_DIR, VENDORED_PLUGINS_DIR
+            )
         });
 
     if !plugins_dir.is_dir() {
