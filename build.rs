@@ -45,11 +45,28 @@ fn main() {
         );
     }
 
+    // Parse as C++17. The VPX headers use a self-referential typedef
+    // idiom (`typedef struct Foo { ... Foo* ... } Foo;`) that's only
+    // legal in C++; switching to `-xc` breaks bindgen.
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", plugins_dir.display()))
         .clang_arg("-xc++")
         .clang_arg("-std=c++17");
+
+    // macOS bindgen quirk: libclang must be told where libc++ lives,
+    // otherwise <cstddef> resolves to the C SDK <stddef.h> first and
+    // libc++ template parsing falls over. `xcrun --show-sdk-path`
+    // returns the active SDK root; <sysroot>/usr/include/c++/v1 is the
+    // libc++ headers. We also force `-stdlib=libc++` so clang picks
+    // them up.
+    #[cfg(target_os = "macos")]
+    if let Some(sdk) = macos_sdk_path() {
+        builder = builder
+            .clang_arg("-stdlib=libc++")
+            .clang_arg(format!("-isysroot{}", sdk.display()))
+            .clang_arg(format!("-isystem{}/usr/include/c++/v1", sdk.display()));
+    }
 
     // libclang ships compiler-internal headers (stddef.h, stdarg.h, …) in its
     // resource directory; on Debian/Ubuntu these only land when the
@@ -142,4 +159,19 @@ fn compiler_resource_include_dir() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// macOS only: invoke `xcrun --show-sdk-path` to locate the active
+/// Command Line Tools / Xcode SDK root.
+#[cfg(target_os = "macos")]
+fn macos_sdk_path() -> Option<PathBuf> {
+    let out = Command::new("xcrun")
+        .args(["--show-sdk-path"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    p.is_dir().then_some(p)
 }
