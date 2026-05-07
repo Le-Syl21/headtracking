@@ -22,6 +22,16 @@ fn main() {
         );
     }
 
+    // Cross-compile fix: libfreenect2's GenerateResources.cmake does
+    //   COMMAND generate_resources_tool …
+    // which CMake expects to auto-resolve to the target's binary path.
+    // When cross-compiling macOS x86_64 from an ARM runner, the rule
+    // ends up invoking the bare name through `/bin/sh` and fails with
+    // "generate_resources_tool: command not found". Replacing with a
+    // `$<TARGET_FILE:…>` generator expression forces cmake to emit
+    // the resolved absolute path.
+    patch_libfreenect2_resource_tool_path(&vendor_dir);
+
     // libfreenect2's CMakeLists `find_package(TurboJPEG REQUIRED)` — point it
     // at the vendored libjpeg-turbo built by `turbojpeg-sys` so we don't need
     // anything from the system. `DEP_TURBOJPEG_*` come from `turbojpeg-sys`'s
@@ -231,6 +241,31 @@ include("${CMAKE_SOURCE_DIR}/cmake_modules/FindLibUSB.cmake")
 "#;
     std::fs::write(modules_dir.join("FindLibUSB.cmake"), shim).expect("write FindLibUSB shim");
     modules_dir
+}
+
+/// Idempotently rewrite libfreenect2's `GenerateResources.cmake` so
+/// the custom command invokes `generate_resources_tool` via a
+/// `$<TARGET_FILE:…>` generator expression instead of a bare name.
+/// Bare-name invocation breaks under cross-compile (macOS x86_64
+/// from an ARM runner) where the build dir's bin/ isn't on PATH and
+/// the make rule can't find the tool.
+fn patch_libfreenect2_resource_tool_path(vendor_dir: &Path) {
+    let path = vendor_dir.join("cmake_modules/GenerateResources.cmake");
+    let Ok(original) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    const MARKER: &str = "# freenect2-sys: use TARGET_FILE for cross-compile";
+    if original.contains(MARKER) {
+        return;
+    }
+    let target = "COMMAND generate_resources_tool ${BASE_FOLDER} ${ARGN} > ${OUTPUT}";
+    let replacement =
+        "COMMAND $<TARGET_FILE:generate_resources_tool> ${BASE_FOLDER} ${ARGN} > ${OUTPUT}";
+    if !original.contains(target) {
+        return;
+    }
+    let patched = format!("{MARKER}\n{}", original.replace(target, replacement));
+    let _ = std::fs::write(&path, patched);
 }
 
 /// Locate clang's compiler-rt darwin lib dir (where libclang_rt.osx.a

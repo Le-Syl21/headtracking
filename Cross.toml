@@ -11,7 +11,11 @@
 pre-build = [
     "dpkg --add-architecture arm64",
     "apt-get update",
-    "apt-get install -y --no-install-recommends python3 python-is-python3 cmake pkg-config",
+    "apt-get install -y --no-install-recommends python3 cmake pkg-config",
+    # cmake's `find_package(Python REQUIRED)` looks for `python` first.
+    # Older cross-rs base images (Ubuntu 16.04 / 18.04) ship `python3`
+    # but no `python-is-python3` package, so symlink manually.
+    "ln -sf /usr/bin/python3 /usr/local/bin/python",
     "apt-get install -y --no-install-recommends libusb-1.0-0-dev:arm64 libudev-dev:arm64",
     # SDL3 build deps (demo binary). Long line — TOML basic strings
     # don't support shell-style backslash line continuations.
