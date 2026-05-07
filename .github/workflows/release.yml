@@ -62,16 +62,14 @@ jobs:
             archive: zip
             experimental: true
 
-          - suffix: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
-            plugin_lib: libheadtracking.dylib
-            demo_bin: headtracking-demo
-            archive: tar.gz
-            experimental: true
+          # macos-x86_64 dropped for 0.0.x. The Intel `macos-13` runner
+          # pool has been in deep backlog since GitHub started its
+          # multi-month deprecation; jobs hang in "Waiting for a runner"
+          # for hours. Re-add as a cross-compile from `macos-latest`
+          # (Apple Silicon) when an Intel beta tester actually asks.
 
           - suffix: macos-aarch64
-            os: macos-14
+            os: macos-latest
             target: aarch64-apple-darwin
             plugin_lib: libheadtracking.dylib
             demo_bin: headtracking-demo
