@@ -50,7 +50,15 @@ fn main() {
         .define("BUILD_AS3_SERVER", "OFF")
         .define("BUILD_AUDIO", "OFF")
         .define("BUILD_OPENNI2_DRIVER", "OFF")
-        .define("BUILD_REDIST_PACKAGE", "OFF")
+        // BUILD_REDIST_PACKAGE=ON. The OFF branch's `firmware` custom
+        // target runs `fwfetcher.py` to download Microsoft-hosted Kinect
+        // audio firmware files via HTTPS — the URLs and CDN are flaky
+        // in CI (HTTP 403 / SSL handshake failures) and we don't use
+        // the audio path anyway (`BUILD_AUDIO=OFF`). The ON branch only
+        // installs `fwfetcher.py` to share/ as a script we never run,
+        // sidestepping the network dep entirely. This also removes the
+        // need for a working Python at build time.
+        .define("BUILD_REDIST_PACKAGE", "ON")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
 
     // FindLibUSB shim + pre-set values for Windows / macOS x86_64
