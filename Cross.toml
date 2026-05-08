@@ -16,6 +16,10 @@ pre-build = [
     # Older cross-rs base images (Ubuntu 16.04 / 18.04) ship `python3`
     # but no `python-is-python3` package, so symlink manually.
     "ln -sf /usr/bin/python3 /usr/local/bin/python",
+    # The base image's libclang is too old for bindgen >=0.70 (calls
+    # `clang_getTranslationUnitTargetInfo` which only landed in
+    # clang-14+). Install a newer toolchain.
+    "apt-get install -y --no-install-recommends clang libclang-dev",
     "apt-get install -y --no-install-recommends libusb-1.0-0-dev:arm64 libudev-dev:arm64",
     # SDL3 build-deps for the demo. Shortened to packages that exist on
     # the older cross-rs base image (libdecor-0-dev / libxtst-dev etc.

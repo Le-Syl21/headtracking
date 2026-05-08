@@ -169,6 +169,12 @@ jobs:
             # the x86_64 .pc first.
             echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" >> $GITHUB_ENV
             echo "LIBRARY_PATH=/usr/local/lib" >> $GITHUB_ENV
+            # rustc on macOS doesn't always honour LIBRARY_PATH the way
+            # the host clang does (the cross-arch linker invocation can
+            # ignore it). Surface the Intel libusb dir to rustc directly
+            # via RUSTFLAGS so `-L /usr/local/lib` lands on every rustc
+            # link line.
+            echo "RUSTFLAGS=-L /usr/local/lib" >> $GITHUB_ENV
           fi
 
       - name: Windows native deps (libusb via vcpkg + pkgconf)
