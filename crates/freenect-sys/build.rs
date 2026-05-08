@@ -96,7 +96,16 @@ fn main() {
         if let Some(parent) = lib.parent() {
             println!("cargo:rustc-link-search=native={}", parent.display());
         }
-        println!("cargo:rustc-link-lib=libusb-1.0");
+        // See freenect2-sys/build.rs for the naming-convention rationale:
+        // MSVC needs the `lib` prefix in our directive, ld on Linux/macOS
+        // does not (it auto-prepends).
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        let lib_name = if target_env == "msvc" {
+            "libusb-1.0"
+        } else {
+            "usb-1.0"
+        };
+        println!("cargo:rustc-link-lib={lib_name}");
     } else {
         pkg_config::Config::new()
             .atleast_version("1.0.20")

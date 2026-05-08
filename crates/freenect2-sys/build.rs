@@ -144,9 +144,21 @@ fn main() {
         if let Some(parent) = lib.parent() {
             println!("cargo:rustc-link-search=native={}", parent.display());
         }
-        // On Windows the import lib is `libusb-1.0.lib`; rustc strips the
-        // .lib extension. On macOS we link the .dylib by name.
-        println!("cargo:rustc-link-lib=libusb-1.0");
+        // Naming convention diverges per linker:
+        //   * MSVC link.exe : `-lFOO` → `FOO.lib`. The vcpkg import
+        //     library is `libusb-1.0.lib`, so the bare name we hand
+        //     rustc must include the `lib` prefix.
+        //   * ld / lld on Linux/macOS : `-lFOO` → `libFOO.{so,dylib}`,
+        //     i.e. ld auto-prepends `lib`. We must NOT include the
+        //     `lib` prefix in our directive, otherwise ld looks for
+        //     `liblibusb-1.0.{so,dylib}` and fails.
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        let lib_name = if target_env == "msvc" {
+            "libusb-1.0"
+        } else {
+            "usb-1.0"
+        };
+        println!("cargo:rustc-link-lib={lib_name}");
     } else {
         pkg_config::Config::new()
             .atleast_version("1.0.20")
