@@ -1321,7 +1321,7 @@ checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 
 [[package]]
 name = "headtracking"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "arc-swap",
  "bindgen",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "headtracking-demo"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "eframe",
  "face",
