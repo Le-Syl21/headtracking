@@ -168,7 +168,15 @@ pub enum Error {
     ContextInit,
     #[error("no Kinect v2 device available")]
     NoDevice,
-    #[error("libfreenect2 declined to open the device")]
+    // libfreenect2's C++ API only signals success/failure via a null
+    // pointer; we can't recover a libusb rc. The hint covers the by-far
+    // most common cause we hit in the wild — Windows users with the
+    // Microsoft SDK driver but no UsbDk filter / no libusbK replacement.
+    #[error(
+        "libfreenect2 declined to open the device — typical causes: \
+         Linux missing udev rules, Windows missing UsbDk filter or libusbK \
+         driver replacement (see README)"
+    )]
     OpenFailed,
     #[error("libfreenect2 startStreams returned false")]
     StartFailed,

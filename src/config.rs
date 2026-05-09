@@ -67,6 +67,20 @@ pub struct Config {
     pub baseline_offset_x_mm: f32,
     pub baseline_offset_y_mm: f32,
     pub baseline_offset_z_mm: f32,
+    /// World distance between the player's hand centroids when both
+    /// rest on the flipper buttons. Drives the hand-as-fiducial
+    /// calibration (see `src/calibration/hand_fiducial.rs`). Default
+    /// 660 mm is slightly less than the 700 mm lockbar width on
+    /// Sylvain's widebody — hands wrap inboard of the button posts.
+    pub lockbar_hand_span_mm: f32,
+    /// Distance from the floor to the top of the lockbar. Used by
+    /// downstream code to convert hand-Y to world Y. 850 mm = standard
+    /// widebody pincab.
+    pub lockbar_floor_height_mm: f32,
+    /// Anatomical interocular distance, used by face-bbox-based
+    /// distance estimation. Adult mean ≈ 63 mm; user can lower to
+    /// ~55 mm for kids or raise to ~68 mm for very tall players.
+    pub ipd_mm: f32,
 }
 
 impl Default for Config {
@@ -82,6 +96,9 @@ impl Default for Config {
             baseline_offset_x_mm: 0.0,
             baseline_offset_y_mm: 0.0,
             baseline_offset_z_mm: 0.0,
+            lockbar_hand_span_mm: 660.0,
+            lockbar_floor_height_mm: 850.0,
+            ipd_mm: 63.0,
         }
     }
 }
@@ -95,6 +112,9 @@ static CONFIG: RwLock<Config> = RwLock::new(Config {
     baseline_offset_x_mm: 0.0,
     baseline_offset_y_mm: 0.0,
     baseline_offset_z_mm: 0.0,
+    lockbar_hand_span_mm: 660.0,
+    lockbar_floor_height_mm: 850.0,
+    ipd_mm: 63.0,
 });
 
 /// Snapshot of the current configuration. Cheap (RwLock read).
@@ -175,6 +195,34 @@ unsafe extern "C" fn set_offset_z(v: f32) {
         .write()
         .expect("config rwlock poisoned")
         .baseline_offset_z_mm = v;
+}
+
+unsafe extern "C" fn get_lockbar_hand_span() -> f32 {
+    current().lockbar_hand_span_mm
+}
+unsafe extern "C" fn set_lockbar_hand_span(v: f32) {
+    CONFIG
+        .write()
+        .expect("config rwlock poisoned")
+        .lockbar_hand_span_mm = v.max(100.0);
+}
+
+unsafe extern "C" fn get_lockbar_floor_height() -> f32 {
+    current().lockbar_floor_height_mm
+}
+unsafe extern "C" fn set_lockbar_floor_height(v: f32) {
+    CONFIG
+        .write()
+        .expect("config rwlock poisoned")
+        .lockbar_floor_height_mm = v.max(0.0);
+}
+
+unsafe extern "C" fn get_ipd() -> f32 {
+    current().ipd_mm
+}
+unsafe extern "C" fn set_ipd(v: f32) {
+    // 40-80 mm bracket covers everyone from young kids to outliers.
+    CONFIG.write().expect("config rwlock poisoned").ipd_mm = v.clamp(40.0, 80.0);
 }
 
 // ============================================================ register_settings
@@ -365,6 +413,43 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32) {
         get_offset_z,
         set_offset_z,
     );
+    let hand_span = make_float_setting(
+        c"LockbarHandSpan",
+        c"Lockbar Hand Span (mm)",
+        c"World distance between the player's hand centroids on the flipper buttons. \
+          Drives the hand-as-fiducial calibration. ~660 mm on a standard widebody (slightly \
+          inboard of the actual lockbar).",
+        300.0,
+        1000.0,
+        1.0,
+        660.0,
+        get_lockbar_hand_span,
+        set_lockbar_hand_span,
+    );
+    let floor_h = make_float_setting(
+        c"LockbarFloorHeight",
+        c"Lockbar Floor Height (mm)",
+        c"Distance from the floor to the top of the lockbar — used to convert hand-Y to \
+          world Y. 850 mm on a standard widebody.",
+        500.0,
+        1500.0,
+        1.0,
+        850.0,
+        get_lockbar_floor_height,
+        set_lockbar_floor_height,
+    );
+    let ipd = make_float_setting(
+        c"IPDmm",
+        c"Interpupillary Distance (mm)",
+        c"Distance between the eye pupils — used by face-bbox-based depth estimation. \
+          Adult mean ≈ 63 mm; lower for kids (~55), raise for outliers (~68).",
+        40.0,
+        80.0,
+        0.5,
+        63.0,
+        get_ipd,
+        set_ipd,
+    );
 
     // SAFETY: `register` is a valid C function pointer per the API contract;
     // each pointer is a freshly leaked Box<MsgSettingDef> that lives forever.
@@ -377,5 +462,8 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32) {
         register(endpoint_id, off_x);
         register(endpoint_id, off_y);
         register(endpoint_id, off_z);
+        register(endpoint_id, hand_span);
+        register(endpoint_id, floor_h);
+        register(endpoint_id, ipd);
     }
 }

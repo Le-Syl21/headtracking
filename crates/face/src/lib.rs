@@ -1,5 +1,9 @@
-//! Face detection over a vendored Ultraface RFB-320 ONNX model run
-//! through `tract`. Pure Rust, no native deps.
+//! Face & hand detection over vendored ONNX models run through
+//! `tract`. Pure Rust, no native deps.
+//!
+//! The crate is named `face` for historical reasons; with the
+//! BlazePalm scaffold under [`hand`] it now hosts both detectors.
+//! Renaming to `detect` is on the table once the hand path stabilises.
 //!
 //! We tried YuNet first — bigger landmark coverage, but tract 0.21
 //! doesn't analyse its first stride-2 Conv correctly (`Failed analyse for
@@ -17,6 +21,8 @@
 //!
 //! The `N=4420` anchors are baked into the graph, so all the post-
 //! processing we owe is: filter by score, scale to image pixels, NMS.
+
+pub mod hand;
 
 use std::cmp::Ordering;
 use std::io::Cursor;

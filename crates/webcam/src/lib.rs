@@ -22,7 +22,7 @@ use sdl3_sys::camera as sdl_cam;
 use sdl3_sys::camera::SDL_CameraID;
 use sdl3_sys::error::SDL_GetError;
 use sdl3_sys::events::SDL_PumpEvents;
-use sdl3_sys::init::{SDL_INIT_CAMERA, SDL_Init};
+use sdl3_sys::init::{SDL_INIT_CAMERA, SDL_Init, SDL_InitSubSystem, SDL_QuitSubSystem};
 use sdl3_sys::pixels::{SDL_Colorspace, SDL_PIXELFORMAT_RGB24};
 use sdl3_sys::surface::{SDL_ConvertSurface, SDL_DestroySurface, SDL_Surface};
 
@@ -58,6 +58,33 @@ fn read_sdl_error() -> String {
         .into_owned()
 }
 
+/// Force the SDL3 camera subsystem to drop its cached device list and
+/// re-enumerate from scratch. Necessary on Windows because the
+/// MediaFoundation backend ships *no hot-plug detection at all*
+/// (`SDL_camera_mediafoundation.c` has a literal `"no hotplug for you!"`
+/// FIXME) — its only enumeration point is `MEDIAFOUNDATION_DetectDevices`,
+/// called once from `SDL_CameraInit`. Tearing the subsystem down to ref
+/// count 0 and re-initialising is the only way to trigger another scan.
+///
+/// **The caller MUST drop every live [`Camera`] handle before invoking
+/// this.** The subsystem teardown closes every open device; any kept
+/// `Camera` would be a use-after-free waiting to happen.
+pub fn force_refresh() -> Result<(), Error> {
+    ensure_subsystem()?;
+    // SAFETY: ref count is ≥ 1 after `ensure_subsystem`. SDL3 docs (init.h)
+    // state both calls are thread-safe and ref-counted; quit→init at the
+    // same call site cycles the subsystem (re-running DetectDevices) without
+    // racing other in-flight inits.
+    unsafe {
+        SDL_QuitSubSystem(SDL_INIT_CAMERA);
+        if !SDL_InitSubSystem(SDL_INIT_CAMERA) {
+            return Err(Error::Init(read_sdl_error()));
+        }
+    }
+    info!("SDL3 camera subsystem cycled (forced rescan — Windows hot-plug workaround)");
+    Ok(())
+}
+
 // ============================================================ Public types
 
 /// Description of a camera advertised by the OS.
@@ -86,6 +113,12 @@ pub struct RgbFrame {
 // ============================================================ list()
 
 /// Enumerate all webcams visible to the OS. Cheap (no streams opened).
+///
+/// **Windows caveat**: SDL3's MediaFoundation backend has *no* hot-plug
+/// support (cf. `SDL_camera_mediafoundation.c`: *"no hotplug for you!"*).
+/// A camera plugged in after the first call stays invisible until the
+/// subsystem is torn down and re-initialised. Use [`force_refresh`] before
+/// `list()` when implementing a "rescan" UX.
 pub fn list() -> Result<Vec<CameraInfo>, Error> {
     ensure_subsystem()?;
     // SDL_GetCameras returns a snapshot of an internal device list which
