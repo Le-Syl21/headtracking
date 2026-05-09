@@ -144,13 +144,30 @@ $denyKey = "$restrictionsKey\DenyDeviceIDs"
 New-Item -Path $restrictionsKey -Force | Out-Null
 Set-ItemProperty -Path $restrictionsKey -Name 'DenyDeviceIDs' -Type DWord -Value 1
 # Retroactive=0: don't yank already-bound drivers from running devices.
-# We unbind those manually in step 2 instead.
+# We unbind those manually in step 3 instead.
 Set-ItemProperty -Path $restrictionsKey -Name 'DenyDeviceIDsRetroactive' -Type DWord -Value 0
+# AllowAdminInstall=1: by default, DenyDeviceIDs blocks ALL installs
+# including admin-initiated ones (Zadig, Device Manager, pnputil…).
+# We need admins to be able to override the deny so Zadig can bind
+# WinUSB on the v1 sub-devices afterwards. This flag is exactly the
+# Group Policy "Allow administrators to override Device Installation
+# Restriction policies" toggle.
+Set-ItemProperty -Path $restrictionsKey -Name 'AllowAdminInstall' -Type DWord -Value 1
 
 New-Item -Path $denyKey -Force | Out-Null
 
-# All known Kinect VID/PID pairs — covers Xbox 360 ("Kinect for
-# Xbox") and Kinect for Windows revisions of v1, plus v2.
+# Kinect v1 sub-devices ONLY. The deny list is here to stop Windows
+# PnP from auto-installing partial drivers (especially `usbaudio.sys`
+# on the audio interface) that would later get in the way of Zadig's
+# WinUSB binding. AllowAdminInstall=1 above lets Zadig override the
+# deny when an admin runs it.
+#
+# We deliberately do NOT block the Kinect v2 PIDs (02C4 / 02D8 / 02D9):
+# v2 needs Windows to attach SOME function driver (the Microsoft
+# generic one is fine) so UsbDk can filter on top of it. Without a
+# function driver, UsbDk's class filter has nothing to attach to and
+# libfreenect2 fails. Earlier versions of this script blocked v2 too
+# and made the Kinect v2 disappear from Device Manager entirely.
 $kinectIds = @(
     'USB\VID_045E&PID_02AD',  # Xbox NUI Audio (v1, 1414 rev)
     'USB\VID_045E&PID_02AE',  # Xbox NUI Camera (v1, 1414 rev)
@@ -158,10 +175,7 @@ $kinectIds = @(
     'USB\VID_045E&PID_02BB',  # Xbox NUI Audio (v1, 1473 rev)
     'USB\VID_045E&PID_02BE',  # Kinect for Windows v1 motor variant
     'USB\VID_045E&PID_02BF',  # Xbox NUI Camera (v1, 1473 rev)
-    'USB\VID_045E&PID_02C2',  # Kinect for Windows v1 variant
-    'USB\VID_045E&PID_02C4',  # Xbox NUI Sensor (v2 composite parent)
-    'USB\VID_045E&PID_02D8',  # Xbox NUI Sensor (v2 alternate)
-    'USB\VID_045E&PID_02D9'   # Xbox NUI Sensor (v2 alternate)
+    'USB\VID_045E&PID_02C2'   # Kinect for Windows v1 variant
 )
 
 # Wipe the existing list first so re-runs don't accumulate stale
