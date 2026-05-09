@@ -139,10 +139,23 @@ fn main() {
     println!("cargo:rustc-link-lib=static=turbojpeg{tj_suffix}");
     println!("cargo:rustc-link-lib=static=jpeg{tj_suffix}");
 
-    // libfreenect2's USB transport. libusb-sys already emits the right
-    // `cargo:rustc-link-lib=` for the platform (static usb-1.0 + Win32
-    // helpers on Windows via cc-rs; pkg-config dynamic link directives
-    // on Linux/macOS) — nothing to add here.
+    // Re-emit libusb's link directives — same rationale as in
+    // freenect-sys/build.rs: rustc elides the empty libusb-sys rlib,
+    // taking its `cargo:rustc-link-lib=` directives down with it.
+    // freenect2-sys's rlib *is* in the dep graph, so directives we
+    // emit here survive to the cdylib's link line.
+    let libusb_lib_dir = env::var("DEP_USB_1.0_LIB_DIR").unwrap_or_default();
+    if !libusb_lib_dir.is_empty() {
+        println!("cargo:rustc-link-search=native={libusb_lib_dir}");
+    }
+    let libusb_lib_name = env::var("DEP_USB_1.0_LIB_NAME").unwrap_or_else(|_| "usb-1.0".into());
+    let libusb_link_kind = env::var("DEP_USB_1.0_LINK_KIND").unwrap_or_else(|_| "dylib".into());
+    println!("cargo:rustc-link-lib={libusb_link_kind}={libusb_lib_name}");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        for sys in ["user32", "advapi32", "setupapi", "ole32"] {
+            println!("cargo:rustc-link-lib={sys}");
+        }
+    }
 
     // C++ runtime
     if cfg!(target_os = "linux") {

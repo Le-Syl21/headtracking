@@ -121,15 +121,22 @@ fn build_windows_static(vendor_root: &Path) {
 
     println!("cargo:include={}", libusb_dir.display());
     println!("cargo:lib={}", archive.display());
-    // MSVC needs the `lib` prefix in the link directive; ld auto-prepends.
-    println!(
-        "cargo:lib_name={}",
-        if target_env == "msvc" {
-            "libusb-1.0"
-        } else {
-            "usb-1.0"
-        }
-    );
+    // OUT_DIR exposed separately so downstream crates can emit
+    // `cargo:rustc-link-search` even when the libusb-sys rlib gets
+    // elided by rustc (its lib.rs has no public symbols, so without a
+    // re-emit the link directives we declare via `cargo:` would
+    // disappear from the final cdylib's link line — see the
+    // belt-and-suspenders block in freenect-sys/freenect2-sys).
+    println!("cargo:lib_dir={}", out_dir.display());
+    // Bare lib name for `cargo:rustc-link-lib=…` in downstream crates.
+    // cc-rs / cargo-rustc translation:
+    //   - on MSVC, `static=usb-1.0` → `usb-1.0.lib`
+    //   - elsewhere static archives are `libusb-1.0.a` / `.so` /
+    //     `.dylib`; the bare name `usb-1.0` is what ld expects.
+    println!("cargo:lib_name=usb-1.0");
+    // Static vs dylib: the Windows path produces a static archive via
+    // cc-rs; consumers should pass `kind=static` to rustc-link-lib.
+    println!("cargo:link_kind=static");
 }
 
 fn probe_unix_system() {
@@ -194,7 +201,7 @@ fn probe_unix_system() {
             candidates.into_iter().find(|p| p.exists())
         });
 
-    match path {
+    match &path {
         Some(p) => println!("cargo:lib={}", p.display()),
         None => {
             // Fall back to the bare name. cmake's target_link_libraries
@@ -204,5 +211,9 @@ fn probe_unix_system() {
             println!("cargo:lib=usb-1.0");
         }
     }
+    if let Some(p) = path.as_ref().and_then(|p| p.parent()) {
+        println!("cargo:lib_dir={}", p.display());
+    }
     println!("cargo:lib_name=usb-1.0");
+    println!("cargo:link_kind=dylib");
 }

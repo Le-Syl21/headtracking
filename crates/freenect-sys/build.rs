@@ -106,10 +106,29 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=freenect");
-    // No explicit libusb link directive: libusb-sys's own build script
-    // already emits the right `cargo:rustc-link-lib=` for the platform
-    // (static=usb-1.0 on Windows via cc-rs, plus the Win32 helpers; the
-    // pkg-config crate emits the dynamic link directives on Linux/macOS).
+
+    // Re-emit libusb's link directives. libusb-sys's own build script
+    // emits these too, but rustc elides empty rlibs (libusb-sys's
+    // lib.rs has no public Rust symbols → no rlib content → its
+    // `cargo:rustc-link-lib=` directives never reach the final
+    // cdylib's link line). Replaying them from this crate, whose
+    // .rlib *is* referenced by `freenect`, keeps them alive.
+    let libusb_lib_dir = env::var("DEP_USB_1.0_LIB_DIR").unwrap_or_default();
+    if !libusb_lib_dir.is_empty() {
+        println!("cargo:rustc-link-search=native={libusb_lib_dir}");
+    }
+    let libusb_lib_name = env::var("DEP_USB_1.0_LIB_NAME").unwrap_or_else(|_| "usb-1.0".into());
+    let libusb_link_kind = env::var("DEP_USB_1.0_LINK_KIND").unwrap_or_else(|_| "dylib".into());
+    println!("cargo:rustc-link-lib={libusb_link_kind}={libusb_lib_name}");
+
+    // On Windows the static libusb archive depends on these Win32
+    // imports — re-emit them too (libusb-sys emits them as well, but
+    // for the same elision reason we mirror them here).
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        for sys in ["user32", "advapi32", "setupapi", "ole32"] {
+            println!("cargo:rustc-link-lib={sys}");
+        }
+    }
 
     // Bindgen on the public header. Resource-dir fallback mirrors the root
     // build.rs (handles dev systems without libclang-common-* installed).
