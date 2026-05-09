@@ -207,41 +207,11 @@ jobs:
 
       # ---------- Stage + archive ----------
 
-      # ---------- Bundle UsbDk MSI for Windows releases ----------
-
-      # On Windows, the plugin needs UsbDk's filter driver to reach the
-      # Kinect. Rather than asking users to download it themselves, we
-      # ship the signed MSI from Daynix's GitHub releases right next to
-      # the plugin DLL. The download is over HTTPS from GitHub directly
-      # (no proxy), the file is signed by Daynix and Windows verifies
-      # that signature on UAC. The pinned URL targets a specific
-      # release tag so the bundle doesn't drift.
-      # UsbDk's signed MSI from Daynix is x64-only — no ARM64 build is
-      # published. Skip the bundle on aarch64-pc-windows-msvc; ARM
-      # users can still run the plugin (libusb-sys's cc-rs build is
-      # arch-portable) but they need Zadig+libusbK for the Kinect.
-      - name: Fetch UsbDk MSI (Windows x64 only)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/daynix/UsbDk/releases/download/v1.00-22/UsbDk_1.0.22_x64.msi"
-          $out = "${{ github.workspace }}/UsbDk_1.0.22_x64.msi"
-          Write-Host "Fetching $url"
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-          # Display the SHA-256 so the release log carries an audit
-          # trail. We deliberately don't *enforce* a hash here — the
-          # MSI is signed by Daynix and re-fetched at every release;
-          # Windows' Authenticode check during UAC install is the
-          # actual integrity boundary. If you want to harden, lift
-          # this hash into a Verify-FileHash step pinned per release.
-          $hash = (Get-FileHash $out -Algorithm SHA256).Hash
-          Write-Host "UsbDk MSI SHA-256: $hash"
-          # Sanity: refuse a 0-byte file (404 served as 200 by some mirrors).
-          $size = (Get-Item $out).Length
-          if ($size -lt 1000000) {
-            Write-Error "UsbDk MSI suspiciously small ($size bytes) — refusing"
-            exit 1
-          }
+      # The plugin checks for UsbDk at PluginLoad and emits a warn log
+      # with the releases URL when it's missing — bundling the signed
+      # MSI in our ZIP would just duplicate what Daynix already ships.
+      # Users on Windows download UsbDk directly from
+      # https://github.com/daynix/UsbDk/releases (covered in README).
 
       - name: Stage artifacts
         shell: bash
@@ -255,14 +225,6 @@ jobs:
           cp plugin.cfg "$stage/"
           [ -f LICENSE ] && cp LICENSE "$stage/" || true
           [ -f README.md ] && cp README.md "$stage/" || true
-          # Windows x64 only: bundle UsbDk MSI + the install helper
-          # alongside the plugin under drivers/. ARM Windows skips it
-          # (no ARM64 UsbDk build available); Linux/macOS skip too.
-          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
-            mkdir -p "$stage/drivers"
-            cp UsbDk_1.0.22_x64.msi "$stage/drivers/"
-            cp tools/windows-release/install-drivers.cmd "$stage/drivers/"
-          fi
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
           echo "ARTIFACT_BASENAME=headtracking-${version}-${{ matrix.suffix }}" >> "$GITHUB_ENV"
 

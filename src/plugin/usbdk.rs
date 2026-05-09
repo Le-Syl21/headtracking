@@ -11,20 +11,42 @@
 //! instead of letting them stare at a later `LIBUSB_ERROR_NOT_SUPPORTED`.
 //! The probe is best-effort; a false-negative just means a redundant hint.
 
-#[cfg(not(target_os = "windows"))]
-pub fn warn_if_missing() {}
+/// Public download URL for the UsbDk releases page. Surfaced both in
+/// the warn log and in the headtracking-demo popup so users have a
+/// single source of truth they can click on.
+pub const RELEASES_URL: &str = "https://github.com/daynix/UsbDk/releases";
 
-#[cfg(target_os = "windows")]
+/// `true` if UsbDk is loaded and reachable. Always `true` on
+/// non-Windows targets — UsbDk only matters when libusb's WinUSB
+/// backend would otherwise fail. Cheap (one `CreateFileW` call); safe
+/// to invoke from any thread.
+pub fn is_present() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return windows::is_usbdk_present();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
+/// Log one actionable line if UsbDk is missing on Windows. No-op on
+/// other platforms (including the "info: detected" line, which would
+/// just be noise).
 pub fn warn_if_missing() {
-    if windows::is_usbdk_present() {
-        tracing::info!("UsbDk filter driver detected");
-    } else {
-        tracing::warn!(
-            installer =
-                "https://github.com/daynix/UsbDk/releases/download/v1.00-22/UsbDk_1.0.22_x64.msi",
-            "UsbDk filter driver not detected — Kinect open will fail with \
-             LIBUSB_ERROR_NOT_SUPPORTED. Install UsbDk and restart VPX."
-        );
+    #[cfg(target_os = "windows")]
+    {
+        if is_present() {
+            tracing::info!("UsbDk filter driver detected");
+        } else {
+            tracing::warn!(
+                releases = RELEASES_URL,
+                "UsbDk filter driver not detected — Kinect open will fail with \
+                 LIBUSB_ERROR_NOT_SUPPORTED. Install UsbDk from the link above \
+                 and restart VPX."
+            );
+        }
     }
 }
 

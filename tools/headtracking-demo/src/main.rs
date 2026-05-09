@@ -140,6 +140,12 @@ struct App {
     active: Option<Active>,
     error: Option<String>,
     logs: Arc<Mutex<VecDeque<String>>>,
+    /// `true` while the "UsbDk missing" popup should still be drawn.
+    /// Set on Windows only; flipped to `false` when the user clicks
+    /// the dismiss button. Always `false` on non-Windows because the
+    /// startup probe returns `is_present() == true` there by design
+    /// (see `headtracking::usbdk::is_present`).
+    show_usbdk_warning: bool,
 }
 
 impl App {
@@ -154,6 +160,56 @@ impl App {
                 Backend::KinectV2 => "Kinect v2".to_string(),
                 Backend::Webcam(i) => format!("Webcam #{i}"),
             })
+    }
+
+    /// Modal-like overlay shown on Windows when UsbDk wasn't detected
+    /// at startup. No-op on Linux/macOS (the flag is initialised to
+    /// `false` there) and on Windows once the user clicks Dismiss.
+    fn show_usbdk_warning_popup(&mut self, egui_ctx: &egui::Context) {
+        if !self.show_usbdk_warning {
+            return;
+        }
+        // egui::Window's `open(&mut bool)` adds the close button in
+        // the title bar, so a click on it sets `show_usbdk_warning =
+        // false` automatically. We additionally render a Dismiss
+        // button inside the body for users who'd reach for it.
+        let mut still_open = true;
+        egui::Window::new("UsbDk filter driver not detected")
+            .open(&mut still_open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(egui_ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label(
+                    "The Kinect needs UsbDk's filter driver on Windows. \
+                     libusb otherwise can't reach it (LIBUSB_ERROR_NOT_SUPPORTED \
+                     when opening the device).",
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    "Download the latest signed MSI from Daynix's releases \
+                     page, run it, then restart this app:",
+                );
+                ui.add_space(4.0);
+                ui.hyperlink_to(
+                    headtracking::usbdk::RELEASES_URL,
+                    headtracking::usbdk::RELEASES_URL,
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Dismiss").clicked() {
+                        self.show_usbdk_warning = false;
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Re-check").clicked() && headtracking::usbdk::is_present() {
+                        self.show_usbdk_warning = false;
+                    }
+                });
+            });
+        if !still_open {
+            self.show_usbdk_warning = false;
+        }
     }
 }
 
@@ -400,12 +456,20 @@ struct Baseline {
 impl App {
     fn new(logs: Arc<Mutex<VecDeque<String>>>) -> Self {
         let available = detect_backends();
+        // Same probe the plugin runs at PluginLoad. Surfaces a popup
+        // (drawn by `update`) on Windows when UsbDk's filter driver
+        // isn't loaded — Kinect open would later fail with -12. Logs
+        // the result either way so the trace lines up with the
+        // plugin's startup banner.
+        headtracking::usbdk::warn_if_missing();
+        let show_usbdk_warning = !headtracking::usbdk::is_present();
         Self {
             selected: Backend::None,
             available,
             active: None,
             error: None,
             logs,
+            show_usbdk_warning,
         }
     }
 
@@ -727,6 +791,8 @@ impl eframe::App for App {
     fn update(&mut self, egui_ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_active();
         self.poll(egui_ctx);
+
+        self.show_usbdk_warning_popup(egui_ctx);
 
         // ----- Top toolbar
         TopBottomPanel::top("toolbar").show(egui_ctx, |ui| {
