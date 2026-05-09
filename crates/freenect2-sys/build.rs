@@ -151,10 +151,22 @@ fn main() {
     let libusb_lib_name = env::var("DEP_USB_1.0_LIB_NAME").unwrap_or_else(|_| "usb-1.0".into());
     let libusb_link_kind = env::var("DEP_USB_1.0_LINK_KIND").unwrap_or_else(|_| "dylib".into());
     println!("cargo:rustc-link-lib={libusb_link_kind}={libusb_lib_name}");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        for sys in ["user32", "advapi32", "setupapi", "ole32"] {
-            println!("cargo:rustc-link-lib={sys}");
+    let target_os_for_sys = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match target_os_for_sys.as_str() {
+        "windows" => {
+            for sys in ["user32", "advapi32", "setupapi", "ole32"] {
+                println!("cargo:rustc-link-lib={sys}");
+            }
         }
+        "macos" => {
+            // libusb's darwin_usb.c uses these frameworks; re-emit
+            // here because libusb-sys's rlib gets elided.
+            for fw in ["IOKit", "CoreFoundation", "Security"] {
+                println!("cargo:rustc-link-lib=framework={fw}");
+            }
+            println!("cargo:rustc-link-lib=objc");
+        }
+        _ => {}
     }
 
     // C++ runtime

@@ -121,13 +121,29 @@ fn main() {
     let libusb_link_kind = env::var("DEP_USB_1.0_LINK_KIND").unwrap_or_else(|_| "dylib".into());
     println!("cargo:rustc-link-lib={libusb_link_kind}={libusb_lib_name}");
 
-    // On Windows the static libusb archive depends on these Win32
-    // imports — re-emit them too (libusb-sys emits them as well, but
-    // for the same elision reason we mirror them here).
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        for sys in ["user32", "advapi32", "setupapi", "ole32"] {
-            println!("cargo:rustc-link-lib={sys}");
+    // System-lib deps that the static libusb archive pulls in. Same
+    // elision rationale as the libusb directives just above:
+    // libusb-sys's rlib is empty, rustc drops it from the final
+    // cdylib's link line, and any `cargo:rustc-link-lib=` it emitted
+    // disappears with it. We re-emit from this crate's build script
+    // (its rlib *is* referenced) to keep them alive.
+    let target_os_for_sys = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match target_os_for_sys.as_str() {
+        "windows" => {
+            for sys in ["user32", "advapi32", "setupapi", "ole32"] {
+                println!("cargo:rustc-link-lib={sys}");
+            }
         }
+        "macos" => {
+            // libusb's darwin_usb.c uses CoreFoundation /
+            // IOKit / Security frameworks plus the Objective-C
+            // runtime (notification path).
+            for fw in ["IOKit", "CoreFoundation", "Security"] {
+                println!("cargo:rustc-link-lib=framework={fw}");
+            }
+            println!("cargo:rustc-link-lib=objc");
+        }
+        _ => {}
     }
 
     // Bindgen on the public header. Resource-dir fallback mirrors the root
