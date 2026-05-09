@@ -72,20 +72,21 @@ jobs:
             demo_bin: headtracking-demo.exe
             archive: zip
 
-          # Windows ARM64 native runner from the Arm Limited partner
-          # image set (`windows-11-arm`). GA since 2025-04. cc-rs
-          # picks up the ARM64 cl.exe automatically; libusb's source
-          # is portable C with no x86-only asm. UsbDk's signed MSI is
-          # x64-only — the bundle step skips this target, so an ARM
-          # user would have to use Zadig+libusbK for the Kinect.
-          # Largely a future-proofing target: VPX itself doesn't ship
-          # an ARM Windows build today.
-          - suffix: windows-aarch64
-            os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            plugin_lib: headtracking.dll
-            demo_bin: headtracking-demo.exe
-            archive: zip
+          # Windows ARM64 — disabled until upstream blockers clear:
+          # `tract-linalg`'s ARM64 SIMD kernels are GAS .S files that
+          # cl.exe ARM (the Windows-ARM C compiler) refuses to assemble
+          # (LNK1181 on `arm64simd_mmm_*.o`). The portable libusb
+          # build path on our side works fine; the blocker is in the
+          # ML inference dep chain. Re-enable once tract publishes a
+          # Windows-ARM-compatible release. Audience is also nil today
+          # — VPX itself ships no Windows ARM build.
+          #
+          # - suffix: windows-aarch64
+          #   os: windows-11-arm
+          #   target: aarch64-pc-windows-msvc
+          #   plugin_lib: headtracking.dll
+          #   demo_bin: headtracking-demo.exe
+          #   archive: zip
 
           # macOS Intel: `macos-26-intel` is the standard-tier alias
           # for the most recent Intel image, free unlimited on public
