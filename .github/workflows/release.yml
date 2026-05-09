@@ -72,13 +72,16 @@ jobs:
             demo_bin: headtracking-demo.exe
             archive: zip
 
-          # macOS x86_64: native Intel runner. GitHub still publishes
-          # `macos-13` images on Intel hardware (`macos-latest` and
-          # newer labels redirect to Apple Silicon). Native > cross —
-          # no Rosetta, no /usr/local Intel-Homebrew dance, pkg-config
-          # works the same way as on Linux.
+          # macOS x86_64: native Intel runner via the `-large` suffix.
+          # GitHub Actions publishes Intel macOS images alongside the
+          # ARM ones for every recent OS version; `macos-latest-large`
+          # is the floating alias (currently macOS 15 Sequoia, Intel
+          # x64). Free for public repos. Avoids the Rosetta + dual
+          # Homebrew dance we'd need to cross-compile from an ARM
+          # `macos-latest`. See actions/runner-images README for the
+          # canonical label table.
           - suffix: macos-x86_64
-            os: macos-13
+            os: macos-latest-large
             target: x86_64-apple-darwin
             plugin_lib: libheadtracking.dylib
             demo_bin: headtracking-demo
