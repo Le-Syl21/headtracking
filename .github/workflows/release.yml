@@ -156,12 +156,14 @@ jobs:
         run: |
           # libusb-sys now compiles libusb statically from the vendored
           # submodule on macOS too (using upstream's Xcode/config.h),
-          # so the build no longer needs Homebrew's libusb. Just cmake
-          # for libfreenect[2]. The resulting `.dylib` and binaries
-          # have zero external libusb dependency at runtime — no more
-          # "missing /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib"
-          # for end users without Homebrew installed.
-          brew install cmake
+          # so the build no longer needs Homebrew's libusb. Only cmake
+          # is needed for libfreenect[2], and the GitHub macOS runner
+          # images already ship a current cmake — guard the install so
+          # we don't print the "already installed and up-to-date"
+          # warning every run.
+          if ! command -v cmake >/dev/null 2>&1; then
+            brew install cmake
+          fi
 
       # Now that `libusb-sys` vendors libusb statically and our
       # FindLibUSB shim short-circuits the bundled cmake module
@@ -232,28 +234,29 @@ jobs:
           [ -f README.md ] && cp README.md "$stage/" || true
           if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
             mkdir -p "$stage/setup"
-            cp tools/windows-release/cleanup-kinect.cmd "$stage/setup/"
-            cp tools/windows-release/cleanup-kinect.ps1 "$stage/setup/"
+            cp tools/windows-release/cleanup-kinectv1.cmd "$stage/setup/"
+            cp tools/windows-release/cleanup-kinectv1.ps1 "$stage/setup/"
           fi
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
           echo "ARTIFACT_BASENAME=headtracking-${version}-${{ matrix.suffix }}" >> "$GITHUB_ENV"
 
-      - name: Tar (Linux / macOS)
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        run: |
-          tar -C "${STAGE_DIR}" -czf "${ARTIFACT_BASENAME}.tar.gz" .
-
-      - name: Zip (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path "$env:STAGE_DIR\*" -DestinationPath "$env:ARTIFACT_BASENAME.zip"
-
+      # Upload the staged DIRECTORY contents directly. `upload-artifact`
+      # always wraps its input in a single `<artifact-name>.zip` at
+      # download time. If we pre-zipped here, end-users would download
+      # `<name>.zip` containing `<name>.zip` containing the actual
+      # files — a double-wrap. Letting the action zip the directory
+      # itself gives a single, clean wrap.
+      #
+      # Side-effect: the artifact downloaded from a `workflow_dispatch`
+      # run is always a `.zip` (GitHub's wrapper format), regardless of
+      # OS. Tagged releases re-archive in the publish job below into
+      # the canonical per-OS format (`.tar.gz` for unix, `.zip` for
+      # Windows) — those are the assets that show up on the GitHub
+      # Release page.
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARTIFACT_BASENAME }}
-          path: ${{ env.ARTIFACT_BASENAME }}.${{ matrix.archive }}
+          path: ${{ env.STAGE_DIR }}/
           if-no-files-found: error
           retention-days: 7
 
@@ -267,20 +270,46 @@ jobs:
     # partial release — better no asset than a misleading one.
     if: success() && startsWith(github.ref, 'refs/tags/v')
     steps:
+      # `download-artifact` extracts each artifact's contents under
+      # `dist/<artifact-name>/`. We deliberately do NOT use
+      # `merge-multiple` — we want one directory per OS so we can
+      # re-archive each into its canonical format below.
       - uses: actions/download-artifact@v8
         with:
           path: dist
-          merge-multiple: true
 
-      - name: List artifacts
-        run: ls -lah dist/
+      - name: List downloaded artifacts
+        run: |
+          ls -lah dist/
+          for d in dist/*/; do
+            echo "--- $d ---"
+            ls -lah "$d"
+          done
+
+      # Re-archive each per-OS folder into the platform's canonical
+      # archive type: `.tar.gz` for linux/macos, `.zip` for windows.
+      # The artifact name embeds the suffix (`headtracking-<ver>-<os>-<arch>`)
+      # which we map to the right tool.
+      - name: Repack artifacts for release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          for d in dist/*/; do
+            name=$(basename "$d")
+            case "$name" in
+              *windows*) ( cd "$d" && zip -r "../../release-assets/${name}.zip" . ) ;;
+              *)         tar -C "$d" -czf "release-assets/${name}.tar.gz" . ;;
+            esac
+          done
+          ls -lah release-assets/
 
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            dist/*.tar.gz
-            dist/*.zip
+            release-assets/*.tar.gz
+            release-assets/*.zip
           generate_release_notes: true
           # Tags with -alpha / -beta / -rc suffix are flagged as
           # pre-releases automatically.

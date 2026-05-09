@@ -4,7 +4,7 @@ REM  HeadTracking — Kinect Windows setup launcher
 REM ----------------------------------------------------------------------
 REM
 REM  Double-click this file. Windows will prompt for admin rights (UAC),
-REM  then run cleanup-kinect.ps1 in the same directory. The PowerShell
+REM  then run cleanup-kinectv1.ps1 in the same directory. The PowerShell
 REM  script:
 REM    1. Downloads + installs UsbDk if it isn't already there
 REM       (covers the Kinect v2 path entirely);
@@ -29,10 +29,10 @@ REM ----------------------------------------------------------------------
 setlocal
 
 set SCRIPT_DIR=%~dp0
-set PS1=%SCRIPT_DIR%cleanup-kinect.ps1
+set PS1=%SCRIPT_DIR%cleanup-kinectv1.ps1
 
 if not exist "%PS1%" (
-    echo [ERROR] cleanup-kinect.ps1 not found next to this launcher:
+    echo [ERROR] cleanup-kinectv1.ps1 not found next to this launcher:
     echo         %PS1%
     pause
     exit /b 1
