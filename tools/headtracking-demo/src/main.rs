@@ -1063,8 +1063,18 @@ impl eframe::App for App {
                     if let Some(bar) = active.last_lockbar {
                         draw_lockbar(ui.painter(), rect, bar);
                     }
+                    // Source dimensions for bbox normalisation come from
+                    // the texture itself, NOT from the backend's spec.
+                    // On macOS AVFoundation the camera often delivers
+                    // frames at a size different from what
+                    // `SDL_GetCameraFormat` reported at open time —
+                    // using the spec here mapped boxes to the wrong
+                    // place (or off-screen). The texture was built from
+                    // the same buffer the detector saw, so its size is
+                    // authoritative.
+                    let src_size = tex.size_vec2();
                     for face in &active.last_faces {
-                        draw_face_bbox(ui.painter(), rect, face, &active.inner);
+                        draw_face_bbox(ui.painter(), rect, face, src_size);
                     }
                 } else {
                     centered(ui, rect, "waiting for first RGB frame…");
@@ -1098,12 +1108,13 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
 /// active backend (RGB sensor resolution: 1920×1080 for v2, 640×480 for
 /// v1, native cam res for webcam — the texture in `rect` already encodes
 /// the right aspect, we just need source dimensions to normalise).
-fn draw_face_bbox(painter: &egui::Painter, rect: Rect, face: &face::FaceDetection, inner: &Inner) {
-    let (frame_w, frame_h) = match inner {
-        Inner::KinectV2 { .. } => (1920.0, 1080.0),
-        Inner::KinectV1 { .. } => (640.0, 480.0),
-        Inner::Webcam { camera } => (camera.width() as f32, camera.height() as f32),
-    };
+/// `src_size` is the actual pixel dimensions of the frame the detector
+/// processed (= the texture's size, not the camera spec). Passing the
+/// wrong source size mis-projects the bbox; cf. the macOS AVFoundation
+/// vs SDL3 camera-format mismatch the demo hit on the FaceTime cam.
+fn draw_face_bbox(painter: &egui::Painter, rect: Rect, face: &face::FaceDetection, src_size: Vec2) {
+    let frame_w = src_size.x;
+    let frame_h = src_size.y;
     if frame_w <= 0.0 || frame_h <= 0.0 {
         return;
     }
