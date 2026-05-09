@@ -235,6 +235,25 @@ should see `kinect2 backend: 1 device(s) detected` (or v1 equivalent).
   **dedicated USB 3.0 port** (v2 needs the bandwidth of a root port,
   not a shared hub).
 
+##### Triage logs
+
+For the deeper "Device Manager lists it but it still won't open" cases
+the standalone `headtracking-demo` exposes libfreenect's own USB
+trace. Two env vars combined:
+
+```cmd
+set FREENECT_LOG_LEVEL=spew
+set HEADTRACKING_LOG=libfreenect=debug,info
+headtracking-demo.exe
+```
+
+`FREENECT_LOG_LEVEL` (`fatal`/`error`/`warning`/`notice`/`info`/
+`debug`/`spew`/`flood`) tunes libfreenect's verbosity; `HEADTRACKING_LOG`
+is the standard `tracing` filter routing those lines through. Every
+libfreenect log line shows up with a `libfreenect:` prefix in the
+in-app log panel and in the stderr stream — easy to grep / paste in
+a bug report.
+
 #### macOS
 
 `libusb` works on macOS without an extra driver. Drop the `.dylib` into
@@ -256,14 +275,16 @@ cargo build --release --no-default-features --features kinect-v2 # one backend
 ```
 
 Prerequisites: recent stable Rust (edition 2024), `cmake` ≥ 3.20, `libclang`
-(for `bindgen`). On Linux/macOS, the system `libusb-1.0` is used (`apt
-install libusb-1.0-0-dev`, `brew install libusb`); on Windows, libusb is
-vendored as a submodule and built statically by `libusb-sys`, no setup
-needed.
+(for `bindgen`). libusb is vendored as a submodule and built statically
+by `libusb-sys` on **all three** platforms — no `apt install
+libusb-1.0-0-dev`, no `brew install libusb`, no vcpkg. SDL3 build deps
+(only needed for the standalone demo's static SDL3) are still
+distro-managed: see the workflow `release.yml` for the exhaustive list.
 
-Native libs (libfreenect, libfreenect2, libjpeg-turbo, libusb on Windows)
-are vendored as submodules or via `turbojpeg-sys` and built **statically** —
-no system dep on the end user's machine.
+Native libs (libfreenect, libfreenect2, libjpeg-turbo, libusb) are all
+vendored as submodules or via `turbojpeg-sys` and built **statically** —
+zero external runtime dep on the end user's machine across Linux,
+macOS, and Windows.
 
 ### Credits
 
@@ -525,14 +546,17 @@ cargo build --release --no-default-features --features kinect-v2 # un seul
 ```
 
 Pré-requis : Rust stable récent (édition 2024), `cmake` ≥ 3.20, `libclang`
-(pour `bindgen`). Sur Linux/macOS, `libusb-1.0` système est utilisé
-(`apt install libusb-1.0-0-dev`, `brew install libusb`) ; sur Windows,
-libusb est vendoré en submodule et compilé statiquement par `libusb-sys`,
-rien à installer.
+(pour `bindgen`). libusb est vendoré en submodule et compilé
+statiquement par `libusb-sys` sur **les trois** plateformes — pas de
+`apt install libusb-1.0-0-dev`, pas de `brew install libusb`, pas de
+vcpkg. Les deps SDL3 (pour la build statique SDL3 du demo standalone
+uniquement) restent gérées par la distro — voir le workflow
+`release.yml` pour la liste complète.
 
-Les libs natives (libfreenect, libfreenect2, libjpeg-turbo, libusb sur
-Windows) sont vendorées en submodules ou via `turbojpeg-sys` et compilées
-**statiquement** — aucune dep système à installer côté utilisateur final.
+Les libs natives (libfreenect, libfreenect2, libjpeg-turbo, libusb)
+sont toutes vendorées en submodules ou via `turbojpeg-sys` et
+compilées **statiquement** — zéro dep externe au runtime côté
+utilisateur, sur Linux, macOS et Windows.
 
 ### Crédits
 

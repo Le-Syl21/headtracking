@@ -144,6 +144,10 @@ unsafe impl Sync for CtxHandle {}
 
 impl Context {
     /// Build a fresh context. Equivalent to `freenect_init(&mut ctx, NULL)`.
+    /// Wires the libfreenect log callback to the `tracing` ecosystem so
+    /// USB / driver / device-state messages surface in the same log
+    /// stream as the Rust-side ones — crucial for diagnosing why a
+    /// Kinect v1 enumerates but won't open on Windows.
     pub fn new() -> Result<Self, Error> {
         let mut raw: *mut sys::freenect_context = std::ptr::null_mut();
         // SAFETY: libfreenect requires we pass a valid out-pointer; usb_ctx
@@ -152,10 +156,32 @@ impl Context {
         if rc < 0 || raw.is_null() {
             return Err(Error::ContextInit(rc));
         }
-        // Claim camera + motor (so we can drive the tilt and LED). Audio
-        // stays off.
-        // SAFETY: `raw` is non-null per the check above.
+        // SAFETY: `raw` is non-null per the check above. The callback
+        // and log level live for the duration of the context.
         unsafe {
+            sys::freenect_set_log_callback(raw, Some(forward_log));
+            // INFO is the highest level that's still terse. Bump to DEBUG
+            // / SPEW via env var when triaging a stuck open. Important
+            // for the "Kinect v1 listed but won't open on Windows" case
+            // — libfreenect's INFO/DEBUG channel narrates the libusb
+            // claim and any access-denied transitions.
+            let level = match std::env::var("FREENECT_LOG_LEVEL")
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Ok("fatal") => sys::freenect_loglevel_FREENECT_LOG_FATAL,
+                Ok("error") => sys::freenect_loglevel_FREENECT_LOG_ERROR,
+                Ok("warning") => sys::freenect_loglevel_FREENECT_LOG_WARNING,
+                Ok("notice") => sys::freenect_loglevel_FREENECT_LOG_NOTICE,
+                Ok("debug") => sys::freenect_loglevel_FREENECT_LOG_DEBUG,
+                Ok("spew") => sys::freenect_loglevel_FREENECT_LOG_SPEW,
+                Ok("flood") => sys::freenect_loglevel_FREENECT_LOG_FLOOD,
+                _ => sys::freenect_loglevel_FREENECT_LOG_INFO,
+            };
+            sys::freenect_set_log_level(raw, level);
+            // Claim camera + motor (so we can drive the tilt and LED).
+            // Audio stays off.
             sys::freenect_select_subdevices(
                 raw,
                 sys::freenect_device_flags_FREENECT_DEVICE_CAMERA
@@ -170,24 +196,73 @@ impl Context {
         })
     }
 
-    /// Number of Kinect v1 devices visible on USB.
+    /// Number of Kinect v1 devices visible on USB. libfreenect counts
+    /// composite parents (Xbox NUI Sensor, VID `045E:02ae`/`02bf` etc.) —
+    /// not the three sub-devices. A non-zero count means libusb saw a
+    /// matching VID/PID and could descriptor-query it; opening can
+    /// still fail later with `LIBUSB_ERROR_NOT_SUPPORTED` (-12) if no
+    /// libusb-compatible driver is bound.
     pub fn enumerate(&self) -> i32 {
         let _g = self.handle.api_lock.lock();
         // SAFETY: `raw` is valid for the lifetime of CtxHandle.
-        unsafe { sys::freenect_num_devices(self.handle.raw) }
+        let count = unsafe { sys::freenect_num_devices(self.handle.raw) };
+        tracing::debug!(count, "freenect_num_devices returned");
+        count
     }
 
     /// Open the device at `index`. Mirrors `freenect_open_device`.
     pub fn open(&self, index: i32) -> Result<Device, Error> {
+        tracing::debug!(index, "freenect_open_device: entering");
         let g = self.handle.api_lock.lock();
         let mut raw: *mut sys::freenect_device = std::ptr::null_mut();
         // SAFETY: ctx is alive, `raw` is a valid out-pointer.
         let rc = unsafe { sys::freenect_open_device(self.handle.raw, &mut raw, index) };
         drop(g);
         if rc < 0 || raw.is_null() {
-            return Err(Error::OpenFailed(OpenFailureCode(rc)));
+            let code = OpenFailureCode(rc);
+            tracing::error!(rc, hint = %code, "freenect_open_device failed");
+            return Err(Error::OpenFailed(code));
         }
+        tracing::debug!(index, "freenect_open_device: success");
         Device::wrap(self.handle.clone(), raw)
+    }
+}
+
+/// Forward libfreenect's log lines to `tracing`. libfreenect calls
+/// this from the USB worker thread when the device is streaming, and
+/// from the main thread during init/enumerate/open. The callback is
+/// `extern "C"` and must not unwind.
+unsafe extern "C" fn forward_log(
+    _ctx: *mut sys::freenect_context,
+    level: sys::freenect_loglevel,
+    msg: *const std::os::raw::c_char,
+) {
+    if msg.is_null() {
+        return;
+    }
+    // SAFETY: msg is non-null per the check above; libfreenect docs
+    // guarantee a NUL-terminated UTF-8 (ASCII in practice) string.
+    let raw = unsafe { std::ffi::CStr::from_ptr(msg) };
+    let line = raw.to_string_lossy();
+    let line = line.trim_end_matches('\n');
+    // Both `target:` (for env-filter routing — `HEADTRACKING_LOG=libfreenect=debug`)
+    // and an explicit `libfreenect: ` message prefix (so the panel
+    // layer's `.with_target(false)` doesn't make these lines look
+    // identical to app-side ones during visual triage).
+    match level {
+        sys::freenect_loglevel_FREENECT_LOG_FATAL | sys::freenect_loglevel_FREENECT_LOG_ERROR => {
+            tracing::error!(target: "libfreenect", "libfreenect: {line}");
+        }
+        sys::freenect_loglevel_FREENECT_LOG_WARNING => {
+            tracing::warn!(target: "libfreenect", "libfreenect: {line}");
+        }
+        sys::freenect_loglevel_FREENECT_LOG_NOTICE | sys::freenect_loglevel_FREENECT_LOG_INFO => {
+            tracing::info!(target: "libfreenect", "libfreenect: {line}");
+        }
+        _ => {
+            // DEBUG / SPEW / FLOOD — let the env filter decide.
+            tracing::debug!(target: "libfreenect", "libfreenect: {line}");
+        }
     }
 }
 

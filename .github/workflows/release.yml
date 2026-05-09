@@ -132,13 +132,14 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          # Full SDL3 build-deps list (per
-          # https://wiki.libsdl.org/SDL3/README-linux) plus libusb / libudev
-          # for libfreenect[2]. Required by the demo's static SDL3 build;
-          # the plugin itself doesn't link SDL3 (resolved via dlsym).
+          # libusb is now vendored statically by `libusb-sys` (no more
+          # `libusb-1.0-0-dev`); the rest of this list is SDL3's
+          # build-time deps (per https://wiki.libsdl.org/SDL3/README-linux)
+          # for the standalone demo's static SDL3 build. The plugin
+          # itself doesn't link SDL3 (resolved via dlsym at PluginLoad).
           sudo apt-get install -y --no-install-recommends \
             cmake clang libclang-dev pkg-config ninja-build \
-            libusb-1.0-0-dev libudev-dev \
+            libudev-dev \
             libasound2-dev libpulse-dev libjack-jackd2-dev \
             libsndio-dev libpipewire-0.3-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
@@ -153,11 +154,14 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
-          # Homebrew is preinstalled on both Intel and ARM macOS
-          # runners at the canonical prefix for their architecture
-          # (`/usr/local` on Intel, `/opt/homebrew` on ARM). pkg-config
-          # picks up the right .pc files automatically.
-          brew install libusb cmake
+          # libusb-sys now compiles libusb statically from the vendored
+          # submodule on macOS too (using upstream's Xcode/config.h),
+          # so the build no longer needs Homebrew's libusb. Just cmake
+          # for libfreenect[2]. The resulting `.dylib` and binaries
+          # have zero external libusb dependency at runtime — no more
+          # "missing /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib"
+          # for end users without Homebrew installed.
+          brew install cmake
 
       # Now that `libusb-sys` vendors libusb statically and our
       # FindLibUSB shim short-circuits the bundled cmake module

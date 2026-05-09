@@ -77,58 +77,100 @@ struct BackendEntry {
 
 /// Probe USB for connected sensors. Always returns `None (off)` first; the
 /// other entries are added when the corresponding library reports a device.
+///
+/// Logs each backend's enumeration outcome at INFO level. For triage of
+/// the "Kinect v1 listed in Device Manager but won't open" case on
+/// Windows:
+///   * set `FREENECT_LOG_LEVEL=spew` (or `flood`) before launching to
+///     make libfreenect itself emit its full USB transcript;
+///   * set `HEADTRACKING_LOG=libfreenect=debug,info` so the demo
+///     surfaces those lines (they'll appear with the `libfreenect:`
+///     prefix in both the stderr stream and the in-app log panel).
 fn detect_backends() -> Vec<BackendEntry> {
+    info!("scan: probing USB backends");
     let mut out = vec![BackendEntry {
         backend: Backend::None,
         label: "None (off)".to_string(),
     }];
 
+    // ---- Kinect v2 (libfreenect2)
     match freenect2::Context::new() {
         Ok(ctx) => {
             let n = ctx.enumerate();
+            info!(count = n, "scan: libfreenect2 enumerated devices");
             if n > 0 {
                 out.push(BackendEntry {
                     backend: Backend::KinectV2,
                     label: "Kinect v2".to_string(),
                 });
-                info!(count = n, "kinect v2 detected");
             }
         }
-        Err(e) => info!(?e, "kinect v2 enumerate failed"),
+        Err(e) => warn!(?e, "scan: kinect v2 context init failed"),
     }
 
+    // ---- Kinect v1 (libfreenect) — extra noise here because that's the
+    // backend currently flaky on Windows. We log Windows-side UsbDk
+    // status alongside so a single trace tells the full story.
+    #[cfg(target_os = "windows")]
+    {
+        let usbdk = headtracking::usbdk::is_present();
+        info!(
+            usbdk,
+            "scan: UsbDk filter status (false = libusb cannot open Kinect on Windows)"
+        );
+    }
     match freenect::Context::new() {
         Ok(ctx) => {
             let n = ctx.enumerate();
+            // Distinguish three states explicitly:
+            //   n == 0  : libusb saw nothing matching VID 045E:02ae/02bf
+            //             → driver bound by another stack (SDK), or no
+            //             driver at all and Windows hasn't created a
+            //             device path libusb can enumerate.
+            //   n  > 0  : libusb saw the device descriptor; opening may
+            //             still fail with -12 if no libusb-compatible
+            //             driver is bound. Try `kinect_v1::open` next.
             if n > 0 {
+                info!(count = n, "scan: kinect v1 detected");
                 out.push(BackendEntry {
                     backend: Backend::KinectV1,
                     label: "Kinect v1".to_string(),
                 });
-                info!(count = n, "kinect v1 detected");
+            } else {
+                info!(
+                    "scan: kinect v1 — libfreenect counted 0 devices. \
+                     On Windows that means libusb couldn't enumerate the \
+                     composite parent (Xbox NUI Sensor) — typically the \
+                     SDK driver is bound and UsbDk is missing/inactive. \
+                     Check the libfreenect log lines just above (set \
+                     FREENECT_LOG_LEVEL=spew for full USB trace)."
+                );
             }
         }
-        Err(e) => info!(?e, "kinect v1 enumerate failed"),
+        Err(e) => warn!(?e, "scan: kinect v1 context init failed"),
     }
 
+    // ---- Webcam via SDL3
     match webcam::list() {
         Ok(cams) => {
+            info!(count = cams.len(), "scan: SDL3 enumerated cameras");
             for cam in cams {
                 let label = if cam.name.is_empty() {
                     format!("Webcam #{}", cam.id)
                 } else {
                     format!("Webcam: {}", cam.name)
                 };
-                info!(index = cam.id, name = %cam.name, "webcam detected");
+                info!(index = cam.id, name = %cam.name, "scan: webcam entry");
                 out.push(BackendEntry {
                     backend: Backend::Webcam(cam.id),
                     label,
                 });
             }
         }
-        Err(e) => info!(?e, "webcam enumerate failed"),
+        Err(e) => warn!(?e, "scan: webcam enumerate failed"),
     }
 
+    info!(entries = out.len() - 1, "scan: complete");
     out
 }
 
@@ -1166,12 +1208,24 @@ fn open_kinect_v2() -> Result<Active, String> {
 }
 
 fn open_kinect_v1() -> Result<Active, String> {
+    info!("kinect v1 open: building context");
     let ctx = freenect::Context::new().map_err(|e| format!("freenect Context::new: {e}"))?;
     let count = ctx.enumerate();
+    info!(count, "kinect v1 open: pre-open enumerate");
     if count <= 0 {
         return Err("no Kinect v1 found on USB".to_string());
     }
-    let mut device = ctx.open(0).map_err(|e| format!("freenect open: {e}"))?;
+    info!(index = 0, "kinect v1 open: calling freenect_open_device");
+    let mut device = ctx.open(0).map_err(|e| {
+        // Surface a precise error on the path that's most likely to
+        // bite Windows users. The wrapper Display impl already maps
+        // -12 to a UsbDk/Zadig hint; copying it through verbatim
+        // gives the demo log a single line a user can paste.
+        let msg = format!("freenect open: {e}");
+        warn!("{msg}");
+        msg
+    })?;
+    info!("kinect v1 open: device handle acquired, starting streams");
     device
         .start_streams(true, true)
         .map_err(|e| format!("freenect start_streams: {e}"))?;
