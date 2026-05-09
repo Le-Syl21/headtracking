@@ -185,7 +185,7 @@ impl Context {
         let rc = unsafe { sys::freenect_open_device(self.handle.raw, &mut raw, index) };
         drop(g);
         if rc < 0 || raw.is_null() {
-            return Err(Error::OpenFailed(rc));
+            return Err(Error::OpenFailed(OpenFailureCode(rc)));
         }
         Device::wrap(self.handle.clone(), raw)
     }
@@ -617,14 +617,40 @@ struct Timeval {
     tv_usec: i64,
 }
 
+/// Wraps a libfreenect / libusb open-failure rc with a richer Display
+/// that appends an actionable hint when the code is recognised.
+/// libfreenect propagates raw libusb codes through `freenect_open_device`,
+/// so e.g. `-12 = LIBUSB_ERROR_NOT_SUPPORTED` is exactly what Windows
+/// libusb returns when another driver has claimed the device.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenFailureCode(pub i32);
+
+impl std::fmt::Display for OpenFailureCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hint = match self.0 {
+            -3 => " — LIBUSB_ERROR_ACCESS: install the udev rules (see README)",
+            -4 => " — LIBUSB_ERROR_NO_DEVICE: device disconnected mid-open",
+            -5 => " — LIBUSB_ERROR_NOT_FOUND: kernel driver missing or device gone",
+            -6 => " — LIBUSB_ERROR_BUSY: device already opened by another process",
+            -12 => {
+                " — LIBUSB_ERROR_NOT_SUPPORTED: on Windows, install UsbDk \
+                   (filter driver) or replace the Kinect driver with libusbK \
+                   via Zadig — see README"
+            }
+            _ => "",
+        };
+        write!(f, "rc={}{}", self.0, hint)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("freenect_init failed (rc={0})")]
     ContextInit(i32),
     #[error("no Kinect v1 device available")]
     NoDevice,
-    #[error("freenect_open_device failed (rc={0})")]
-    OpenFailed(i32),
+    #[error("freenect_open_device failed: {0}")]
+    OpenFailed(OpenFailureCode),
     #[error("requested stream mode is not advertised by the device")]
     ModeUnavailable,
     #[error("freenect_start_depth or _video failed (rc={0})")]

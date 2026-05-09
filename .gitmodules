@@ -4,3 +4,6 @@
 [submodule "crates/freenect-sys/vendor/libfreenect"]
 	path = crates/freenect-sys/vendor/libfreenect
 	url = https://github.com/OpenKinect/libfreenect
+[submodule "crates/libusb-sys/vendor/libusb"]
+	path = crates/libusb-sys/vendor/libusb
+	url = https://github.com/libusb/libusb.git

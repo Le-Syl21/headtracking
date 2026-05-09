@@ -30,6 +30,12 @@ fn main() {
     // target's declaration + install + link lines in `if(NOT WIN32)`
     // so only the static lib remains on Windows.
     patch_libfreenect_skip_shared_on_windows(&vendor_dir);
+    // Mirror the libfreenect2 opt-in pattern: on Windows, ask libusb to
+    // use the UsbDk backend at init time so libfreenect can reach the
+    // Kinect even when another driver (Microsoft Kinect SDK) owns the
+    // device. Open upstream PR — OpenKinect/libfreenect#701 — once
+    // merged, the in-tree patch becomes a no-op via the marker check.
+    patch_libfreenect_usbdk_opt_in(&vendor_dir);
 
     // Static cmake build. Drop the bits we don't need (audio, OpenNI2, examples).
     let mut config = cmake::Config::new(&vendor_dir);
@@ -61,57 +67,49 @@ fn main() {
         .define("BUILD_REDIST_PACKAGE", "ON")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
 
-    // FindLibUSB shim + pre-set values for Windows / macOS x86_64
-    // cross-compile. See freenect2-sys/build.rs for the rationale.
+    // libusb-sys (the dedicated workspace member) handles all platform
+    // sourcing — vendored static build on Windows, pkg-config probe on
+    // Linux/macOS. It exposes its outputs to us via cargo metadata
+    // surfaced as `DEP_USB_1_0_*` env vars. We just feed those into the
+    // libfreenect cmake invocation.
+    // Cargo's `links` → env-var translation preserves the `.` literally
+    // (only `-` becomes `_`), so `links = "usb-1.0"` produces vars named
+    // `DEP_USB_1.0_*`, not `DEP_USB_1_0_*`. Unusual but documented.
+    let libusb_include =
+        env::var("DEP_USB_1.0_INCLUDE").expect("libusb-sys must expose DEP_USB_1.0_INCLUDE");
+    let libusb_lib = env::var("DEP_USB_1.0_LIB").expect("libusb-sys must expose DEP_USB_1.0_LIB");
+
+    // FindLibUSB shim — same idea as before: stop libfreenect's bundled
+    // module from re-probing pkg-config when we've already pinned the
+    // values via cmake -D below.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let modules_dir = write_findlibusb_shim(&out_dir);
-    // Forward slashes for Windows cmake compatibility (see
-    // freenect2-sys/build.rs comment).
     let modules_path = modules_dir.to_string_lossy().replace('\\', "/");
     config.define("CMAKE_MODULE_PATH", &modules_path);
-    if let Some((lib, include)) = detect_libusb_paths() {
-        let lib_s = lib.to_string_lossy().replace('\\', "/");
-        let include_s = include.to_string_lossy().replace('\\', "/");
-        // libfreenect's bundled `cmake_modules/Findlibusb-1.0.cmake`
-        // checks pre-set `LIBUSB_1_LIBRARIES` / `LIBUSB_1_INCLUDE_DIRS`
-        // (with `_1_` underscore-1-underscore) and skips its own
-        // pkg-config probe when both are set. Keep the older
-        // CamelCase / hyphen variants too as defensive fallbacks for
-        // any other module variant that might be in scope.
-        config
-            .define("LIBUSB_1_LIBRARIES", &lib_s)
-            .define("LIBUSB_1_INCLUDE_DIRS", &include_s)
-            .define("LIBUSB_LIBRARIES", &lib_s)
-            .define("LIBUSB_INCLUDE_DIRS", &include_s)
-            .define("LibUSB-1.0_LIBRARIES", &lib_s)
-            .define("LibUSB-1.0_INCLUDE_DIRS", &include_s);
-    }
+
+    // Forward slashes for Windows cmake compatibility (backslashes are
+    // interpreted as escape characters in cmake variable expansion).
+    let lib_s = libusb_lib.replace('\\', "/");
+    let include_s = libusb_include.replace('\\', "/");
+    // libfreenect's `Findlibusb-1.0.cmake` checks the `_1_` form. Keep
+    // the older CamelCase / no-suffix variants too as defensive aliases
+    // in case the bundled module gets refactored upstream.
+    config
+        .define("LIBUSB_1_LIBRARIES", &lib_s)
+        .define("LIBUSB_1_INCLUDE_DIRS", &include_s)
+        .define("LIBUSB_LIBRARIES", &lib_s)
+        .define("LIBUSB_INCLUDE_DIRS", &include_s)
+        .define("LibUSB-1.0_LIBRARIES", &lib_s)
+        .define("LibUSB-1.0_INCLUDE_DIRS", &include_s);
 
     let dst = config.build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=freenect");
-
-    if let Some((lib, _)) = detect_libusb_paths() {
-        if let Some(parent) = lib.parent() {
-            println!("cargo:rustc-link-search=native={}", parent.display());
-        }
-        // See freenect2-sys/build.rs for the naming-convention rationale:
-        // MSVC needs the `lib` prefix in our directive, ld on Linux/macOS
-        // does not (it auto-prepends).
-        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-        let lib_name = if target_env == "msvc" {
-            "libusb-1.0"
-        } else {
-            "usb-1.0"
-        };
-        println!("cargo:rustc-link-lib={lib_name}");
-    } else {
-        pkg_config::Config::new()
-            .atleast_version("1.0.20")
-            .probe("libusb-1.0")
-            .expect("libusb-1.0 not found via pkg-config");
-    }
+    // No explicit libusb link directive: libusb-sys's own build script
+    // already emits the right `cargo:rustc-link-lib=` for the platform
+    // (static=usb-1.0 on Windows via cc-rs, plus the Win32 helpers; the
+    // pkg-config crate emits the dynamic link directives on Linux/macOS).
 
     // Bindgen on the public header. Resource-dir fallback mirrors the root
     // build.rs (handles dev systems without libclang-common-* installed).
@@ -177,33 +175,6 @@ fn compiler_resource_include_dir() -> Option<PathBuf> {
             return Some(p.join("include"));
         }
     }
-    None
-}
-
-/// Locate libusb on platforms where pkg-config is unreliable. Mirrors
-/// the same helper in `freenect2-sys`. See its docstring for the
-/// contract.
-fn detect_libusb_paths() -> Option<(PathBuf, PathBuf)> {
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-
-    if target_os == "windows" {
-        let root = env::var_os("VCPKG_ROOT").or_else(|| env::var_os("VCPKG_INSTALLATION_ROOT"))?;
-        let triplet = env::var("VCPKG_TARGET_TRIPLET").unwrap_or_else(|_| "x64-windows".into());
-        let installed = PathBuf::from(root).join("installed").join(triplet);
-        let lib = installed.join("lib").join("libusb-1.0.lib");
-        let include = installed.join("include").join("libusb-1.0");
-        return (lib.is_file() && include.is_dir()).then_some((lib, include));
-    }
-
-    if target_os == "macos" && target_arch == "x86_64" {
-        let lib = PathBuf::from("/usr/local/lib/libusb-1.0.dylib");
-        let include = PathBuf::from("/usr/local/include/libusb-1.0");
-        if lib.is_file() && include.is_dir() {
-            return Some((lib, include));
-        }
-    }
-
     None
 }
 
@@ -273,6 +244,61 @@ fn patch_libfreenect_skip_shared_on_windows(vendor_dir: &std::path::Path) {
             out.pop();
         }
     }
+    let _ = std::fs::write(&path, out);
+}
+
+/// Idempotently patch `vendor/libfreenect/src/usb_libusb10.c` to call
+/// `libusb_set_option(LIBUSB_OPTION_USE_USBDK)` immediately after
+/// `libusb_init`, mirroring what libfreenect2 has done for years
+/// (`libfreenect2.cpp` line 392-394). Without this, on Windows libusb
+/// stays on the WinUSB backend and `freenect_open_device` returns
+/// `LIBUSB_ERROR_NOT_SUPPORTED` (-12) whenever the Kinect is bound to
+/// the Microsoft SDK driver — forcing every user through Zadig.
+///
+/// Acts as an in-tree fallback while the upstream PR
+/// (OpenKinect/libfreenect#701) is in review. Once merged and we bump
+/// the submodule, the marker check makes this a no-op.
+///
+/// Patch is gated by `#ifdef _WIN32` inside the C source itself, so
+/// applying it on Linux/macOS is harmless — but we skip the rewrite
+/// anyway to keep the vendor checkout pristine outside Windows builds.
+fn patch_libfreenect_usbdk_opt_in(vendor_dir: &std::path::Path) {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let path = vendor_dir.join("src/usb_libusb10.c");
+    let Ok(original) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    const MARKER: &str = "/* freenect-sys: UsbDk opt-in (mirror libfreenect2) */";
+    if original.contains(MARKER) || original.contains("LIBUSB_OPTION_USE_USBDK") {
+        // Either we patched this checkout already, or upstream merged
+        // the equivalent patch and the option call is now in-source.
+        return;
+    }
+    // Anchor: the exact two lines we inject between. We lookahead-match
+    // them as a contiguous slice to avoid mis-patching some other
+    // `libusb_init` site that might be added later.
+    const ANCHOR: &str = "\t\tres = libusb_init(&ctx->ctx);\n\t\tif (res >= 0) {\n";
+    let Some(idx) = original.find(ANCHOR) else {
+        // Source layout drifted (likely upstream PR merged with a
+        // slightly different formatting). Don't fail the build —
+        // patch was best-effort, the worst case is the user still
+        // needs Zadig as before.
+        return;
+    };
+    let injection = format!(
+        "{ANCHOR}\
+{MARKER}
+#if defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)
+\t\t\t(void)libusb_set_option(ctx->ctx, LIBUSB_OPTION_USE_USBDK);
+#endif
+"
+    );
+    let mut out = String::with_capacity(original.len() + injection.len());
+    out.push_str(&original[..idx]);
+    out.push_str(&injection);
+    out.push_str(&original[idx + ANCHOR.len()..]);
     let _ = std::fs::write(&path, out);
 }
 

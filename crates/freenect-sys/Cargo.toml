@@ -8,7 +8,12 @@ publish = false
 
 [lib]
 
+# Pulled to share libusb sourcing logic with freenect2-sys: libusb-sys
+# emits `cargo:include=` / `cargo:lib=` metadata that surfaces here as
+# `DEP_USB_1_0_*` env vars, sidestepping the per-crate platform dance.
+[dependencies]
+libusb-sys = { path = "../libusb-sys" }
+
 [build-dependencies]
 bindgen = "0.71"
 cmake = "0.1"
-pkg-config = "0.3"

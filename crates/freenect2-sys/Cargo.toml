@@ -14,8 +14,10 @@ cxx = "1.0"
 # against a PIC-enabled static archive — Ubuntu's `libturbojpeg.a` is
 # non-PIC and refuses to land in a cdylib.
 turbojpeg-sys = { version = "1", default-features = false, features = ["cmake"] }
+# Shared libusb-1.0 sourcing — vendored static build on Windows,
+# system probe on Linux/macOS. Surfaces as DEP_USB_1_0_* env vars.
+libusb-sys = { path = "../libusb-sys" }
 
 [build-dependencies]
 cxx-build = "1.0"
 cmake = "0.1"
-pkg-config = "0.3"

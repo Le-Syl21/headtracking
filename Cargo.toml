@@ -6,6 +6,7 @@ members = [
     "crates/freenect",
     "crates/freenect2-sys",
     "crates/freenect2",
+    "crates/libusb-sys",
     "crates/webcam",
     "tools/headtracking-demo",
 ]
@@ -45,6 +46,10 @@ all-trackers = ["kinect-v1", "kinect-v2", "webcam"]
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Read OS distro + version (e.g. "Ubuntu 24.04 LTS", "Windows 11") at
+# PluginLoad — `std::env::consts::OS` only gives "linux"/"windows", which
+# is not enough to triage user reports.
+os_info = { version = "3", default-features = false }
 arc-swap = "1"
 parking_lot = "0.12"
 nalgebra = "0.33"

@@ -210,6 +210,38 @@ jobs:
 
       # ---------- Stage + archive ----------
 
+      # ---------- Bundle UsbDk MSI for Windows releases ----------
+
+      # On Windows, the plugin needs UsbDk's filter driver to reach the
+      # Kinect. Rather than asking users to download it themselves, we
+      # ship the signed MSI from Daynix's GitHub releases right next to
+      # the plugin DLL. The download is over HTTPS from GitHub directly
+      # (no proxy), the file is signed by Daynix and Windows verifies
+      # that signature on UAC. The pinned URL targets a specific
+      # release tag so the bundle doesn't drift.
+      - name: Fetch UsbDk MSI (Windows only)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/daynix/UsbDk/releases/download/v1.00-22/UsbDk_1.0.22_x64.msi"
+          $out = "${{ github.workspace }}/UsbDk_1.0.22_x64.msi"
+          Write-Host "Fetching $url"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          # Display the SHA-256 so the release log carries an audit
+          # trail. We deliberately don't *enforce* a hash here — the
+          # MSI is signed by Daynix and re-fetched at every release;
+          # Windows' Authenticode check during UAC install is the
+          # actual integrity boundary. If you want to harden, lift
+          # this hash into a Verify-FileHash step pinned per release.
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash
+          Write-Host "UsbDk MSI SHA-256: $hash"
+          # Sanity: refuse a 0-byte file (404 served as 200 by some mirrors).
+          $size = (Get-Item $out).Length
+          if ($size -lt 1000000) {
+            Write-Error "UsbDk MSI suspiciously small ($size bytes) — refusing"
+            exit 1
+          }
+
       - name: Stage artifacts
         shell: bash
         run: |
@@ -222,6 +254,13 @@ jobs:
           cp plugin.cfg "$stage/"
           [ -f LICENSE ] && cp LICENSE "$stage/" || true
           [ -f README.md ] && cp README.md "$stage/" || true
+          # Windows: bundle UsbDk MSI + the install helper alongside
+          # the plugin under drivers/. Linux/macOS skip this.
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            mkdir -p "$stage/drivers"
+            cp UsbDk_1.0.22_x64.msi "$stage/drivers/"
+            cp tools/windows-release/install-drivers.cmd "$stage/drivers/"
+          fi
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
           echo "ARTIFACT_BASENAME=headtracking-${version}-${{ matrix.suffix }}" >> "$GITHUB_ENV"
 

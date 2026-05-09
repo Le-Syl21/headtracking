@@ -1,0 +1,20 @@
+[package]
+name = "libusb-sys"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Internal: vendored libusb-1.0 static build for Windows; system probe on Linux/macOS"
+publish = false
+# `links` claims libusb-1.0 for the workspace; ensures cargo can route
+# the build-script metadata (DEP_USB_1_0_INCLUDE, DEP_USB_1_0_LIB) to
+# downstream sys crates (freenect-sys, freenect2-sys) and rejects any
+# duplicate claim.
+links = "usb-1.0"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

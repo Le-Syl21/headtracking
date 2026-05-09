@@ -84,11 +84,9 @@ fn main() {
 
     // libfreenect2's bundled FindLibUSB.cmake unconditionally calls
     // `pkg_check_modules(libusb-1.0)` whenever PKG_CONFIG is found,
-    // ignoring any pre-set LibUSB_* variables. On Windows (vcpkg-managed
-    // libusb) and macOS cross-compile (Intel libusb under /usr/local on
-    // an ARM runner) that path doesn't resolve. Override the module via
+    // ignoring any pre-set LibUSB_* variables. Override the module via
     // CMAKE_MODULE_PATH with a shim that respects pre-set values, then
-    // pre-set them when we know where libusb lives.
+    // pre-set them from the libusb-sys metadata.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let modules_dir = write_findlibusb_shim(&out_dir);
     // CMake on Windows accepts forward slashes; passing native
@@ -97,13 +95,18 @@ fn main() {
     // `\` as an escape sequence in `set(...)` arguments.
     let modules_path = modules_dir.to_string_lossy().replace('\\', "/");
     config.define("CMAKE_MODULE_PATH", &modules_path);
-    if let Some((lib, include)) = detect_libusb_paths() {
-        let lib = lib.to_string_lossy().replace('\\', "/");
-        let include = include.to_string_lossy().replace('\\', "/");
-        config
-            .define("LibUSB_LIBRARIES", &lib)
-            .define("LibUSB_INCLUDE_DIRS", &include);
-    }
+
+    // libusb-sys exposes its location via DEP_USB_1.0_* env vars. Note
+    // the literal `.` — Cargo's `links` → env-var translation preserves
+    // it (only `-` becomes `_`). See `crates/libusb-sys/build.rs`.
+    let libusb_lib = env::var("DEP_USB_1.0_LIB").expect("libusb-sys must expose DEP_USB_1.0_LIB");
+    let libusb_include =
+        env::var("DEP_USB_1.0_INCLUDE").expect("libusb-sys must expose DEP_USB_1.0_INCLUDE");
+    let lib_s = libusb_lib.replace('\\', "/");
+    let include_s = libusb_include.replace('\\', "/");
+    config
+        .define("LibUSB_LIBRARIES", &lib_s)
+        .define("LibUSB_INCLUDE_DIRS", &include_s);
 
     let dst = config.build();
 
@@ -136,35 +139,10 @@ fn main() {
     println!("cargo:rustc-link-lib=static=turbojpeg{tj_suffix}");
     println!("cargo:rustc-link-lib=static=jpeg{tj_suffix}");
 
-    // libfreenect2 USB transport. On platforms where pkg-config is
-    // unreliable (Windows vcpkg, macOS cross-compile) we already located
-    // libusb above; emit the link directives directly. Otherwise let
-    // pkg-config probe the system install.
-    if let Some((lib, _)) = detect_libusb_paths() {
-        if let Some(parent) = lib.parent() {
-            println!("cargo:rustc-link-search=native={}", parent.display());
-        }
-        // Naming convention diverges per linker:
-        //   * MSVC link.exe : `-lFOO` → `FOO.lib`. The vcpkg import
-        //     library is `libusb-1.0.lib`, so the bare name we hand
-        //     rustc must include the `lib` prefix.
-        //   * ld / lld on Linux/macOS : `-lFOO` → `libFOO.{so,dylib}`,
-        //     i.e. ld auto-prepends `lib`. We must NOT include the
-        //     `lib` prefix in our directive, otherwise ld looks for
-        //     `liblibusb-1.0.{so,dylib}` and fails.
-        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-        let lib_name = if target_env == "msvc" {
-            "libusb-1.0"
-        } else {
-            "usb-1.0"
-        };
-        println!("cargo:rustc-link-lib={lib_name}");
-    } else {
-        pkg_config::Config::new()
-            .atleast_version("1.0.20")
-            .probe("libusb-1.0")
-            .expect("libusb-1.0 not found via pkg-config");
-    }
+    // libfreenect2's USB transport. libusb-sys already emits the right
+    // `cargo:rustc-link-lib=` for the platform (static usb-1.0 + Win32
+    // helpers on Windows via cc-rs; pkg-config dynamic link directives
+    // on Linux/macOS) — nothing to add here.
 
     // C++ runtime
     if cfg!(target_os = "linux") {
@@ -202,35 +180,6 @@ fn main() {
         .flag_if_supported("-std=c++14")
         .flag_if_supported("-Wno-unused-parameter")
         .compile("freenect2-shim");
-}
-
-/// Locate libusb for targets where pkg-config can't be trusted:
-/// Windows (vcpkg-managed) and macOS x86_64 cross-compile from an
-/// Apple Silicon runner (Intel libusb under /usr/local from
-/// `arch -x86_64 brew install libusb`). Returns `(library, include_dir)`
-/// or `None` to fall back to pkg-config.
-fn detect_libusb_paths() -> Option<(PathBuf, PathBuf)> {
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-
-    if target_os == "windows" {
-        let root = env::var_os("VCPKG_ROOT").or_else(|| env::var_os("VCPKG_INSTALLATION_ROOT"))?;
-        let triplet = env::var("VCPKG_TARGET_TRIPLET").unwrap_or_else(|_| "x64-windows".into());
-        let installed = PathBuf::from(root).join("installed").join(triplet);
-        let lib = installed.join("lib").join("libusb-1.0.lib");
-        let include = installed.join("include").join("libusb-1.0");
-        return (lib.is_file() && include.is_dir()).then_some((lib, include));
-    }
-
-    if target_os == "macos" && target_arch == "x86_64" {
-        let lib = PathBuf::from("/usr/local/lib/libusb-1.0.dylib");
-        let include = PathBuf::from("/usr/local/include/libusb-1.0");
-        if lib.is_file() && include.is_dir() {
-            return Some((lib, include));
-        }
-    }
-
-    None
 }
 
 /// Write a `FindLibUSB.cmake` shim into `<out>/cmake_modules/`. The
