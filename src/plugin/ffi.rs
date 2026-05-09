@@ -74,12 +74,13 @@ static GAME: Mutex<Option<GameSession>> = Mutex::new(None);
 pub unsafe extern "C" fn HeadTrackingPluginLoad(session_id: u32, api: *const MsgPluginAPI) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         init_tracing_once();
+        let host = os_info::get();
         info!(
             session_id,
             version = env!("CARGO_PKG_VERSION"),
-            os = std::env::consts::OS,
-            arch = std::env::consts::ARCH,
-            family = std::env::consts::FAMILY,
+            os = %host.os_type(),
+            os_version = %host.version(),
+            arch = host.architecture().unwrap_or("unknown"),
             "HeadTracking plugin: load"
         );
 
@@ -116,6 +117,12 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     // SAFETY: caller guarantees `api_ptr` is valid for at least the duration
     // of this call (and beyond — the host keeps it live until unload).
     let api = unsafe { &*api_ptr };
+
+    // Best-effort hint for Windows users with no UsbDk filter installed —
+    // log-only, no-op on Linux/macOS. We do this early so the message
+    // shows up before any Kinect open attempt that would otherwise fail
+    // with a cryptic LIBUSB_ERROR_NOT_SUPPORTED later in the load path.
+    super::usbdk::warn_if_missing();
 
     let get_msg_id = api.GetMsgID.ok_or(LoadError::MissingFunction("GetMsgID"))?;
     let subscribe = api
@@ -161,6 +168,13 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     }
     info!("VPX plugin API resolved");
 
+    // Wire the tracing → VPX console bridge as soon as MsgPluginAPI is
+    // available. From this point on every `info!` / `warn!` / `error!`
+    // emitted by the plugin appears in VPX's plugin log panel as well
+    // as on stderr. SAFETY: `api` is a live `&MsgPluginAPI` for the
+    // duration of the plugin session, see top-of-file contract.
+    unsafe { super::logging::resolve_and_install(api, session_id) };
+
     // Subscribe to game lifecycle + per-frame hook.
     // SAFETY: callbacks are FFI-safe (extern "C" fn with the documented
     // signature), userData is null because we route all state through globals.
@@ -202,6 +216,12 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
 }
 
 unsafe fn do_unload() {
+    // Tear down the logging bridge first: the host will reclaim the
+    // LoggingPluginAPI struct as soon as we return from this function,
+    // and any tracing event fired during the rest of the unload (we
+    // emit a couple ourselves) must not dereference a freed pointer.
+    super::logging::clear();
+
     let Some(state) = STATE.lock().take() else {
         warn!("unload called but plugin state was already empty");
         return;
@@ -364,14 +384,24 @@ fn init_tracing_once() {
     use std::sync::OnceLock;
     static GUARD: OnceLock<()> = OnceLock::new();
     GUARD.get_or_init(|| {
-        // For now: route to stderr so VPX captures it in its console log.
-        // Phase 2 will switch to the LoggingPlugin.h API once we resolve it.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_env("HEADTRACKING_LOG")
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_target(false)
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        // Two layers stacked on the registry:
+        //   * `fmt` to stderr — kept for headless dev (`headtracking-demo`)
+        //     and as a fallback when VPX's LoggingPluginAPI isn't reachable
+        //     (no host listener, plugin loaded outside VPX, etc.)
+        //   * `VpxLogLayer` — forwards every event into VPX's console
+        //     once `super::logging::resolve_and_install` has run.
+        // Order doesn't matter: each layer decides independently whether
+        // to emit. The env filter applies globally.
+        let filter = tracing_subscriber::EnvFilter::try_from_env("HEADTRACKING_LOG")
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(super::logging::VpxLogLayer)
             .try_init();
     });
 }

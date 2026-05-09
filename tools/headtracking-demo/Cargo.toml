@@ -20,3 +20,4 @@ eframe = { version = "0.30", default-features = false, features = ["default_font
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+os_info = { version = "3", default-features = false }

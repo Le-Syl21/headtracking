@@ -35,11 +35,12 @@ fn main() -> eframe::Result {
 
     // Banner: lets a beta tester paste a single line that pins the
     // build they're running when something misbehaves.
+    let host = os_info::get();
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        os = std::env::consts::OS,
-        arch = std::env::consts::ARCH,
-        family = std::env::consts::FAMILY,
+        os = %host.os_type(),
+        os_version = %host.version(),
+        arch = host.architecture().unwrap_or("unknown"),
         "headtracking-demo starting"
     );
 
@@ -410,10 +411,18 @@ impl App {
 
     fn refresh_available(&mut self) {
         // Drop the active device first — libfreenect[2] can't reliably
-        // enumerate while a sibling context holds an open device on Linux.
+        // enumerate while a sibling context holds an open device on Linux,
+        // and `webcam::force_refresh` below requires no live camera handle.
         if let Some(old) = self.active.take() {
             info!(backend = ?old.backend, "closing backend before scan");
             drop(old);
+        }
+        // Cycle SDL3's camera subsystem so a freshly plugged webcam shows
+        // up. Mandatory on Windows (MediaFoundation has no hot-plug);
+        // harmless on Linux/macOS — those backends already track hot-plug,
+        // re-init just yields the same list.
+        if let Err(e) = webcam::force_refresh() {
+            info!(?e, "webcam subsystem refresh failed");
         }
         self.selected = Backend::None;
         self.available = detect_backends();

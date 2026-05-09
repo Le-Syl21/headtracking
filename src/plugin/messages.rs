@@ -24,5 +24,8 @@ pub const VPXPI_EVT_ON_GAME_END: &CStr = cstr!("OnGameEnd");
 pub const VPXPI_EVT_ON_PREPARE_FRAME: &CStr = cstr!("OnPrepareFrame");
 
 // LoggingPlugin.h
-pub const LOGPI_NAMESPACE: &CStr = cstr!("Logging");
+// NB: upstream `#define LOGPI_NAMESPACE "Login"` — yes, the typo (Login,
+// not Logging) is what VPX broadcasts on. Match it verbatim or our
+// `BroadcastMsg` will never reach the host's logging endpoint.
+pub const LOGPI_NAMESPACE: &CStr = cstr!("Login");
 pub const LOGPI_MSG_GET_API: &CStr = cstr!("GetAPI");
