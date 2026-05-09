@@ -211,11 +211,12 @@ jobs:
 
       # ---------- Stage + archive ----------
 
-      # The plugin checks for UsbDk at PluginLoad and emits a warn log
-      # with the releases URL when it's missing — bundling the signed
-      # MSI in our ZIP would just duplicate what Daynix already ships.
-      # Users on Windows download UsbDk directly from
-      # https://github.com/daynix/UsbDk/releases (covered in README).
+      # On Windows we ship a `setup/` folder with a one-click setup
+      # script (downloads UsbDk on demand, blocks PnP for Kinect
+      # VID/PIDs, removes existing partial driver bindings). The
+      # signed MSI itself is NOT bundled — Daynix's own GitHub release
+      # is the authoritative source, and the script pulls it from
+      # there at runtime. Other OSes don't need any of this.
 
       - name: Stage artifacts
         shell: bash
@@ -229,6 +230,11 @@ jobs:
           cp plugin.cfg "$stage/"
           [ -f LICENSE ] && cp LICENSE "$stage/" || true
           [ -f README.md ] && cp README.md "$stage/" || true
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
+            mkdir -p "$stage/setup"
+            cp tools/windows-release/cleanup-kinect.cmd "$stage/setup/"
+            cp tools/windows-release/cleanup-kinect.ps1 "$stage/setup/"
+          fi
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
           echo "ARTIFACT_BASENAME=headtracking-${version}-${{ matrix.suffix }}" >> "$GITHUB_ENV"
 

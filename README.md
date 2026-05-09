@@ -175,28 +175,42 @@ error -12** (this is libusb saying *"another kernel driver owns this
 device, I can't talk to it"*). That's expected — install UsbDk or replace
 the driver via Zadig, below, to actually use it.
 
-##### Option 1 — UsbDk (recommended)
+##### Option 1 — One-click setup script (recommended)
 
-UsbDk is a *filter driver* signed by Daynix. It slots above whatever
-driver currently owns the device (including the Microsoft Kinect SDK
-driver) and lets libusb take over per-process. Cleanest path on
-Windows 10/11.
+The Windows release ZIP includes `setup/cleanup-kinect.cmd` — a
+double-clickable launcher that handles the full Windows side in one
+shot:
 
 1. (Windows 7 only) install
    [Microsoft Security Advisory 3033929](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2015/3033929)
    first or USB keyboards/mice may stop working.
-2. Grab the latest **x64 MSI** from
-   <https://github.com/daynix/UsbDk/releases> (signed by Daynix, ~3.5 MB).
-3. Run the installer. Reboot if asked. Plug the Kinect, restart VPX.
+2. Open the extracted release folder, navigate to `setup\`, and
+   **double-click `cleanup-kinect.cmd`**. Confirm the UAC prompt.
+3. Wait for the script to finish — it will:
+   - download + install Daynix's signed UsbDk MSI (skipped if
+     already installed, ~3.5 MB pull from GitHub Releases over HTTPS);
+   - block Windows from auto-installing partial drivers on the
+     Kinect VID/PIDs (registry deny list, survives reboots);
+   - unbind any current Kinect device instance so PnP re-discovers
+     them cleanly on next plug.
 
-The plugin auto-detects UsbDk at startup. If it's missing, the VPX
-plugin log emits a `WARN` line with the releases URL, and the
-`headtracking-demo` standalone tool shows a popup with a clickable
-link — so you don't have to dig through this README again.
+Plug the Kinect, restart VPX.
+
+If you have a **Kinect v1**, you also need to run [Zadig](https://zadig.akeo.ie/)
+once after the script: enable *Options → List All Devices*, untick
+*Ignore Hubs or Composite Parents*, then for each *Xbox NUI Audio /
+Camera / Motor* pick **WinUSB** on the right and click *Replace
+Driver*. The script's deny list ensures Windows won't undo your
+WinUSB binding the next time you replug.
+
+(Don't want to run a script? You can install UsbDk by hand from
+<https://github.com/daynix/UsbDk/releases>. The plugin auto-detects
+its presence at startup — missing-UsbDk shows up as a `WARN` line in
+VPX's plugin log and a popup with a clickable link in the
+`headtracking-demo` standalone tool.)
 
 UsbDk coexists with the Kinect for Windows v2 SDK — no need to uninstall
-anything. It also fixes the Kinect v1 case as long as the *Xbox NUI*
-sub-devices have *some* driver loaded (the SDK installer covers it).
+anything. It handles the Kinect v2 entirely on its own.
 
 ##### Option 2 — libusbK via Zadig (alternative)
 
@@ -459,30 +473,43 @@ avec l'erreur -12** (libusb dit *« un autre driver kernel possède ce
 device, je ne peux pas lui parler »*). C'est attendu — installer UsbDk
 ou remplacer le driver via Zadig (ci-dessous) pour vraiment l'utiliser.
 
-##### Option 1 — UsbDk (recommandé)
+##### Option 1 — Script setup tout-en-un (recommandé)
 
-UsbDk est un *filter driver* signé par Daynix. Il s'intercale au-dessus
-du driver qui possède actuellement le device (y compris le SDK
-Microsoft Kinect) et laisse libusb prendre la main par process. C'est
-l'approche la plus propre sur Windows 10/11.
+Le ZIP release Windows inclut `setup/cleanup-kinect.cmd` — un
+launcher double-cliquable qui gère toute la mise en place en un seul
+geste :
 
 1. (Windows 7 uniquement) installer d'abord
    [Microsoft Security Advisory 3033929](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2015/3033929)
    sinon les claviers/souris USB peuvent cesser de fonctionner.
-2. Récupérer le dernier **MSI x64** depuis
-   <https://github.com/daynix/UsbDk/releases> (signé Daynix, ~3.5 Mo).
-3. Lancer l'installeur. Redémarrer si demandé. Brancher la Kinect,
-   relancer VPX.
+2. Ouvrir le dossier release extrait, aller dans `setup\`, et
+   **double-cliquer sur `cleanup-kinect.cmd`**. Confirmer l'UAC.
+3. Le script va :
+   - télécharger + installer le MSI UsbDk signé Daynix (skippé s'il
+     est déjà installé, ~3.5 Mo depuis GitHub Releases en HTTPS) ;
+   - bloquer Windows pour qu'il n'installe plus de drivers partiels
+     sur les VID/PID Kinect (registre, survit aux reboots) ;
+   - délier toute instance Kinect actuelle pour que PnP ré-énumère
+     proprement au prochain plug.
 
-Le plugin détecte automatiquement UsbDk au démarrage. Si absent, le log
-plugin VPX émet une ligne `WARN` avec l'URL releases, et l'outil
-standalone `headtracking-demo` affiche une popup avec un lien
-cliquable — pas besoin de revenir sur ce README.
+Brancher la Kinect, relancer VPX.
+
+Pour une **Kinect v1**, il faut aussi lancer [Zadig](https://zadig.akeo.ie/)
+une fois après le script : activer *Options → List All Devices*,
+décocher *Ignore Hubs or Composite Parents*, puis pour chaque *Xbox
+NUI Audio / Camera / Motor* choisir **WinUSB** à droite et cliquer
+*Replace Driver*. La deny-list posée par le script empêche Windows
+de défaire ton binding WinUSB au prochain replug.
+
+(Tu ne veux pas lancer un script ? Tu peux installer UsbDk à la main
+depuis <https://github.com/daynix/UsbDk/releases>. Le plugin détecte
+sa présence au démarrage — UsbDk absent = ligne `WARN` dans le log
+plugin VPX + popup avec lien cliquable dans l'outil standalone
+`headtracking-demo`.)
 
 UsbDk coexiste avec le SDK Kinect for Windows v2 — pas besoin de
-désinstaller quoi que ce soit. Il règle aussi le cas Kinect v1 tant que
-les sous-périphériques *Xbox NUI* ont *un* driver chargé (l'installeur
-SDK le fait).
+désinstaller quoi que ce soit. Il règle entièrement le cas Kinect v2
+de lui-même.
 
 ##### Option 2 — libusbK via Zadig (alternative)
 
