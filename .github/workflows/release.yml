@@ -72,23 +72,40 @@ jobs:
             demo_bin: headtracking-demo.exe
             archive: zip
 
-          # macOS x86_64: native Intel runner via the `-large` suffix.
-          # GitHub Actions publishes Intel macOS images alongside the
-          # ARM ones for every recent OS version; `macos-latest-large`
-          # is the floating alias (currently macOS 15 Sequoia, Intel
-          # x64). Free for public repos. Avoids the Rosetta + dual
-          # Homebrew dance we'd need to cross-compile from an ARM
-          # `macos-latest`. See actions/runner-images README for the
-          # canonical label table.
+          # Windows ARM64 native runner from the Arm Limited partner
+          # image set (`windows-11-arm`). GA since 2025-04. cc-rs
+          # picks up the ARM64 cl.exe automatically; libusb's source
+          # is portable C with no x86-only asm. UsbDk's signed MSI is
+          # x64-only — the bundle step skips this target, so an ARM
+          # user would have to use Zadig+libusbK for the Kinect.
+          # Largely a future-proofing target: VPX itself doesn't ship
+          # an ARM Windows build today.
+          - suffix: windows-aarch64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            plugin_lib: headtracking.dll
+            demo_bin: headtracking-demo.exe
+            archive: zip
+
+          # macOS Intel: `macos-26-intel` is the standard-tier alias
+          # for the most recent Intel image, free unlimited on public
+          # repos (per "Standard GitHub-hosted runners for public
+          # repositories" doc). The `-large` and `-xlarge` siblings
+          # point at the same hardware but bill against the larger-
+          # runner quota — don't use those without a configured
+          # spending limit.
           - suffix: macos-x86_64
-            os: macos-latest-large
+            os: macos-26-intel
             target: x86_64-apple-darwin
             plugin_lib: libheadtracking.dylib
             demo_bin: headtracking-demo
             archive: tar.gz
 
+          # macOS Apple Silicon: pinned to `macos-26` so we track the
+          # same OS version on both arches. `macos-latest` floats and
+          # would diverge over time.
           - suffix: macos-aarch64
-            os: macos-latest
+            os: macos-26
             target: aarch64-apple-darwin
             plugin_lib: libheadtracking.dylib
             demo_bin: headtracking-demo
@@ -135,15 +152,22 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
-          # Both macos-13 (Intel) and macos-latest (Apple Silicon) ship
-          # Homebrew at the canonical prefix for their architecture
+          # Homebrew is preinstalled on both Intel and ARM macOS
+          # runners at the canonical prefix for their architecture
           # (`/usr/local` on Intel, `/opt/homebrew` on ARM). pkg-config
-          # picks up the right .pc files automatically — no extra env
-          # plumbing, no Rosetta, no cross-compile.
+          # picks up the right .pc files automatically.
           brew install libusb cmake
 
+      # Now that `libusb-sys` vendors libusb statically and our
+      # FindLibUSB shim short-circuits the bundled cmake module
+      # (LibUSB_LIBRARIES is always pre-set from DEP_USB_1.0_LIB),
+      # vcpkg's libusb + pkgconf are redundant — kept here for x64
+      # only as a safety net while we validate the new path. ARM
+      # Windows skips it: vcpkg's libusb x64 triplet wouldn't help,
+      # and `arm64-windows` isn't required since libusb-sys's cc-rs
+      # build handles the cross-arch compile cleanly.
       - name: Windows native deps (libusb via vcpkg + pkgconf)
-        if: matrix.os == 'windows-latest'
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: |
           # Both libusb (the C lib) and pkgconf (so libfreenect2's
@@ -191,8 +215,12 @@ jobs:
       # (no proxy), the file is signed by Daynix and Windows verifies
       # that signature on UAC. The pinned URL targets a specific
       # release tag so the bundle doesn't drift.
-      - name: Fetch UsbDk MSI (Windows only)
-        if: matrix.os == 'windows-latest'
+      # UsbDk's signed MSI from Daynix is x64-only — no ARM64 build is
+      # published. Skip the bundle on aarch64-pc-windows-msvc; ARM
+      # users can still run the plugin (libusb-sys's cc-rs build is
+      # arch-portable) but they need Zadig+libusbK for the Kinect.
+      - name: Fetch UsbDk MSI (Windows x64 only)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
           $url = "https://github.com/daynix/UsbDk/releases/download/v1.00-22/UsbDk_1.0.22_x64.msi"
@@ -226,9 +254,10 @@ jobs:
           cp plugin.cfg "$stage/"
           [ -f LICENSE ] && cp LICENSE "$stage/" || true
           [ -f README.md ] && cp README.md "$stage/" || true
-          # Windows: bundle UsbDk MSI + the install helper alongside
-          # the plugin under drivers/. Linux/macOS skip this.
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          # Windows x64 only: bundle UsbDk MSI + the install helper
+          # alongside the plugin under drivers/. ARM Windows skips it
+          # (no ARM64 UsbDk build available); Linux/macOS skip too.
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
             mkdir -p "$stage/drivers"
             cp UsbDk_1.0.22_x64.msi "$stage/drivers/"
             cp tools/windows-release/install-drivers.cmd "$stage/drivers/"
