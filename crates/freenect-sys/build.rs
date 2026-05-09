@@ -29,7 +29,7 @@ fn main() {
     // "multiple rules generate lib/freenect.lib". Wrap the SHARED
     // target's declaration + install + link lines in `if(NOT WIN32)`
     // so only the static lib remains on Windows.
-    patch_libfreenect_skip_shared_on_windows(&vendor_dir);
+    patch_libfreenect_skip_shared(&vendor_dir);
     // Mirror the libfreenect2 opt-in pattern: on Windows, ask libusb to
     // use the UsbDk backend at init time so libfreenect can reach the
     // Kinect even when another driver (Microsoft Kinect SDK) owns the
@@ -198,19 +198,34 @@ fn compiler_resource_include_dir() -> Option<PathBuf> {
 }
 
 /// Idempotently patch `vendor/libfreenect/src/CMakeLists.txt` to skip
-/// the SHARED `freenect` target on Windows. Without this libfreenect's
-/// SHARED + STATIC libraries both resolve to `freenect.lib` and Ninja
-/// (single-config) errors out. Patch is a no-op outside Windows and
+/// the SHARED `freenect` target on Windows AND macOS. Reasons differ:
+///
+///   * Windows + Ninja: SHARED + STATIC both resolve to `freenect.lib`
+///     and Ninja (single-config) errors out with "multiple rules
+///     generate lib/freenect.lib".
+///   * macOS: the SHARED target's link line tries to resolve symbols
+///     from libusb-1.0.a (now built static via `libusb-sys`), which on
+///     macOS pulls in CoreFoundation / IOKit / Security framework
+///     symbols. cmake's `target_link_libraries(freenect
+///     ${LIBUSB_1_LIBRARIES})` doesn't carry those frameworks as
+///     transitive deps, so the link errors out with `kCFAllocatorDefault`
+///     etc. undefined. We don't consume `libfreenect.dylib` from Rust
+///     anyway (only the `.a`), so dropping the SHARED build is the
+///     cleanest fix.
+///
+/// Patch is a no-op on Linux (system libusb is dynamic, the .so
+/// resolves transitive frameworks-equivalent libs cleanly) and
 /// re-runs are idempotent via a marker comment.
-fn patch_libfreenect_skip_shared_on_windows(vendor_dir: &std::path::Path) {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+fn patch_libfreenect_skip_shared(vendor_dir: &std::path::Path) {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "windows" && target_os != "macos" {
         return;
     }
     let path = vendor_dir.join("src/CMakeLists.txt");
     let Ok(original) = std::fs::read_to_string(&path) else {
         return;
     };
-    const MARKER: &str = "# freenect-sys: skip SHARED on Windows (Ninja conflict)";
+    const MARKER: &str = "# freenect-sys: skip SHARED on Windows + macOS (build-deps conflict)";
     if original.contains(MARKER) {
         return;
     }
@@ -219,6 +234,11 @@ fn patch_libfreenect_skip_shared_on_windows(vendor_dir: &std::path::Path) {
     } else {
         "\n"
     };
+    // CMake guard expression: WIN32 OR APPLE — covers both targets we
+    // want to skip the SHARED build on, in a single conditional block
+    // applied at C-source patch time. The same NOT condition is used
+    // for the install + target_link_libraries lines below.
+    const GUARD_OPEN: &str = "if(NOT WIN32 AND NOT APPLE)";
     let mut out = String::with_capacity(original.len() + 256);
     out.push_str(MARKER);
     out.push_str(nl);
@@ -227,7 +247,7 @@ fn patch_libfreenect_skip_shared_on_windows(vendor_dir: &std::path::Path) {
     while let Some(line) = iter.next() {
         let trimmed = line.trim();
         if trimmed == "add_library (freenect SHARED ${SRC})" {
-            out.push_str("if(NOT WIN32)");
+            out.push_str(GUARD_OPEN);
             out.push_str(nl);
             out.push_str(line);
             out.push_str(nl);
@@ -240,12 +260,12 @@ fn patch_libfreenect_skip_shared_on_windows(vendor_dir: &std::path::Path) {
                     break;
                 }
             }
-            out.push_str("endif()  # NOT WIN32 (freenect SHARED)");
+            out.push_str("endif()  # NOT WIN32 AND NOT APPLE (freenect SHARED)");
             out.push_str(nl);
             continue;
         }
         if trimmed == "target_link_libraries (freenect ${LIBUSB_1_LIBRARIES})" {
-            out.push_str("if(NOT WIN32)");
+            out.push_str(GUARD_OPEN);
             out.push_str(nl);
             out.push_str(line);
             out.push_str(nl);
