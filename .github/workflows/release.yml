@@ -346,8 +346,17 @@ jobs:
       # is intentionally NOT done — `xcrun stapler staple` only
       # supports .app bundles / .pkg / .dmg, not raw Mach-O files.
       # Without stapling, Gatekeeper does an online lookup against
-      # Apple on first launch (fine if the user has internet, which
-      # they do given they just downloaded the tarball).
+      # Apple on first launch (fine if the user has internet).
+      #
+      # Soft-fail: Apple's notary auth is flaky (rate-limits + account
+      # locks for spurious 401s). If notarization fails for any
+      # reason — bad creds, account lock, Apple side outage, network
+      # — emit a `::warning::` and let the build continue. The
+      # binaries are still codesigned with hardened runtime; the user
+      # just sees a one-time Gatekeeper "cannot be opened" the first
+      # time (ctrl-click → Open, or System Settings → Privacy &
+      # Security → "Open Anyway"). Better UX than blocking the
+      # entire release on Apple infrastructure being weird.
       - name: Notarize macOS binaries
         if: startsWith(matrix.os, 'macos') && env.APPLE_SIGNING_AVAILABLE == 'true'
         env:
@@ -356,7 +365,6 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
         run: |
-          set -euo pipefail
           if [ -z "$APPLE_ID" ] || [ -z "$APPLE_ID_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
             echo "::warning::Notarization secrets missing (APPLE_ID / APPLE_ID_PASSWORD / APPLE_TEAM_ID) — signing only, no notarization."
             exit 0
@@ -364,14 +372,22 @@ jobs:
           NOTARIZE_ZIP="$RUNNER_TEMP/notarize-${{ matrix.suffix }}.zip"
           /usr/bin/ditto -c -k --keepParent "$STAGE_DIR" "$NOTARIZE_ZIP"
           # `--wait` polls until Apple returns Accepted / Invalid;
-          # typical turnaround 1-5 min.
+          # typical turnaround 1-5 min. We capture the exit code
+          # rather than letting it bubble up — see soft-fail comment
+          # above the step.
+          set +e
           xcrun notarytool submit "$NOTARIZE_ZIP" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait \
             --timeout 30m
+          rc=$?
+          set -e
           rm -f "$NOTARIZE_ZIP"
+          if [ $rc -ne 0 ]; then
+            echo "::warning::Notarization failed (exit $rc). Binaries are codesigned but not notarized — Gatekeeper will require user override on first launch."
+          fi
 
       # Upload the staged DIRECTORY contents directly. `upload-artifact`
       # always wraps its input in a single `<artifact-name>.zip` at
