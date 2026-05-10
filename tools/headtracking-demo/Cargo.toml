@@ -1,6 +1,6 @@
 [package]
 name = "headtracking-demo"
-version = "0.0.7"
+version = "0.0.8"
 edition.workspace = true
 license.workspace = true
 description = "Standalone visualization of the Kinect / webcam head-tracker (RGB + face bbox + VPX delta + logs)"

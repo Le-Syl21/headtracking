@@ -165,6 +165,68 @@ jobs:
             brew install cmake
           fi
 
+      # Set up an ephemeral keychain populated with the Developer ID
+      # Application certificate from secrets, so the codesign + notarize
+      # steps below can find a signing identity. The step runs on every
+      # macOS job but degrades gracefully if the secret isn't set
+      # (PRs from forks, missing secrets) — the build keeps going and
+      # produces unsigned binaries that Gatekeeper would refuse on a
+      # locked-down end-user Mac. Tagged releases are expected to have
+      # the secrets configured at the repo level.
+      - name: Import Apple code-signing certificate
+        if: startsWith(matrix.os, 'macos')
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then
+            echo "::warning::APPLE_CERTIFICATE_P12 not set — building unsigned binaries."
+            echo "APPLE_SIGNING_AVAILABLE=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # Random keychain password — this keychain is created here,
+          # used by codesign in the next step, and torn down in the
+          # post-job cleanup. Nothing else on the runner sees it.
+          KEYCHAIN_PWD=$(uuidgen)
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          # Add to the search list so `find-identity` / `codesign` see it.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+              $(security list-keychains -d user | tr -d '"')
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+          # Decode the base64 p12 from the secret into a temp file.
+          P12="$RUNNER_TEMP/cert.p12"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$P12"
+          security import "$P12" -k "$KEYCHAIN_PATH" \
+              -P "$APPLE_CERTIFICATE_PASSWORD" \
+              -T /usr/bin/codesign -T /usr/bin/security
+
+          # Allow codesign to use the imported key without a UI prompt.
+          security set-key-partition-list \
+              -S apple-tool:,apple:,codesign: \
+              -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" >/dev/null
+
+          rm "$P12"
+
+          # Resolve the signing identity (CN of the imported cert) and
+          # surface it to subsequent steps via $GITHUB_ENV.
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+              | grep "Developer ID Application" | head -n1 \
+              | sed -E 's/^.*"([^"]+)".*$/\1/')
+          if [ -z "$IDENTITY" ]; then
+              echo "::error::No Developer ID Application identity found after import"
+              exit 1
+          fi
+          echo "Found signing identity: $IDENTITY"
+          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "APPLE_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "APPLE_SIGNING_AVAILABLE=true" >> "$GITHUB_ENV"
+
       # Now that `libusb-sys` vendors libusb statically and our
       # FindLibUSB shim short-circuits the bundled cmake module
       # (LibUSB_LIBRARIES is always pre-set from DEP_USB_1.0_LIB),
@@ -239,8 +301,77 @@ jobs:
             # and have everything wired up in one shot.
             cp -r tools/windows-release/setup "$stage/"
           fi
+          # macOS: ensure the executable + dylib have the +x bit set so
+          # double-clicking the binary in Finder works after extraction.
+          # `cargo build --release` already sets it, but `cp` preserves
+          # that and `tar` keeps the mode — explicit chmod here is a
+          # defensive belt for past CI hosts that stripped exec bits.
+          if [[ "${{ matrix.os }}" == macos-* ]]; then
+            chmod +x "$stage/${{ matrix.demo_bin }}"
+            chmod +x "$stage/${{ matrix.plugin_lib }}"
+          fi
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
           echo "ARTIFACT_BASENAME=headtracking-${version}-${{ matrix.suffix }}" >> "$GITHUB_ENV"
+
+      # ---------- macOS code-signing + notarization ----------
+
+      # Sign the dylib + demo binary with the Developer ID Application
+      # identity imported above. Hardened runtime is mandatory for
+      # notarization (Apple rejects submissions without it). The
+      # `--timestamp` flag pins a secure timestamp so the signature
+      # stays valid past the cert's own expiry.
+      #
+      # No entitlements file is passed: the demo's camera + USB
+      # accesses go through standard public APIs that don't require a
+      # provisioning profile, and TCC will prompt the user once on
+      # first run for camera access (then remember the choice).
+      - name: Sign macOS binaries
+        if: startsWith(matrix.os, 'macos') && env.APPLE_SIGNING_AVAILABLE == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$STAGE_DIR/${{ matrix.plugin_lib }}"
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$STAGE_DIR/${{ matrix.demo_bin }}"
+          # Quick sanity check — `codesign --verify` exits non-zero if
+          # the signature is malformed or the cert chain is broken.
+          codesign --verify --deep --strict --verbose=2 "$STAGE_DIR/${{ matrix.plugin_lib }}"
+          codesign --verify --deep --strict --verbose=2 "$STAGE_DIR/${{ matrix.demo_bin }}"
+
+      # Notarize: ditto-zip the two binaries together, submit one
+      # request, wait for Apple's notary service to accept. Stapling
+      # is intentionally NOT done — `xcrun stapler staple` only
+      # supports .app bundles / .pkg / .dmg, not raw Mach-O files.
+      # Without stapling, Gatekeeper does an online lookup against
+      # Apple on first launch (fine if the user has internet, which
+      # they do given they just downloaded the tarball).
+      - name: Notarize macOS binaries
+        if: startsWith(matrix.os, 'macos') && env.APPLE_SIGNING_AVAILABLE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_ID_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "::warning::Notarization secrets missing (APPLE_ID / APPLE_ID_PASSWORD / APPLE_TEAM_ID) — signing only, no notarization."
+            exit 0
+          fi
+          NOTARIZE_ZIP="$RUNNER_TEMP/notarize-${{ matrix.suffix }}.zip"
+          /usr/bin/ditto -c -k --keepParent "$STAGE_DIR" "$NOTARIZE_ZIP"
+          # `--wait` polls until Apple returns Accepted / Invalid;
+          # typical turnaround 1-5 min.
+          xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 30m
+          rm -f "$NOTARIZE_ZIP"
 
       # Upload the staged DIRECTORY contents directly. `upload-artifact`
       # always wraps its input in a single `<artifact-name>.zip` at
@@ -261,6 +392,17 @@ jobs:
           path: ${{ env.STAGE_DIR }}/
           if-no-files-found: error
           retention-days: 7
+
+      # Tear down the ephemeral signing keychain. Runs even on failure
+      # so a botched intermediate step doesn't leave the cert lingering
+      # on the (shared, public) GitHub runner image.
+      - name: Clean up signing keychain
+        if: always() && startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          if [ -n "${APPLE_KEYCHAIN_PATH:-}" ] && [ -e "$APPLE_KEYCHAIN_PATH" ]; then
+            security delete-keychain "$APPLE_KEYCHAIN_PATH" || true
+          fi
 
   release:
     name: Publish GitHub Release
@@ -289,22 +431,35 @@ jobs:
           done
 
       # Re-archive each per-OS folder into the platform's canonical
-      # archive type: `.tar.gz` for linux/macos, `.zip` for windows.
-      # The artifact name embeds the suffix (`headtracking-<ver>-<os>-<arch>`)
-      # which we map to the right tool.
+      # archive type with a top-level directory wrapper. This way
+      # `unzip headtracking-X.Y.Z-windows-x86_64.zip` (or `tar xzf`)
+      # produces a `headtracking-X.Y.Z-windows-x86_64/` folder rather
+      # than dumping loose files into the user's working directory.
       - name: Repack artifacts for release
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p release-assets
+          mkdir -p release-assets release-staging
           for d in dist/*/; do
             name=$(basename "$d")
+            # Move the per-target download dir under release-staging
+            # so the archive's internal path starts with $name/.
+            mv "$d" "release-staging/$name"
             case "$name" in
-              *windows*) ( cd "$d" && zip -r "../../release-assets/${name}.zip" . ) ;;
-              *)         tar -C "$d" -czf "release-assets/${name}.tar.gz" . ;;
+              *windows*) ( cd release-staging && zip -r "../release-assets/${name}.zip" "$name" ) ;;
+              *)         tar -C release-staging -czf "release-assets/${name}.tar.gz" "$name" ;;
             esac
           done
+          echo "--- release-assets ---"
           ls -lah release-assets/
+          echo "--- archive top-level (sample) ---"
+          # Sanity-print the first archive's top-level entries — they
+          # should be a single `<name>/` directory.
+          first=$(ls release-assets/ | head -n1)
+          case "$first" in
+            *.zip)    unzip -l "release-assets/$first" | head -10 ;;
+            *.tar.gz) tar -tzf "release-assets/$first" | head -5 ;;
+          esac
 
       - name: Create release
         uses: softprops/action-gh-release@v3
