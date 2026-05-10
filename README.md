@@ -155,193 +155,95 @@ Media Foundation, not libusb). The rest of this section is Kinect-specific.
 
 Tested 2026-05 on a fresh Windows pincab: even with all Windows Updates
 installed, **the Kinect ships with no driver at all**. Plug a Kinect v1
-or v2 in and Device Manager shows it as *Unknown / Other device* — there
-is no device path for libusb to enumerate, so the plugin reports zero
-devices detected. **You must install something before anything works.**
+or v2 in and Device Manager shows it as *Unknown / Other device* — no
+device path for libusb to enumerate, plugin reports zero devices.
+**You must install something before anything works.**
 
-There are two distinct things you may install, and they solve different
-problems:
-
-| Driver | Makes the device... visible to libusb? | …openable by libusb? |
-|---|---|---|
-| **None** (out of the box) | ❌ no | ❌ no |
-| **Microsoft Kinect SDK driver** alone | ✅ yes | ❌ **`open` fails with rc=-12 / `LIBUSB_ERROR_NOT_SUPPORTED`** |
-| **UsbDk filter** (any other driver may coexist) | ✅ yes | ✅ yes |
-| **libusbK** via Zadig (replaces existing driver) | ✅ yes | ✅ yes |
-
-If you've already installed the Microsoft SDK driver, you'll see the
-Kinect listed when the plugin enumerates, but **opening it will fail with
-error -12** (this is libusb saying *"another kernel driver owns this
-device, I can't talk to it"*). That's expected — install UsbDk or replace
-the driver via Zadig, below, to actually use it.
+The release ZIP solves this in one click — see Option 1 below.
 
 ##### Option 1 — One-click setup script (recommended)
 
-The Windows release ZIP includes `setup/cleanup-kinectv1.cmd` — a
-double-clickable launcher that handles the full Windows side in one
-shot:
+The Windows release ZIP includes a `setup/` folder with a
+double-clickable launcher that wires up the entire Windows USB stack
+for both Kinect generations:
 
 1. (Windows 7 only) install
    [Microsoft Security Advisory 3033929](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2015/3033929)
    first or USB keyboards/mice may stop working.
 2. Open the extracted release folder, navigate to `setup\`, and
-   **double-click `cleanup-kinectv1.cmd`**. Confirm the UAC prompt.
-3. Wait for the script to finish — it will:
-   - download + install Daynix's signed UsbDk MSI (skipped if
-     already installed, ~3.5 MB pull from GitHub Releases over HTTPS);
-   - block Windows from auto-installing partial drivers on the
-     Kinect VID/PIDs (registry deny list, survives reboots);
-   - unbind any current Kinect device instance so PnP re-discovers
-     them cleanly on next plug.
+   **double-click `setup-kinect.cmd`**. Confirm the UAC prompt.
+3. Wait for the script to finish (~10–30 s).
 
-Plug the Kinect, restart VPX.
+That's it for both Kinect v1 and v2. Plug the Kinect, restart VPX.
 
-For a **Kinect v2**: that's it — UsbDk + libfreenect2 do the rest.
-For a **Kinect v1**: one more step, see *"Kinect v1 — bind WinUSB
-via Zadig"* below.
+What the script does, in order:
 
-(Don't want to run a script? You can install UsbDk by hand from
-<https://github.com/daynix/UsbDk/releases>. The plugin auto-detects
-its presence at startup — missing-UsbDk shows up as a `WARN` line in
-VPX's plugin log and a popup with a clickable link in the
-`headtracking-demo` standalone tool. You'd still need the
-`AllowAdminInstall=1` registry write the script does, otherwise the
-deny list — if you want one — would block Zadig too.)
+| Step | Action |
+|---|---|
+| 1 | Adds `DenyDeviceIDs` registry entries for every Kinect v1 sub-device PID (Audio / Camera / Motor across 1414, 1473, KfW revisions) so Windows PnP stops re-binding `usbaudio.sys` between replugs. |
+| 2 | Same for Kinect v2 sensor PIDs, so Windows Update can't silently re-bind a Microsoft driver later. The hub PID (`02D9`) is deliberately *not* denied — it must keep `usbhub.sys` so the sensor can be enumerated downstream. |
+| 3 | Removes any currently-attached Kinect instance and deletes any leftover Kinect drivers from the Driver Store (legacy SDK, prior Zadig output, prior runs of this script). |
+| 4 | Pre-trusts the libwdi self-signed certificate that signs the bundled `.cat` files (so `pnputil` won't prompt or fail under HVCI), then `pnputil /add-driver /install` on the 9 WinUSB INF packages in `setup\drivers\` — covers every known Kinect VID/PID. |
+| 5 | `pnputil /scan-devices` re-enumerates USB so already-plugged Kinects pick up WinUSB without a physical replug — useful when the Kinect is hard-mounted in a pinball cabinet. |
 
-UsbDk coexists with the Kinect for Windows v2 SDK — no need to uninstall
-anything. It handles the Kinect v2 entirely on its own.
+After the script: every Kinect interface is bound to **WinUSB** (the
+Microsoft inbox kernel driver, signed at the kernel level — HVCI /
+Memory Integrity safe). libusb claims them through its WinUSB
+backend, libfreenect/libfreenect2 enumerate normally, no Zadig
+required, no UsbDk required.
 
-##### Kinect v1 — bind WinUSB via Zadig
-
-After the setup script runs, the Kinect v1 sub-devices are visible
-in Device Manager but **no driver is bound** to them (yellow `?`).
-That's intentional: libusb needs an actual function driver to claim
-the device, and we want **WinUSB** (Microsoft's inbox kernel
-driver, signed at the kernel level — HVCI / Memory Integrity safe)
-rather than the Kinect SDK driver or `usbaudio.sys`. Zadig is the
-tool that writes the registry mapping between each Kinect v1
-sub-device and WinUSB.
-
-The script's deny list is configured with `AllowAdminInstall=1`, so
-Zadig (running as admin) can override it. Once Zadig has bound
-WinUSB, the binding is sticky across replugs — Windows won't push
-`usbaudio.sys` back over the audio interface.
-
-1. **Plug the Kinect v1.** Open *Device Manager* (`devmgmt.msc`)
-   and confirm three entries appear with a yellow `?` icon:
-   - *Xbox NUI Audio*
-   - *Xbox NUI Camera*
-   - *Xbox NUI Motor*
-
-   If you see fewer than three (e.g. only two), unplug + replug. If
-   they don't show a `?` (a driver is already bound), re-run
-   `setup\cleanup-kinectv1.cmd` first.
-
-2. **Get Zadig** from <https://zadig.akeo.ie/>. It's a single
-   ~5 MB executable, no install. **Right-click → *Run as
-   administrator***.
-
-3. In Zadig's *Options* menu:
-   - **Check** *List All Devices*
-   - **Uncheck** *Ignore Hubs or Composite Parents*
-
-4. **Bind WinUSB on `Xbox NUI Audio`**:
-   - Pick *Xbox NUI Audio* in the device dropdown at the top.
-   - The current driver (left of the green arrow) is probably
-     blank or `HidUsb`.
-   - The replacement driver (right of the arrow) should default
-     to `WinUSB (v6.x.x.x)` — leave it.
-   - Click **Replace Driver**. Confirm the warning about replacing
-     a system driver.
-   - Wait for the *Driver Installation: SUCCESS* dialog (5–15 s).
-
-5. **Repeat step 4 for `Xbox NUI Camera` and `Xbox NUI Motor`**
-   — same procedure, just a different entry in the dropdown.
-
-6. **Verify** in Device Manager. The three *Xbox NUI* entries
-   should have moved under *Universal Serial Bus devices* and show
-   `WinUSB Device` in their *Driver* tab. The yellow `?` is gone.
-
-7. **Test**: launch `headtracking-demo.exe`. The dropdown at the
-   top should list *Kinect v1*. Select it; the live RGB + depth
-   feeds should appear within ~1 s.
-
-###### Troubleshooting
-
-* *"Driver Installation: FAILED — Inf modified"* — the deny list is
-  still blocking admin installs. Check that
-  `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions`
-  has `AllowAdminInstall = 1` (DWORD). Re-run
-  `cleanup-kinectv1.cmd` if not.
-* *Sub-devices show with a non-WinUSB driver after replug* —
-  Windows Update may have pushed a replacement. Re-run the setup
-  script (it's idempotent), then redo Zadig once more. The deny
-  list should pin it from then on.
-* *headtracking-demo says "no Kinect v1 found on USB"* — open the
-  log panel at the bottom and look for `libfreenect:` lines. Set
-  `FREENECT_LOG_LEVEL=spew` and `HEADTRACKING_LOG=libfreenect=debug,info`
-  in the environment to surface the full USB transcript.
-* *Kinect v2 disappeared from Device Manager* — you ran an older
-  version of the setup script that included v2 PIDs in the deny
-  list (fixed in v0.0.5). Re-run the current script; it wipes and
-  rewrites the deny list with v1 entries only, then `pnputil
-  /remove-device` forces v2 to re-enumerate cleanly on next plug.
-
-##### Option 2 — libusbK via Zadig (alternative)
-
-Zadig **replaces** whatever driver currently owns the device with
-libusbK. Use this if UsbDk misbehaves on your machine, or if you don't
-want to keep the Microsoft SDK around.
-
-1. Get Zadig from <https://zadig.akeo.ie/>.
-2. Run Zadig. In **Options**, tick **List All Devices** and untick
-   **Ignore Hubs or Composite Parents**.
-3. Pick from the dropdown:
-   - Kinect v2 → **Xbox NUI Sensor (composite parent)** (USB ID `045E:02C4`
-     or `045E:02D8`). ⚠ Skip **NuiSensor Adaptor**, that's the power brick,
-     not the sensor.
-   - Kinect v1 → install libusbK for **each** of the three sub-devices:
-     *Xbox NUI Motor*, *Xbox NUI Audio*, *Xbox NUI Camera*.
-4. On the right, pick **libusbK (v3.0.7.0 or newer)** from the replacement
-   driver list.
-5. Click **Replace Driver**. Confirm the warning (composite parent system
-   driver).
-
-**To revert to the Microsoft SDK driver**: Device Manager → libusbK USB
-Devices → right-click the device → *Uninstall*, tick *Delete the driver
-software for this device*, then Action → *Scan for hardware changes*.
+Re-running the script is idempotent: registry entries are wiped and
+rewritten, missing devices are silently skipped, `pnputil
+/add-driver` is a no-op when the same INF is already in the Driver
+Store at the same DriverVer.
 
 ##### Verification
 
-Launch VPX, open the plugin console (or check the log): on PluginLoad you
-should see `kinect2 backend: 1 device(s) detected` (or v1 equivalent).
-- *Nothing detected* → no driver is registered for the device. Install
-  the Kinect SDK driver (or just UsbDk, which is simpler).
-- *Detected, but `OpenFailed (rc=-12)` / `LIBUSB_ERROR_NOT_SUPPORTED`* →
-  only the SDK driver is in play. Install UsbDk **or** run Zadig as
-  described above.
-- *Still nothing on a v2 specifically* → replug the Kinect into a
-  **dedicated USB 3.0 port** (v2 needs the bandwidth of a root port,
-  not a shared hub).
+Launch `headtracking-demo.exe` (or VPX with the plugin loaded). The
+backend dropdown / plugin log should list the Kinect within a second
+of opening.
 
-##### Triage logs
+If it doesn't:
+* Open Device Manager (`devmgmt.msc`) → look under *Universal Serial
+  Bus devices*. Your Kinect's interfaces should show as
+  `kinect_v1_*` or `kinect_v2_*` with `WinUSB Device` in the *Driver*
+  tab.
+* If the entries still appear with a yellow `?` (no driver), the
+  script's `pnputil /add-driver` step failed — open `setup\dont_run.ps1`
+  output (visible in the script's console window) and look for `[FAIL]`
+  lines.
+* Set `FREENECT_LOG_LEVEL=spew` and
+  `HEADTRACKING_LOG=libfreenect=debug,info` before launching the demo
+  to surface libfreenect's full USB transcript via `tracing`.
 
-For the deeper "Device Manager lists it but it still won't open" cases
-the standalone `headtracking-demo` exposes libfreenect's own USB
-trace. Two env vars combined:
+##### Option 2 — Manual Zadig fallback
 
-```cmd
-set FREENECT_LOG_LEVEL=spew
-set HEADTRACKING_LOG=libfreenect=debug,info
-headtracking-demo.exe
-```
+If you'd rather not run a script, or the script failed for some
+reason (locked-down corporate Windows, code-signing policy, etc.),
+you can bind WinUSB by hand with [Zadig](https://zadig.akeo.ie/).
 
-`FREENECT_LOG_LEVEL` (`fatal`/`error`/`warning`/`notice`/`info`/
-`debug`/`spew`/`flood`) tunes libfreenect's verbosity; `HEADTRACKING_LOG`
-is the standard `tracing` filter routing those lines through. Every
-libfreenect log line shows up with a `libfreenect:` prefix in the
-in-app log panel and in the stderr stream — easy to grep / paste in
-a bug report.
+1. Get Zadig (single ~5 MB executable). **Right-click → Run as
+   administrator**.
+2. *Options* → **check** *List All Devices*, **uncheck** *Ignore
+   Hubs or Composite Parents*.
+3. For **Kinect v1**: bind WinUSB to all three sub-devices —
+   *Xbox NUI Audio*, *Xbox NUI Camera*, *Xbox NUI Motor*.
+   For **Kinect v2**: bind WinUSB to *Xbox NUI Sensor (composite
+   parent)* (USB ID `045E:02C4` or `045E:02D8`). ⚠ Skip *NuiSensor
+   Adaptor* — that's the power brick, not the sensor.
+4. On the right side of the Zadig window, leave the default
+   `WinUSB (v6.x.x.x)` and click **Replace Driver**.
+
+**To revert** any of these bindings: Device Manager → right-click
+the device → *Uninstall device* → tick *Delete the driver software
+for this device* → *Scan for hardware changes*.
+
+##### v2 needs USB 3.0 root-port bandwidth
+
+If you have a Kinect v2 and the `setup-kinect.cmd` script ran
+clean but the demo still doesn't see it, replug into a **dedicated
+USB 3.0 port** on the motherboard's back panel — the v2 needs the
+bandwidth of a root port and won't enumerate behind a shared hub.
 
 #### macOS
 
@@ -528,180 +430,100 @@ section concerne la Kinect.
 Testé en mai 2026 sur un pincab Windows neuf : même avec toutes les
 mises à jour Windows, **la Kinect arrive sans aucun driver**. Brancher
 une Kinect v1 ou v2 et le Gestionnaire de périphériques affiche
-*Périphérique inconnu* — il n'y a pas de chemin device pour libusb à
-énumérer, donc le plugin ne détecte rien. **Il faut installer quelque
-chose avant que ça démarre.**
+*Périphérique inconnu* — pas de chemin device pour libusb à énumérer,
+le plugin ne détecte rien. **Il faut installer quelque chose avant
+que ça démarre.**
 
-Deux choses différentes peuvent être installées, et elles résolvent des
-problèmes distincts :
-
-| Driver | Visible par libusb ? | Ouvrable par libusb ? |
-|---|---|---|
-| **Aucun** (sortie d'usine) | ❌ non | ❌ non |
-| **Driver SDK Kinect Microsoft** seul | ✅ oui | ❌ **`open` échoue avec rc=-12 / `LIBUSB_ERROR_NOT_SUPPORTED`** |
-| **UsbDk** (filter, peut coexister avec un autre driver) | ✅ oui | ✅ oui |
-| **libusbK** via Zadig (remplace le driver existant) | ✅ oui | ✅ oui |
-
-Si vous avez déjà installé le driver SDK Microsoft, vous verrez la
-Kinect remontée à l'énumération du plugin, mais **l'ouverture échouera
-avec l'erreur -12** (libusb dit *« un autre driver kernel possède ce
-device, je ne peux pas lui parler »*). C'est attendu — installer UsbDk
-ou remplacer le driver via Zadig (ci-dessous) pour vraiment l'utiliser.
+Le ZIP release règle ça en un clic — voir Option 1 ci-dessous.
 
 ##### Option 1 — Script setup tout-en-un (recommandé)
 
-Le ZIP release Windows inclut `setup/cleanup-kinectv1.cmd` — un
-launcher double-cliquable qui gère toute la mise en place en un seul
-geste :
+Le ZIP release Windows inclut un dossier `setup/` avec un launcher
+double-cliquable qui câble toute la stack USB Windows pour les deux
+générations de Kinect :
 
 1. (Windows 7 uniquement) installer d'abord
    [Microsoft Security Advisory 3033929](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2015/3033929)
    sinon les claviers/souris USB peuvent cesser de fonctionner.
 2. Ouvrir le dossier release extrait, aller dans `setup\`, et
-   **double-cliquer sur `cleanup-kinectv1.cmd`**. Confirmer l'UAC.
-3. Le script va :
-   - télécharger + installer le MSI UsbDk signé Daynix (skippé s'il
-     est déjà installé, ~3.5 Mo depuis GitHub Releases en HTTPS) ;
-   - bloquer Windows pour qu'il n'installe plus de drivers partiels
-     sur les VID/PID Kinect (registre, survit aux reboots) ;
-   - délier toute instance Kinect actuelle pour que PnP ré-énumère
-     proprement au prochain plug.
+   **double-cliquer sur `setup-kinect.cmd`**. Confirmer l'UAC.
+3. Attendre que le script termine (~10–30 s).
 
-Brancher la Kinect, relancer VPX.
+C'est tout, pour les deux Kinect v1 et v2. Brancher la Kinect, relancer VPX.
 
-Pour une **Kinect v2** : c'est terminé — UsbDk + libfreenect2 font
-le reste. Pour une **Kinect v1** : une étape de plus, voir
-*"Kinect v1 — bind WinUSB via Zadig"* ci-dessous.
+Ce que fait le script, dans l'ordre :
 
-(Tu ne veux pas lancer un script ? Tu peux installer UsbDk à la main
-depuis <https://github.com/daynix/UsbDk/releases>. Le plugin détecte
-sa présence au démarrage — UsbDk absent = ligne `WARN` dans le log
-plugin VPX + popup avec lien cliquable dans l'outil standalone
-`headtracking-demo`. Il te faudrait quand même l'écriture registre
-`AllowAdminInstall=1` que fait le script, sinon une éventuelle
-deny-list bloquerait aussi Zadig.)
+| Étape | Action |
+|---|---|
+| 1 | Ajoute des entrées `DenyDeviceIDs` au registre pour chaque PID Kinect v1 sous-périphérique (Audio / Camera / Motor sur révs 1414, 1473, KfW), pour empêcher Windows PnP de re-binder `usbaudio.sys` entre les replugs. |
+| 2 | Idem pour les PIDs Kinect v2 sensor, pour que Windows Update ne re-bind pas silencieusement un driver Microsoft plus tard. Le PID hub (`02D9`) est délibérément *non* dans la deny-list — il doit garder `usbhub.sys` pour pouvoir énumérer le sensor downstream. |
+| 3 | Retire toute instance Kinect actuellement attachée et supprime tout driver Kinect résiduel du Driver Store (legacy SDK, output Zadig précédent, runs antérieurs de ce script). |
+| 4 | Pré-trust le certificat self-signé libwdi qui signe les `.cat` bundlés (sinon `pnputil` prompte ou échoue sous HVCI), puis `pnputil /add-driver /install` sur les 9 INFs WinUSB dans `setup\drivers\` — couvre tous les VID/PID Kinect connus. |
+| 5 | `pnputil /scan-devices` ré-énumère USB pour que les Kinect déjà branchées prennent WinUSB sans replug physique — utile quand la Kinect est câblée à demeure dans un pincab. |
 
-UsbDk coexiste avec le SDK Kinect for Windows v2 — pas besoin de
-désinstaller quoi que ce soit. Il règle entièrement le cas Kinect v2
-de lui-même.
+Après le script : chaque interface Kinect est bindée à **WinUSB** (le
+driver kernel inbox Microsoft, signé au niveau kernel — compatible
+HVCI / Memory Integrity). libusb les claim via son backend WinUSB,
+libfreenect/libfreenect2 les énumèrent normalement, **pas de Zadig
+requis, pas de UsbDk requis**.
 
-##### Kinect v1 — bind WinUSB via Zadig
-
-Après que le script setup tourne, les sous-périphériques Kinect v1
-sont visibles dans le Device Manager mais **aucun driver n'est
-attaché** (`?` jaune). C'est intentionnel : libusb a besoin d'un
-function driver pour claim le device, et on veut **WinUSB**
-(driver kernel inbox Microsoft, signé au niveau kernel — compatible
-HVCI / Memory Integrity) plutôt que le driver SDK Kinect ou
-`usbaudio.sys`. Zadig est l'outil qui écrit l'entrée registre liant
-chaque sous-périphérique Kinect v1 à WinUSB.
-
-La deny-list posée par le script inclut `AllowAdminInstall=1`, donc
-Zadig (lancé en admin) peut l'override. Une fois WinUSB bindé, le
-binding tient au-delà des replugs — Windows ne re-pousse plus
-`usbaudio.sys` sur l'interface audio.
-
-1. **Brancher la Kinect v1.** Ouvrir *Device Manager*
-   (`devmgmt.msc`) et confirmer trois entrées avec un `?` jaune :
-   - *Xbox NUI Audio*
-   - *Xbox NUI Camera*
-   - *Xbox NUI Motor*
-
-   Si tu en vois moins (ex : seulement deux), débranche/rebranche.
-   Si le `?` est absent (un driver est déjà attaché), relance
-   `setup\cleanup-kinectv1.cmd` d'abord.
-
-2. **Récupérer Zadig** depuis <https://zadig.akeo.ie/>. C'est un
-   exécutable unique de ~5 Mo, sans installation. **Clic droit →
-   *Exécuter en tant qu'administrateur***.
-
-3. Dans le menu *Options* de Zadig :
-   - **Cocher** *List All Devices*
-   - **Décocher** *Ignore Hubs or Composite Parents*
-
-4. **Binder WinUSB sur `Xbox NUI Audio`** :
-   - Sélectionner *Xbox NUI Audio* dans la dropdown du haut.
-   - Le driver actuel (à gauche de la flèche verte) est
-     probablement vide ou `HidUsb`.
-   - Le driver de remplacement (à droite de la flèche) doit
-     déjà être `WinUSB (v6.x.x.x)` — le laisser tel quel.
-   - Cliquer **Replace Driver**. Confirmer le warning sur le
-     remplacement d'un driver système.
-   - Attendre la dialog *Driver Installation: SUCCESS* (5–15 s).
-
-5. **Répéter l'étape 4 pour `Xbox NUI Camera` et `Xbox NUI Motor`**
-   — même procédure, juste une autre entrée dans la dropdown.
-
-6. **Vérifier** dans Device Manager. Les trois entrées *Xbox NUI*
-   doivent être passées sous *Universal Serial Bus devices* et
-   afficher `WinUSB Device` dans leur onglet *Driver*. Le `?`
-   jaune a disparu.
-
-7. **Tester** : lancer `headtracking-demo.exe`. La dropdown du
-   haut doit lister *Kinect v1*. Sélectionner ; les flux RGB +
-   depth live doivent apparaître en ~1 s.
-
-###### Troubleshooting
-
-* *"Driver Installation: FAILED — Inf modified"* — la deny-list
-  bloque encore les installs admin. Vérifier que
-  `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions`
-  contient bien `AllowAdminInstall = 1` (DWORD). Relancer
-  `cleanup-kinectv1.cmd` sinon.
-* *Les sous-périphériques affichent un autre driver après replug* —
-  Windows Update a peut-être pushé un remplacement. Re-lancer le
-  script setup (idempotent), puis refaire Zadig une fois. La
-  deny-list devrait pinner à partir de là.
-* *headtracking-demo dit "no Kinect v1 found on USB"* — ouvre le
-  panel log en bas, cherche les lignes `libfreenect:`. Mets
-  `FREENECT_LOG_LEVEL=spew` et `HEADTRACKING_LOG=libfreenect=debug,info`
-  dans l'environnement pour avoir le transcript USB complet.
-* *La Kinect v2 a disparu du Device Manager* — tu as lancé une
-  ancienne version du script qui incluait les PIDs v2 dans la
-  deny-list (corrigé en v0.0.5). Re-lance le script actuel ; il
-  wipe et réécrit la deny-list avec uniquement les PIDs v1, puis
-  `pnputil /remove-device` force la v2 à se ré-énumérer proprement
-  au prochain plug.
-
-##### Option 2 — libusbK via Zadig (alternative)
-
-Zadig **remplace** le driver qui possède actuellement le device par
-libusbK. À utiliser si UsbDk se comporte mal sur votre machine, ou si
-vous ne voulez pas garder le SDK Microsoft.
-
-1. Télécharger Zadig depuis <https://zadig.akeo.ie/>.
-2. Lancer Zadig. Dans **Options**, cocher **List All Devices** et décocher
-   **Ignore Hubs or Composite Parents**.
-3. Sélectionner dans la liste déroulante :
-   - Kinect v2 → **Xbox NUI Sensor (composite parent)** (USB ID `045E:02C4`
-     ou `045E:02D8`). ⚠ Ignorer **NuiSensor Adaptor**, qui est l'adaptateur
-     secteur, pas la Kinect.
-   - Kinect v1 → installer libusbK pour **chacun** des trois
-     sous-périphériques : *Xbox NUI Motor*, *Xbox NUI Audio*, *Xbox NUI
-     Camera*.
-4. À droite, choisir **libusbK (v3.0.7.0 ou plus récent)** dans la liste
-   des drivers de remplacement.
-5. Cliquer sur **Replace Driver**. Confirmer le warning (driver système
-   composite).
-
-**Pour revenir au driver SDK Microsoft** : Device Manager → libusbK USB
-Devices → clic droit sur le device → *Uninstall*, cocher *Delete the
-driver software for this device*, puis Action → *Scan for hardware
-changes*.
+Re-lancer le script est idempotent : entrées registre wipées et
+réécrites, devices manquants silencieusement skippés, `pnputil
+/add-driver` ne fait rien quand le même INF est déjà dans le Driver
+Store au même DriverVer.
 
 ##### Vérification
 
-Lancer VPX, ouvrir la console plugin (ou regarder le log) : au PluginLoad
-on doit voir la ligne `kinect2 backend: 1 device(s) detected` (ou
-équivalent v1).
-- *Rien n'est détecté* → aucun driver enregistré pour le device.
-  Installer le driver SDK Kinect (ou directement UsbDk, plus simple).
-- *Détecté, mais `OpenFailed (rc=-12)` / `LIBUSB_ERROR_NOT_SUPPORTED`* →
-  seul le driver SDK est en place. Installer UsbDk **ou** lancer Zadig
-  comme décrit ci-dessus.
-- *Toujours rien sur une v2 spécifiquement* → rebrancher la Kinect sur
-  un **port USB 3.0 dédié** (la v2 demande la bande passante d'un port
-  racine, pas un hub partagé).
+Lancer `headtracking-demo.exe` (ou VPX avec le plugin chargé). La
+dropdown backend / le log plugin doit lister la Kinect en moins
+d'une seconde après ouverture.
+
+Si pas le cas :
+* Ouvrir Device Manager (`devmgmt.msc`) → regarder sous *Universal
+  Serial Bus devices*. Les interfaces Kinect doivent apparaître
+  comme `kinect_v1_*` ou `kinect_v2_*` avec `WinUSB Device` dans
+  l'onglet *Driver*.
+* Si elles affichent encore un `?` jaune (pas de driver), le step
+  `pnputil /add-driver` du script a échoué — ouvrir la fenêtre
+  console du script (qui reste affichée) et chercher les lignes
+  `[FAIL]`.
+* Mettre `FREENECT_LOG_LEVEL=spew` et
+  `HEADTRACKING_LOG=libfreenect=debug,info` dans l'environnement
+  avant de lancer le demo pour avoir le transcript USB complet de
+  libfreenect via `tracing`.
+
+##### Option 2 — Zadig manuel (fallback)
+
+Si tu ne veux pas lancer un script, ou si le script a échoué pour
+une raison ou une autre (Windows verrouillé en entreprise, policy
+de signature, etc.), tu peux binder WinUSB à la main via
+[Zadig](https://zadig.akeo.ie/).
+
+1. Récupérer Zadig (exécutable unique de ~5 Mo). **Clic droit →
+   Exécuter en tant qu'administrateur**.
+2. *Options* → **cocher** *List All Devices*, **décocher** *Ignore
+   Hubs or Composite Parents*.
+3. Pour la **Kinect v1** : binder WinUSB sur les trois
+   sous-périphériques — *Xbox NUI Audio*, *Xbox NUI Camera*,
+   *Xbox NUI Motor*.
+   Pour la **Kinect v2** : binder WinUSB sur *Xbox NUI Sensor
+   (composite parent)* (USB ID `045E:02C4` ou `045E:02D8`).
+   ⚠ Ignorer *NuiSensor Adaptor* — c'est l'adaptateur secteur, pas
+   le sensor.
+4. Côté droit de la fenêtre Zadig, laisser le `WinUSB (v6.x.x.x)`
+   par défaut et cliquer **Replace Driver**.
+
+**Pour revenir en arrière** sur un binding : Device Manager → clic
+droit sur le device → *Uninstall device* → cocher *Delete the
+driver software for this device* → *Scan for hardware changes*.
+
+##### v2 demande la bande passante d'un port USB 3.0 racine
+
+Si tu as une Kinect v2 et que `setup-kinect.cmd` est passé sans
+erreur mais le demo ne la voit toujours pas, rebrancher sur un
+**port USB 3.0 dédié** au dos de la carte mère — la v2 a besoin
+de la bande passante d'un port racine et n'énumère pas derrière
+un hub partagé.
 
 #### macOS
 

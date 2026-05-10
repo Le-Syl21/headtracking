@@ -30,12 +30,6 @@ fn main() {
     // target's declaration + install + link lines in `if(NOT WIN32)`
     // so only the static lib remains on Windows.
     patch_libfreenect_skip_shared(&vendor_dir);
-    // Mirror the libfreenect2 opt-in pattern: on Windows, ask libusb to
-    // use the UsbDk backend at init time so libfreenect can reach the
-    // Kinect even when another driver (Microsoft Kinect SDK) owns the
-    // device. Open upstream PR — OpenKinect/libfreenect#701 — once
-    // merged, the in-tree patch becomes a no-op via the marker check.
-    patch_libfreenect_usbdk_opt_in(&vendor_dir);
 
     // Static cmake build. Drop the bits we don't need (audio, OpenNI2, examples).
     let mut config = cmake::Config::new(&vendor_dir);
@@ -299,61 +293,6 @@ fn patch_libfreenect_skip_shared(vendor_dir: &std::path::Path) {
             out.pop();
         }
     }
-    let _ = std::fs::write(&path, out);
-}
-
-/// Idempotently patch `vendor/libfreenect/src/usb_libusb10.c` to call
-/// `libusb_set_option(LIBUSB_OPTION_USE_USBDK)` immediately after
-/// `libusb_init`, mirroring what libfreenect2 has done for years
-/// (`libfreenect2.cpp` line 392-394). Without this, on Windows libusb
-/// stays on the WinUSB backend and `freenect_open_device` returns
-/// `LIBUSB_ERROR_NOT_SUPPORTED` (-12) whenever the Kinect is bound to
-/// the Microsoft SDK driver — forcing every user through Zadig.
-///
-/// Acts as an in-tree fallback while the upstream PR
-/// (OpenKinect/libfreenect#701) is in review. Once merged and we bump
-/// the submodule, the marker check makes this a no-op.
-///
-/// Patch is gated by `#ifdef _WIN32` inside the C source itself, so
-/// applying it on Linux/macOS is harmless — but we skip the rewrite
-/// anyway to keep the vendor checkout pristine outside Windows builds.
-fn patch_libfreenect_usbdk_opt_in(vendor_dir: &std::path::Path) {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
-    let path = vendor_dir.join("src/usb_libusb10.c");
-    let Ok(original) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    const MARKER: &str = "/* freenect-sys: UsbDk opt-in (mirror libfreenect2) */";
-    if original.contains(MARKER) || original.contains("LIBUSB_OPTION_USE_USBDK") {
-        // Either we patched this checkout already, or upstream merged
-        // the equivalent patch and the option call is now in-source.
-        return;
-    }
-    // Anchor: the exact two lines we inject between. We lookahead-match
-    // them as a contiguous slice to avoid mis-patching some other
-    // `libusb_init` site that might be added later.
-    const ANCHOR: &str = "\t\tres = libusb_init(&ctx->ctx);\n\t\tif (res >= 0) {\n";
-    let Some(idx) = original.find(ANCHOR) else {
-        // Source layout drifted (likely upstream PR merged with a
-        // slightly different formatting). Don't fail the build —
-        // patch was best-effort, the worst case is the user still
-        // needs Zadig as before.
-        return;
-    };
-    let injection = format!(
-        "{ANCHOR}\
-{MARKER}
-#if defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)
-\t\t\t(void)libusb_set_option(ctx->ctx, LIBUSB_OPTION_USE_USBDK);
-#endif
-"
-    );
-    let mut out = String::with_capacity(original.len() + injection.len());
-    out.push_str(&original[..idx]);
-    out.push_str(&injection);
-    out.push_str(&original[idx + ANCHOR.len()..]);
     let _ = std::fs::write(&path, out);
 }
 

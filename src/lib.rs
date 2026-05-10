@@ -12,8 +12,3 @@ pub mod config;
 pub mod filter;
 pub mod plugin;
 pub mod tracker;
-
-/// Re-export the UsbDk presence probe so the standalone demo can run
-/// the same check the plugin runs at PluginLoad and surface a popup
-/// to the user when it's missing.
-pub use plugin::usbdk;

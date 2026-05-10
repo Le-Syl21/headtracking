@@ -118,12 +118,6 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     // of this call (and beyond — the host keeps it live until unload).
     let api = unsafe { &*api_ptr };
 
-    // Best-effort hint for Windows users with no UsbDk filter installed —
-    // log-only, no-op on Linux/macOS. We do this early so the message
-    // shows up before any Kinect open attempt that would otherwise fail
-    // with a cryptic LIBUSB_ERROR_NOT_SUPPORTED later in the load path.
-    super::usbdk::warn_if_missing();
-
     let get_msg_id = api.GetMsgID.ok_or(LoadError::MissingFunction("GetMsgID"))?;
     let subscribe = api
         .SubscribeMsg

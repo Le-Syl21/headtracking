@@ -233,9 +233,11 @@ jobs:
           [ -f LICENSE ] && cp LICENSE "$stage/" || true
           [ -f README.md ] && cp README.md "$stage/" || true
           if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
-            mkdir -p "$stage/setup"
-            cp tools/windows-release/cleanup-kinectv1.cmd "$stage/setup/"
-            cp tools/windows-release/cleanup-kinectv1.ps1 "$stage/setup/"
+            # Bundle the full setup/ tree (cmd launcher, PS1 logic,
+            # 9 WinUSB INF/CAT pairs covering every Kinect hardware
+            # revision) so the user can double-click `setup-kinect.cmd`
+            # and have everything wired up in one shot.
+            cp -r tools/windows-release/setup "$stage/"
           fi
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
           echo "ARTIFACT_BASENAME=headtracking-${version}-${{ matrix.suffix }}" >> "$GITHUB_ENV"

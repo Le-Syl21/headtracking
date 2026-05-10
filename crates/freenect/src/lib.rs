@@ -708,9 +708,10 @@ impl std::fmt::Display for OpenFailureCode {
             -5 => " — LIBUSB_ERROR_NOT_FOUND: kernel driver missing or device gone",
             -6 => " — LIBUSB_ERROR_BUSY: device already opened by another process",
             -12 => {
-                " — LIBUSB_ERROR_NOT_SUPPORTED: on Windows, install UsbDk \
-                   (filter driver) or replace the Kinect driver with libusbK \
-                   via Zadig — see README"
+                " — LIBUSB_ERROR_NOT_SUPPORTED: on Windows, run \
+                   setup\\setup-kinect.cmd from the release ZIP to bind \
+                   WinUSB to each Kinect interface (or use Zadig manually \
+                   on each Xbox NUI sub-device) — see README"
             }
             _ => "",
         };

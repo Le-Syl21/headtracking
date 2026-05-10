@@ -3,5 +3,4 @@
 pub mod ffi;
 pub mod logging;
 pub mod messages;
-pub mod usbdk;
 pub mod vpx_sys;
