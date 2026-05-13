@@ -165,6 +165,251 @@ fn detect_backends() -> Vec<BackendEntry> {
     out
 }
 
+// ==================================================== Kinect access helper
+//
+// A Kinect only shows up in `detect_backends` if libusb can actually open
+// it, and that has an OS-level prerequisite:
+//   * Linux  — a udev rule giving the USB node 0666 (libfreenect2 ships
+//              `90-kinect2.rules` for exactly this); without it
+//              `freenect2::Context::enumerate()` probes each candidate,
+//              hits `LIBUSB_ERROR_ACCESS`, and silently drops it.
+//   * Windows — a libusb-capable kernel driver (WinUSB) bound to the
+//              Kinect interfaces; a fresh Windows binds nothing, the
+//              sensor sits in Device Manager as "Other device".
+//   * macOS  — nothing; libusb opens the device as-is.
+// So: if a Kinect is on the USB bus but absent from the dropdown, offer a
+// one-click fix (drop the udev rule via pkexec/sudo on Linux; run the
+// bundled `setup\setup-kinect.cmd` WinUSB installer on Windows).
+
+// Banner copy — picked at compile time so the message names the real fix.
+#[cfg(target_os = "linux")]
+const KINECT_ACCESS_PROBLEM: &str = "— libfreenect2 needs a udev rule (0666) to open the sensor.";
+#[cfg(target_os = "linux")]
+const KINECT_ACCESS_BUTTON: &str = "Install udev rule (asks for password)";
+#[cfg(target_os = "linux")]
+const KINECT_ACCESS_OK_NOTE: &str = "udev rule installed. Click 'rescan' — if the sensor still doesn't show up, unplug/replug it first.";
+
+#[cfg(target_os = "windows")]
+const KINECT_ACCESS_PROBLEM: &str = "— Windows binds no usable driver out of the box; libusb/libfreenect can't see it until WinUSB is installed on the Kinect interfaces.";
+#[cfg(target_os = "windows")]
+const KINECT_ACCESS_BUTTON: &str = "Install Kinect drivers (UAC prompt)";
+#[cfg(target_os = "windows")]
+const KINECT_ACCESS_OK_NOTE: &str = "driver installer launched — confirm the UAC prompt, let it finish (~10-30 s), then click 'rescan'. v2 also needs a dedicated USB 3.0 root port.";
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+const KINECT_ACCESS_PROBLEM: &str = "";
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+const KINECT_ACCESS_BUTTON: &str = "";
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+const KINECT_ACCESS_OK_NOTE: &str = "";
+
+/// `true` when `detect_backends` should have found a Kinect but didn't, and
+/// the reason is the missing OS access prerequisite (so the fix banner is
+/// worth showing). Always `false` on macOS.
+fn compute_kinect_access_hint(available: &[BackendEntry]) -> bool {
+    let kinect_listed = available
+        .iter()
+        .any(|e| matches!(e.backend, Backend::KinectV1 | Backend::KinectV2));
+    if kinect_listed {
+        return false;
+    }
+    if !kinect_present_but_not_set_up() {
+        return false;
+    }
+    warn!(
+        "a Kinect is on the USB bus but not accessible — the demo offers a one-click fix \
+         ({})",
+        if cfg!(target_os = "windows") {
+            "WinUSB driver install"
+        } else {
+            "udev rule install"
+        }
+    );
+    true
+}
+
+/// Linux: a Kinect v2 USB device is plugged in (`045e:02c4` / `02d8` /
+/// `02d9`, read from sysfs without privileges) and no udev rule mentioning
+/// it exists in the standard rules directories.
+#[cfg(target_os = "linux")]
+fn kinect_present_but_not_set_up() -> bool {
+    let sysfs_has_v2 = std::fs::read_dir("/sys/bus/usb/devices")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let dir = entry.path();
+            let id = |name: &str| {
+                std::fs::read_to_string(dir.join(name))
+                    .ok()
+                    .map(|s| s.trim().to_ascii_lowercase())
+            };
+            id("idVendor").as_deref() == Some("045e")
+                && matches!(id("idProduct").as_deref(), Some("02c4" | "02d8" | "02d9"))
+        });
+    if !sysfs_has_v2 {
+        return false;
+    }
+    const RULES_DIRS: &[&str] = &[
+        "/etc/udev/rules.d",
+        "/run/udev/rules.d",
+        "/usr/local/lib/udev/rules.d",
+        "/usr/lib/udev/rules.d",
+        "/lib/udev/rules.d",
+    ];
+    let rule_present = RULES_DIRS
+        .iter()
+        .flat_map(std::fs::read_dir)
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let path = entry.path();
+            path.extension().and_then(|e| e.to_str()) == Some("rules")
+                && std::fs::read_to_string(&path).is_ok_and(|t| {
+                    let l = t.to_ascii_lowercase();
+                    l.contains("045e") && l.contains("02c4")
+                })
+        });
+    !rule_present
+}
+
+/// Windows: a Kinect (v1 sub-device or v2 sensor) is present on the USB
+/// bus but no libusb-capable driver (WinUSB / libusbK) is bound to any of
+/// its interfaces. Queried via PowerShell's `Get-PnpDevice` — no extra
+/// crate, and it works on stock Windows 8.1+.
+#[cfg(target_os = "windows")]
+fn kinect_present_but_not_set_up() -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    // PID lists: v1 = Camera/Audio/Motor across models 1414 & 1473/KfW;
+    // v2 = sensor 02C4, firmware-update 02D8, NuiSensor Adaptor 02D9.
+    const SCRIPT: &str = "\
+        $ms = 'VID_045E&PID_(02AE|02BF|02AD|02BE|02B0|02C2|02C4|02D8|02D9)'; \
+        $d = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | \
+               Where-Object { $_.InstanceId -match $ms }); \
+        $drv = @($d | Where-Object { $_.Service -in 'WinUSB','WinUsb','libusbK','libusb0' }); \
+        Write-Output (\"present={0} winusb={1}\" -f $d.Count, $drv.Count)";
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(out) = out else {
+        warn!("could not run powershell Get-PnpDevice — skipping Kinect driver check");
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let field = |key: &str| -> u32 {
+        stdout
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix(key)?.parse().ok())
+            .unwrap_or(0)
+    };
+    let present = field("present=");
+    let winusb = field("winusb=");
+    present > 0 && winusb == 0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn kinect_present_but_not_set_up() -> bool {
+    false
+}
+
+/// Run the one-click fix for the current platform. `Ok(())` means it was
+/// kicked off (the user still has to confirm an elevation prompt and wait);
+/// `Err` carries a fallback hint for the UI to display.
+///
+/// * Linux: stage libfreenect2's `90-kinect2.rules`, install it into
+///   `/etc/udev/rules.d/` via `pkexec` then `sudo`, reload udev.
+/// * Windows: locate and launch `setup\setup-kinect.cmd` from the release
+///   layout (it self-elevates and binds WinUSB to every known Kinect
+///   VID/PID — see the project README).
+#[cfg(target_os = "linux")]
+fn fix_kinect_access() -> Result<(), String> {
+    use std::io::ErrorKind;
+    use std::process::Command;
+
+    // Inlined copy of crates/freenect2-sys/vendor/libfreenect2/platform/
+    // linux/udev/90-kinect2.rules so the installer works from a release
+    // build that doesn't ship the submodule.
+    const RULES: &str = "\
+# Kinect for Windows v2 — USB access for libfreenect2.
+# Installed by headtracking-demo. Upstream: libfreenect2 90-kinect2.rules.
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02c4\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02d8\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02d9\", MODE=\"0666\"
+";
+    let staged = std::env::temp_dir().join("headtracking-90-kinect2.rules");
+    std::fs::write(&staged, RULES).map_err(|e| format!("staging rules file: {e}"))?;
+    let inner = format!(
+        "set -e; install -m 0644 '{}' /etc/udev/rules.d/90-kinect2.rules; \
+         udevadm control --reload-rules; udevadm trigger",
+        staged.display()
+    );
+    let manual = format!("sudo sh -c '{inner}'");
+
+    let mut last: Option<String> = None;
+    for elevator in ["pkexec", "sudo"] {
+        match Command::new(elevator)
+            .arg("sh")
+            .arg("-c")
+            .arg(&inner)
+            .status()
+        {
+            Ok(s) if s.success() => return Ok(()),
+            Ok(s) => last = Some(format!("`{elevator}` exited with {s}")),
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => last = Some(format!("could not run `{elevator}`: {e}")),
+        }
+    }
+    Err(match last {
+        Some(why) => format!("{why}.\nRun it yourself, then click 'rescan':\n{manual}"),
+        None => format!("no `pkexec` or `sudo` on PATH.\nRun this, then click 'rescan':\n{manual}"),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn fix_kinect_access() -> Result<(), String> {
+    use std::process::Command;
+
+    let exe = std::env::current_exe().map_err(|e| format!("locating the executable: {e}"))?;
+    let dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+    // Release-ZIP layout puts the launcher under `setup\`; tolerate a flat
+    // layout and a `bin\` subdir too.
+    let candidates = [
+        dir.join("setup").join("setup-kinect.cmd"),
+        dir.join("setup-kinect.cmd"),
+        dir.join("..").join("setup").join("setup-kinect.cmd"),
+    ];
+    let Some(script) = candidates.iter().find(|p| p.is_file()) else {
+        return Err(format!(
+            "couldn't find setup\\setup-kinect.cmd next to {} — re-download the full release \
+             ZIP, or bind WinUSB by hand with Zadig (see the project README, \"Manual Zadig \
+             fallback\"): v1 → Xbox NUI Audio/Camera/Motor; v2 → Xbox NUI Sensor (045E:02C4).",
+            dir.display()
+        ));
+    };
+
+    // `cmd /c start "" "<script>"` launches it in its own console (so its
+    // output is visible) and detached (so a UAC denial doesn't block us).
+    // The .cmd self-elevates on its own.
+    let workdir = script.parent().unwrap_or(dir).to_path_buf();
+    Command::new("cmd.exe")
+        .args(["/c", "start", ""])
+        .arg(script)
+        .current_dir(workdir)
+        .spawn()
+        .map_err(|e| format!("launching setup-kinect.cmd: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn fix_kinect_access() -> Result<(), String> {
+    Err("nothing to set up — libusb opens the Kinect without a driver on this platform".to_string())
+}
+
 // ============================================================ App state
 
 struct App {
@@ -173,6 +418,15 @@ struct App {
     active: Option<Active>,
     error: Option<String>,
     logs: Arc<Mutex<VecDeque<String>>>,
+    /// A Kinect is on the USB bus but the OS-level access prerequisite
+    /// isn't set up (Linux: missing libfreenect2 udev rule; Windows: no
+    /// libusb/WinUSB driver bound) — show the one-click fix banner. Always
+    /// `false` on macOS, where libusb needs nothing.
+    kinect_access_hint: bool,
+    /// Outcome of the last "fix it" click: `Ok` carries a follow-up note,
+    /// `Err` carries a fallback hint (manual command line / "re-download
+    /// the release ZIP"). Cleared on rescan.
+    kinect_access_result: Option<Result<String, String>>,
 }
 
 impl App {
@@ -433,12 +687,15 @@ struct Baseline {
 impl App {
     fn new(logs: Arc<Mutex<VecDeque<String>>>) -> Self {
         let available = detect_backends();
+        let kinect_access_hint = compute_kinect_access_hint(&available);
         Self {
             selected: Backend::None,
             available,
             active: None,
             error: None,
             logs,
+            kinect_access_hint,
+            kinect_access_result: None,
         }
     }
 
@@ -459,6 +716,8 @@ impl App {
         }
         self.selected = Backend::None;
         self.available = detect_backends();
+        self.kinect_access_hint = compute_kinect_access_hint(&self.available);
+        self.kinect_access_result = None;
     }
 
     fn ensure_active(&mut self) {
@@ -844,6 +1103,59 @@ impl eframe::App for App {
             });
             ui.add_space(4.0);
         });
+
+        // ----- Kinect access nudge (Kinect on the bus but no udev rule /
+        // ----- WinUSB driver — offer the one-click fix)
+        if self.kinect_access_hint || self.kinect_access_result.is_some() {
+            let amber = Color32::from_rgb(0xff, 0xc4, 0x40);
+            let mut do_fix = false;
+            TopBottomPanel::top("kinect-access").show(egui_ctx, |ui| {
+                ui.add_space(3.0);
+                match &self.kinect_access_result {
+                    None => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("⚠ Kinect plugged in but not accessible")
+                                    .color(amber)
+                                    .strong(),
+                            );
+                            ui.label(RichText::new(KINECT_ACCESS_PROBLEM).color(Color32::GRAY));
+                            if ui.button(KINECT_ACCESS_BUTTON).clicked() {
+                                do_fix = true;
+                            }
+                        });
+                    }
+                    Some(Ok(msg)) => {
+                        ui.label(
+                            RichText::new(format!("✓ {msg}"))
+                                .color(Color32::from_rgb(0x6c, 0xc7, 0x6c)),
+                        );
+                    }
+                    Some(Err(detail)) => {
+                        ui.label(
+                            RichText::new("Couldn't do it automatically:")
+                                .color(amber)
+                                .strong(),
+                        );
+                        ui.label(RichText::new(detail).monospace().size(12.0));
+                    }
+                }
+                ui.add_space(3.0);
+            });
+            if do_fix {
+                match fix_kinect_access() {
+                    Ok(()) => {
+                        info!("Kinect access fix started");
+                        self.kinect_access_hint = false;
+                        self.kinect_access_result = Some(Ok(KINECT_ACCESS_OK_NOTE.to_string()));
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Kinect access fix failed");
+                        self.kinect_access_result = Some(Err(e));
+                    }
+                }
+            }
+        }
 
         // ----- Optional Kinect v1 controls (tilt + LED)
         self.show_v1_controls(egui_ctx);
