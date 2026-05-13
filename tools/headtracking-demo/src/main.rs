@@ -190,8 +190,8 @@ fn detect_backends() -> Vec<BackendEntry> {
 //   * macOS  — nothing; libusb opens the device as-is.
 // So: if a Kinect is on the USB bus but absent from the dropdown, offer a
 // one-click fix (drop the udev rule via pkexec/sudo on Linux; spawn the
-// bundled `setup\setup.ps1` WinUSB installer elevated via
-// ShellExecuteW(runas) on Windows).
+// bundled `setup\setup.ps1` WinUSB installer elevated via a hidden
+// PowerShell trampoline that calls `Start-Process -Verb RunAs` on Windows).
 
 // Banner copy — picked at compile time so the message names the real fix.
 #[cfg(target_os = "linux")]
@@ -336,9 +336,10 @@ fn kinect_present_but_not_set_up() -> bool {
 /// * Linux: stage libfreenect2's `90-kinect2.rules`, install it into
 ///   `/etc/udev/rules.d/` via `pkexec` then `sudo`, reload udev.
 /// * Windows: locate `setup\setup.ps1` from the release layout and spawn
-///   it elevated via `ShellExecuteW(verb="runas")` on `powershell.exe`
-///   with `-ExecutionPolicy Bypass` (UAC prompt). The script binds WinUSB
-///   to every known Kinect VID/PID — see the project README.
+///   a hidden non-elevated PowerShell that calls
+///   `Start-Process -Verb RunAs` on `powershell.exe -ExecutionPolicy
+///   Bypass -File setup.ps1` (UAC prompt). The elevated script binds
+///   WinUSB to every known Kinect VID/PID — see the project README.
 #[cfg(target_os = "linux")]
 fn fix_kinect_access() -> Result<(), String> {
     use std::io::ErrorKind;
@@ -385,8 +386,9 @@ SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02d9\", MODE=\"
 
 #[cfg(target_os = "windows")]
 fn fix_kinect_access() -> Result<(), String> {
-    use std::ptr;
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let exe = std::env::current_exe().map_err(|e| format!("locating the executable: {e}"))?;
     let dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -407,56 +409,43 @@ fn fix_kinect_access() -> Result<(), String> {
     };
     let workdir = script.parent().unwrap_or(dir);
 
-    // ShellExecuteW with verb "runas" pops the UAC consent dialog and
-    // spawns the target as Administrator. We invoke `powershell.exe`
-    // explicitly (with `-ExecutionPolicy Bypass`) because the default
-    // `.ps1` association on a fresh Windows opens Notepad — there's no
-    // shell verb to run a .ps1 elevated otherwise.
-    let file: Vec<u16> = to_wide("powershell.exe");
-    let verb: Vec<u16> = to_wide("runas");
-    let params: Vec<u16> = to_wide(&format!(
-        "-NoProfile -ExecutionPolicy Bypass -File \"{}\"",
-        script.display()
-    ));
-    let workdir_w: Vec<u16> = to_wide(workdir.as_os_str());
-    const SW_SHOWNORMAL: i32 = 1;
-
-    // SAFETY: all four wide strings are nul-terminated (`to_wide` appends a
-    // `\0`); ShellExecuteW only reads them, doesn't take ownership.
-    let h = unsafe {
-        ShellExecuteW(
-            ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            params.as_ptr(),
-            workdir_w.as_ptr(),
-            SW_SHOWNORMAL,
-        )
-    };
-    // Per the docs, ShellExecuteW returns an HINSTANCE > 32 on success;
-    // common failure codes: SE_ERR_ACCESSDENIED (5) when the user clicks
-    // No on the UAC prompt, ERROR_CANCELLED (1223) same thing on newer
-    // Windows, SE_ERR_FNF (2) for "file not found".
-    let code = h as isize;
-    if code > 32 {
+    // Two-step trampoline: spawn a hidden, *non*-elevated PowerShell
+    // whose only job is to call `Start-Process -Verb RunAs` on
+    // `powershell.exe -ExecutionPolicy Bypass -File setup.ps1`. The
+    // RunAs verb is what pops the UAC consent dialog; the spawned
+    // elevated PowerShell opens its own visible console (we don't pass
+    // `-WindowStyle Hidden`) so the user can read the script's output
+    // and the type-`yes` prompt. `-ExecutionPolicy Bypass` is required
+    // because a fresh Windows defaults to Restricted/RemoteSigned and
+    // would otherwise refuse our unsigned local script.
+    //
+    // We use this trampoline instead of a direct Win32 ShellExecuteW
+    // call to keep the dependency tree std-only — the price is one
+    // ephemeral PowerShell process (~100 ms) before UAC fires.
+    let inner = format!(
+        "$ErrorActionPreference='Stop'; Start-Process powershell -Verb RunAs \
+         -WorkingDirectory '{workdir}' \
+         -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{script}'",
+        workdir = workdir.display(),
+        script = script.display(),
+    );
+    let status = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &inner])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|e| format!("spawning powershell.exe: {e}"))?;
+    if status.success() {
         return Ok(());
     }
-    let why = match code {
-        2 => "powershell.exe not found",
-        5 | 1223 => "you cancelled the UAC prompt",
-        _ => "ShellExecuteW failed",
-    };
+    // Most common failure: the user clicked "No" on the UAC prompt,
+    // which makes `Start-Process -Verb RunAs` throw under
+    // `$ErrorActionPreference='Stop'` → launcher exits non-zero.
     Err(format!(
-        "{why} (code {code}). Open an elevated PowerShell and run:\n\
+        "launcher PowerShell exited with {status} (often = UAC cancelled, or PowerShell \
+         missing). Open an elevated PowerShell yourself and run:\n\
          powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
         script.display()
     ))
-}
-
-#[cfg(target_os = "windows")]
-fn to_wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
