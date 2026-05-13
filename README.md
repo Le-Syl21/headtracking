@@ -161,30 +161,54 @@ device path for libusb to enumerate, plugin reports zero devices.
 
 The release ZIP solves this in one click — see Option 1 below.
 
-##### Option 1 — One-click setup script (recommended)
+##### Option 1 — One-click setup from the demo (recommended)
 
-The Windows release ZIP includes a `setup/` folder with a
-double-clickable launcher that wires up the entire Windows USB stack
-for both Kinect generations:
+The Windows release ZIP includes a `setup/` folder with the WinUSB
+installer script and a fresh build of `headtracking-demo.exe` that
+knows how to launch it elevated:
 
 1. (Windows 7 only) install
    [Microsoft Security Advisory 3033929](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2015/3033929)
    first or USB keyboards/mice may stop working.
-2. Open the extracted release folder, navigate to `setup\`, and
-   **double-click `setup-kinect.cmd`**. Confirm the UAC prompt.
-3. Wait for the script to finish (~10–30 s).
+2. Plug in the Kinect, then double-click `headtracking-demo.exe`. If
+   no usable driver is bound, the app shows a yellow banner
+   *"⚠ Kinect plugged in but not accessible"* with an **Install
+   Kinect drivers (UAC prompt)** button.
+3. Click the button, confirm the UAC prompt. The PowerShell window
+   that opens shows a warning summary and asks you to **type `yes`**
+   to proceed — this is destructive for **BAM** head tracking and
+   any other software that depends on the Microsoft Kinect SDK
+   runtime (see the warning text for details). Type anything else
+   to abort without touching the system.
+4. Wait for the script to finish (~10–30 s), then hit **rescan** in
+   the demo's toolbar.
 
 That's it for both Kinect v1 and v2. Plug the Kinect, restart VPX.
+
+> ⚠ **Coexists with BAM?** No. BAM relies on the Microsoft Kinect
+> for Windows v2 SDK runtime, and this script removes that driver
+> in favour of WinUSB. If you want to go back to BAM afterwards,
+> reinstall the MS Kinect SDK runtime — there's no automated
+> rollback.
+
+Prefer the terminal? Open an elevated PowerShell and run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File setup\setup.ps1
+```
+
+(The `-ExecutionPolicy Bypass` matters — a fresh Windows defaults to
+`Restricted`/`RemoteSigned` and would otherwise refuse to run an
+unsigned local script.)
 
 What the script does, in order:
 
 | Step | Action |
 |---|---|
-| 1 | Adds `DenyDeviceIDs` registry entries for every Kinect v1 sub-device PID (Audio / Camera / Motor across 1414, 1473, KfW revisions) so Windows PnP stops re-binding `usbaudio.sys` between replugs. |
-| 2 | Same for Kinect v2 sensor PIDs, so Windows Update can't silently re-bind a Microsoft driver later. The hub PID (`02D9`) is deliberately *not* denied — it must keep `usbhub.sys` so the sensor can be enumerated downstream. |
-| 3 | Removes any currently-attached Kinect instance and deletes any leftover Kinect drivers from the Driver Store (legacy SDK, prior Zadig output, prior runs of this script). |
-| 4 | Pre-trusts the libwdi self-signed certificate that signs the bundled `.cat` files (so `pnputil` won't prompt or fail under HVCI), then `pnputil /add-driver /install` on the 9 WinUSB INF packages in `setup\drivers\` — covers every known Kinect VID/PID. |
-| 5 | `pnputil /scan-devices` re-enumerates USB so already-plugged Kinects pick up WinUSB without a physical replug — useful when the Kinect is hard-mounted in a pinball cabinet. |
+| 1 | Removes any currently-attached Kinect device instance from the system and **deletes every Kinect driver package from the Driver Store** — legacy Microsoft Kinect SDK runtime, leftover Zadig output, and our own kinect_v[12]_*.inf from previous runs. Cleans up any obsolete `DenyDeviceIDs` registry entries left by older versions of this script (they used to block PnP rebinding but caused FAILEDINSTALL more often than they helped). |
+| 2 | `pnputil /add-driver /install` on the 9 WinUSB INF/CAT packages in `setup\drivers\` — covers every known Kinect VID/PID. The bundled `.cat` files are signed by libwdi's self-signed cert, which the script pre-trusts in the certificate stores so `pnputil` doesn't prompt or fail under HVCI / Memory Integrity. |
+| 3 | Clears `CONFIGFLAG_FAILEDINSTALL` on any Kinect device still flagged as problem 28 by a previous failed run — PnP refuses to retry binding otherwise. |
+| 4 | `pnputil /scan-devices` re-enumerates USB so devices removed in step 1 (and unblocked in step 3) get re-bound to our freshly-installed WinUSB INF without a physical replug — useful when the Kinect is hard-mounted in a pinball cabinet. |
 
 After the script: every Kinect interface is bound to **WinUSB** (the
 Microsoft inbox kernel driver, signed at the kernel level — HVCI /
@@ -192,10 +216,9 @@ Memory Integrity safe). libusb claims them through its WinUSB
 backend, libfreenect/libfreenect2 enumerate normally, no Zadig
 required, no UsbDk required.
 
-Re-running the script is idempotent: registry entries are wiped and
-rewritten, missing devices are silently skipped, `pnputil
-/add-driver` is a no-op when the same INF is already in the Driver
-Store at the same DriverVer.
+Re-running the script is idempotent: missing devices are silently
+skipped, `pnputil /add-driver` is a no-op when the same INF is
+already in the Driver Store at the same DriverVer.
 
 ##### Verification
 
@@ -209,9 +232,9 @@ If it doesn't:
   `kinect_v1_*` or `kinect_v2_*` with `WinUSB Device` in the *Driver*
   tab.
 * If the entries still appear with a yellow `?` (no driver), the
-  script's `pnputil /add-driver` step failed — open `setup\dont_run.ps1`
-  output (visible in the script's console window) and look for `[FAIL]`
-  lines.
+  script's `pnputil /add-driver` step failed — the elevated
+  PowerShell window shows the `[FAIL]` lines; copy them when
+  reporting the issue.
 * Set `FREENECT_LOG_LEVEL=spew` and
   `HEADTRACKING_LOG=libfreenect=debug,info` before launching the demo
   to surface libfreenect's full USB transcript via `tracing`.
@@ -240,10 +263,10 @@ for this device* → *Scan for hardware changes*.
 
 ##### v2 needs USB 3.0 root-port bandwidth
 
-If you have a Kinect v2 and the `setup-kinect.cmd` script ran
-clean but the demo still doesn't see it, replug into a **dedicated
-USB 3.0 port** on the motherboard's back panel — the v2 needs the
-bandwidth of a root port and won't enumerate behind a shared hub.
+If you have a Kinect v2 and `setup.ps1` ran clean but the demo still
+doesn't see it, replug into a **dedicated USB 3.0 port** on the
+motherboard's back panel — the v2 needs the bandwidth of a root
+port and won't enumerate behind a shared hub.
 
 #### macOS
 
@@ -436,30 +459,54 @@ que ça démarre.**
 
 Le ZIP release règle ça en un clic — voir Option 1 ci-dessous.
 
-##### Option 1 — Script setup tout-en-un (recommandé)
+##### Option 1 — Installation en un clic depuis la démo (recommandé)
 
-Le ZIP release Windows inclut un dossier `setup/` avec un launcher
-double-cliquable qui câble toute la stack USB Windows pour les deux
-générations de Kinect :
+Le ZIP release Windows inclut un dossier `setup/` avec le script
+d'installation WinUSB et un `headtracking-demo.exe` qui sait le
+lancer élevé :
 
 1. (Windows 7 uniquement) installer d'abord
    [Microsoft Security Advisory 3033929](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2015/3033929)
    sinon les claviers/souris USB peuvent cesser de fonctionner.
-2. Ouvrir le dossier release extrait, aller dans `setup\`, et
-   **double-cliquer sur `setup-kinect.cmd`**. Confirmer l'UAC.
-3. Attendre que le script termine (~10–30 s).
+2. Brancher la Kinect, puis double-cliquer sur
+   `headtracking-demo.exe`. Si aucun driver utilisable n'est bindé,
+   l'appli affiche une bannière jaune *« ⚠ Kinect plugged in but
+   not accessible »* avec un bouton **Install Kinect drivers (UAC
+   prompt)**.
+3. Cliquer le bouton, confirmer l'UAC. La fenêtre PowerShell qui
+   s'ouvre affiche un résumé d'avertissement et te demande de
+   **taper `yes`** pour confirmer — l'opération est destructive
+   pour **BAM** et tout logiciel qui dépend du runtime Microsoft
+   Kinect SDK (détails dans le texte d'avertissement). Taper autre
+   chose annule sans rien toucher.
+4. Attendre la fin du script (~10–30 s), puis cliquer **rescan**
+   dans la barre d'outils de la démo.
 
 C'est tout, pour les deux Kinect v1 et v2. Brancher la Kinect, relancer VPX.
+
+> ⚠ **Cohabite avec BAM ?** Non. BAM dépend du runtime Microsoft
+> Kinect for Windows v2 SDK, et le script remplace ce driver par
+> WinUSB. Pour revenir à BAM ensuite, il faut réinstaller le
+> runtime MS Kinect SDK à la main — pas de rollback automatique.
+
+Tu préfères le terminal ? Ouvrir un PowerShell administrateur et lancer :
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File setup\setup.ps1
+```
+
+(Le `-ExecutionPolicy Bypass` est important — Windows neuf est par
+défaut en `Restricted`/`RemoteSigned` et refuserait sinon un script
+local non signé.)
 
 Ce que fait le script, dans l'ordre :
 
 | Étape | Action |
 |---|---|
-| 1 | Ajoute des entrées `DenyDeviceIDs` au registre pour chaque PID Kinect v1 sous-périphérique (Audio / Camera / Motor sur révs 1414, 1473, KfW), pour empêcher Windows PnP de re-binder `usbaudio.sys` entre les replugs. |
-| 2 | Idem pour les PIDs Kinect v2 sensor, pour que Windows Update ne re-bind pas silencieusement un driver Microsoft plus tard. Le PID hub (`02D9`) est délibérément *non* dans la deny-list — il doit garder `usbhub.sys` pour pouvoir énumérer le sensor downstream. |
-| 3 | Retire toute instance Kinect actuellement attachée et supprime tout driver Kinect résiduel du Driver Store (legacy SDK, output Zadig précédent, runs antérieurs de ce script). |
-| 4 | Pré-trust le certificat self-signé libwdi qui signe les `.cat` bundlés (sinon `pnputil` prompte ou échoue sous HVCI), puis `pnputil /add-driver /install` sur les 9 INFs WinUSB dans `setup\drivers\` — couvre tous les VID/PID Kinect connus. |
-| 5 | `pnputil /scan-devices` ré-énumère USB pour que les Kinect déjà branchées prennent WinUSB sans replug physique — utile quand la Kinect est câblée à demeure dans un pincab. |
+| 1 | Retire toute instance Kinect actuellement attachée et **supprime tous les packages de driver Kinect du Driver Store** — runtime Microsoft Kinect SDK legacy, output Zadig précédent, et nos propres kinect_v[12]_*.inf des runs antérieurs. Nettoie aussi les entrées `DenyDeviceIDs` obsolètes laissées par les anciennes versions du script (elles bloquaient le re-binding PnP mais causaient FAILEDINSTALL plus souvent qu'elles n'aidaient). |
+| 2 | `pnputil /add-driver /install` sur les 9 paquets WinUSB INF/CAT dans `setup\drivers\` — couvre tous les VID/PID Kinect connus. Les `.cat` bundlés sont signés par le certificat self-signé libwdi, que le script pré-trust dans les magasins de certificats pour que `pnputil` ne prompte pas ni n'échoue sous HVCI / Memory Integrity. |
+| 3 | Efface `CONFIGFLAG_FAILEDINSTALL` sur toute Kinect encore flaggée problème 28 par un run précédent échoué — sinon PnP refuse de réessayer le bind. |
+| 4 | `pnputil /scan-devices` ré-énumère USB pour que les devices retirés à l'étape 1 (et débloqués à l'étape 3) soient re-bindés à notre INF WinUSB fraîchement installé sans replug physique — utile quand la Kinect est câblée à demeure dans un pincab. |
 
 Après le script : chaque interface Kinect est bindée à **WinUSB** (le
 driver kernel inbox Microsoft, signé au niveau kernel — compatible
@@ -467,10 +514,9 @@ HVCI / Memory Integrity). libusb les claim via son backend WinUSB,
 libfreenect/libfreenect2 les énumèrent normalement, **pas de Zadig
 requis, pas de UsbDk requis**.
 
-Re-lancer le script est idempotent : entrées registre wipées et
-réécrites, devices manquants silencieusement skippés, `pnputil
-/add-driver` ne fait rien quand le même INF est déjà dans le Driver
-Store au même DriverVer.
+Re-lancer le script est idempotent : devices manquants silencieusement
+skippés, `pnputil /add-driver` ne fait rien quand le même INF est
+déjà dans le Driver Store au même DriverVer.
 
 ##### Vérification
 
@@ -484,9 +530,9 @@ Si pas le cas :
   comme `kinect_v1_*` ou `kinect_v2_*` avec `WinUSB Device` dans
   l'onglet *Driver*.
 * Si elles affichent encore un `?` jaune (pas de driver), le step
-  `pnputil /add-driver` du script a échoué — ouvrir la fenêtre
-  console du script (qui reste affichée) et chercher les lignes
-  `[FAIL]`.
+  `pnputil /add-driver` du script a échoué — la fenêtre PowerShell
+  élevée affiche les lignes `[FAIL]`, les copier pour le rapport
+  d'incident.
 * Mettre `FREENECT_LOG_LEVEL=spew` et
   `HEADTRACKING_LOG=libfreenect=debug,info` dans l'environnement
   avant de lancer le demo pour avoir le transcript USB complet de
@@ -519,11 +565,10 @@ driver software for this device* → *Scan for hardware changes*.
 
 ##### v2 demande la bande passante d'un port USB 3.0 racine
 
-Si tu as une Kinect v2 et que `setup-kinect.cmd` est passé sans
-erreur mais le demo ne la voit toujours pas, rebrancher sur un
-**port USB 3.0 dédié** au dos de la carte mère — la v2 a besoin
-de la bande passante d'un port racine et n'énumère pas derrière
-un hub partagé.
+Si tu as une Kinect v2 et que `setup.ps1` est passé sans erreur
+mais le demo ne la voit toujours pas, rebrancher sur un **port USB
+3.0 dédié** au dos de la carte mère — la v2 a besoin de la bande
+passante d'un port racine et n'énumère pas derrière un hub partagé.
 
 #### macOS
 

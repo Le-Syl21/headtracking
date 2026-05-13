@@ -447,10 +447,15 @@ jobs:
           done
 
       # Re-archive each per-OS folder into the platform's canonical
-      # archive type with a top-level directory wrapper. This way
-      # `unzip headtracking-X.Y.Z-windows-x86_64.zip` (or `tar xzf`)
-      # produces a `headtracking-X.Y.Z-windows-x86_64/` folder rather
-      # than dumping loose files into the user's working directory.
+      # archive type with files at the archive root (no wrapping
+      # directory). Rationale: GUI extractors on Windows (right-click
+      # → "Extract All...") and Linux (Files / Nautilus) already
+      # create a folder named after the archive when extracting, so
+      # an inner wrapping dir produces folder-in-folder
+      # (`headtracking-X.Y.Z-windows-x86_64/headtracking-X.Y.Z-windows-x86_64/...`).
+      # CLI users (`unzip`, `tar`) who want a clean folder can pass
+      # `-d <name>` / extract into a fresh subdir themselves — that's
+      # the price for matching what 95% of users actually do.
       - name: Repack artifacts for release
         shell: bash
         run: |
@@ -458,23 +463,21 @@ jobs:
           mkdir -p release-assets release-staging
           for d in dist/*/; do
             name=$(basename "$d")
-            # Move the per-target download dir under release-staging
-            # so the archive's internal path starts with $name/.
             mv "$d" "release-staging/$name"
             case "$name" in
-              *windows*) ( cd release-staging && zip -r "../release-assets/${name}.zip" "$name" ) ;;
-              *)         tar -C release-staging -czf "release-assets/${name}.tar.gz" "$name" ;;
+              *windows*) ( cd "release-staging/$name" && zip -r "../../release-assets/${name}.zip" . ) ;;
+              *)         tar -C "release-staging/$name" -czf "release-assets/${name}.tar.gz" . ;;
             esac
           done
           echo "--- release-assets ---"
           ls -lah release-assets/
           echo "--- archive top-level (sample) ---"
-          # Sanity-print the first archive's top-level entries — they
-          # should be a single `<name>/` directory.
+          # Sanity-print the first archive's entries — files should be
+          # at the root, no inner `<name>/` directory.
           first=$(ls release-assets/ | head -n1)
           case "$first" in
             *.zip)    unzip -l "release-assets/$first" | head -10 ;;
-            *.tar.gz) tar -tzf "release-assets/$first" | head -5 ;;
+            *.tar.gz) tar -tzf "release-assets/$first" | head -10 ;;
           esac
 
       - name: Create release

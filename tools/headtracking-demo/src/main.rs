@@ -8,8 +8,18 @@
 //!
 //! Run with `cargo run --release -p headtracking-demo`.
 
+// Suppress the inherited Windows console for release builds — tracing
+// writes to `headtracking-demo.log` next to the binary AND to the
+// in-app log panel, so the console window adds nothing and only
+// confuses end users. Debug builds keep stderr → console for the dev
+// loop (`cargo run`).
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal as _, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -116,8 +126,9 @@ fn detect_backends() -> Vec<BackendEntry> {
             //   n == 0  : libusb saw nothing matching VID 045E:02ae/02bf
             //             → no driver bound, or driver bound by another
             //             stack libusb can't drive. On Windows the
-            //             setup script (setup-kinect.cmd) installs
-            //             WinUSB INFs that fix this.
+            //             bundled `setup\setup.ps1` installs the WinUSB
+            //             INFs that fix this — the demo offers a
+            //             one-click banner that launches it elevated.
             //   n  > 0  : libusb saw the device descriptor and can
             //             open it.
             if n > 0 {
@@ -131,9 +142,9 @@ fn detect_backends() -> Vec<BackendEntry> {
                     "scan: kinect v1 — libfreenect counted 0 devices. \
                      On Windows that usually means the WinUSB driver \
                      hasn't been bound to the three Xbox NUI sub-devices \
-                     yet — run setup\\setup-kinect.cmd from the release \
-                     ZIP, or use Zadig to bind WinUSB manually. Check \
-                     the libfreenect log lines just above (set \
+                     yet — click the in-app 'Install Kinect drivers' \
+                     banner button (or run setup\\setup.ps1 elevated). \
+                     Check the libfreenect log lines just above (set \
                      FREENECT_LOG_LEVEL=spew for full USB trace)."
                 );
             }
@@ -178,8 +189,9 @@ fn detect_backends() -> Vec<BackendEntry> {
 //              sensor sits in Device Manager as "Other device".
 //   * macOS  — nothing; libusb opens the device as-is.
 // So: if a Kinect is on the USB bus but absent from the dropdown, offer a
-// one-click fix (drop the udev rule via pkexec/sudo on Linux; run the
-// bundled `setup\setup-kinect.cmd` WinUSB installer on Windows).
+// one-click fix (drop the udev rule via pkexec/sudo on Linux; spawn the
+// bundled `setup\setup.ps1` WinUSB installer elevated via
+// ShellExecuteW(runas) on Windows).
 
 // Banner copy — picked at compile time so the message names the real fix.
 #[cfg(target_os = "linux")]
@@ -323,9 +335,10 @@ fn kinect_present_but_not_set_up() -> bool {
 ///
 /// * Linux: stage libfreenect2's `90-kinect2.rules`, install it into
 ///   `/etc/udev/rules.d/` via `pkexec` then `sudo`, reload udev.
-/// * Windows: locate and launch `setup\setup-kinect.cmd` from the release
-///   layout (it self-elevates and binds WinUSB to every known Kinect
-///   VID/PID — see the project README).
+/// * Windows: locate `setup\setup.ps1` from the release layout and spawn
+///   it elevated via `ShellExecuteW(verb="runas")` on `powershell.exe`
+///   with `-ExecutionPolicy Bypass` (UAC prompt). The script binds WinUSB
+///   to every known Kinect VID/PID — see the project README.
 #[cfg(target_os = "linux")]
 fn fix_kinect_access() -> Result<(), String> {
     use std::io::ErrorKind;
@@ -372,37 +385,78 @@ SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02d9\", MODE=\"
 
 #[cfg(target_os = "windows")]
 fn fix_kinect_access() -> Result<(), String> {
-    use std::process::Command;
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
     let exe = std::env::current_exe().map_err(|e| format!("locating the executable: {e}"))?;
     let dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
-    // Release-ZIP layout puts the launcher under `setup\`; tolerate a flat
+    // Release-ZIP layout puts the script under `setup\`; tolerate a flat
     // layout and a `bin\` subdir too.
     let candidates = [
-        dir.join("setup").join("setup-kinect.cmd"),
-        dir.join("setup-kinect.cmd"),
-        dir.join("..").join("setup").join("setup-kinect.cmd"),
+        dir.join("setup").join("setup.ps1"),
+        dir.join("setup.ps1"),
+        dir.join("..").join("setup").join("setup.ps1"),
     ];
     let Some(script) = candidates.iter().find(|p| p.is_file()) else {
         return Err(format!(
-            "couldn't find setup\\setup-kinect.cmd next to {} — re-download the full release \
-             ZIP, or bind WinUSB by hand with Zadig (see the project README, \"Manual Zadig \
+            "couldn't find setup\\setup.ps1 next to {} — re-download the full release ZIP, or \
+             bind WinUSB by hand with Zadig (see the project README, \"Manual Zadig \
              fallback\"): v1 → Xbox NUI Audio/Camera/Motor; v2 → Xbox NUI Sensor (045E:02C4).",
             dir.display()
         ));
     };
+    let workdir = script.parent().unwrap_or(dir);
 
-    // `cmd /c start "" "<script>"` launches it in its own console (so its
-    // output is visible) and detached (so a UAC denial doesn't block us).
-    // The .cmd self-elevates on its own.
-    let workdir = script.parent().unwrap_or(dir).to_path_buf();
-    Command::new("cmd.exe")
-        .args(["/c", "start", ""])
-        .arg(script)
-        .current_dir(workdir)
-        .spawn()
-        .map_err(|e| format!("launching setup-kinect.cmd: {e}"))?;
-    Ok(())
+    // ShellExecuteW with verb "runas" pops the UAC consent dialog and
+    // spawns the target as Administrator. We invoke `powershell.exe`
+    // explicitly (with `-ExecutionPolicy Bypass`) because the default
+    // `.ps1` association on a fresh Windows opens Notepad — there's no
+    // shell verb to run a .ps1 elevated otherwise.
+    let file: Vec<u16> = to_wide("powershell.exe");
+    let verb: Vec<u16> = to_wide("runas");
+    let params: Vec<u16> = to_wide(&format!(
+        "-NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+        script.display()
+    ));
+    let workdir_w: Vec<u16> = to_wide(workdir.as_os_str());
+    const SW_SHOWNORMAL: i32 = 1;
+
+    // SAFETY: all four wide strings are nul-terminated (`to_wide` appends a
+    // `\0`); ShellExecuteW only reads them, doesn't take ownership.
+    let h = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            workdir_w.as_ptr(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Per the docs, ShellExecuteW returns an HINSTANCE > 32 on success;
+    // common failure codes: SE_ERR_ACCESSDENIED (5) when the user clicks
+    // No on the UAC prompt, ERROR_CANCELLED (1223) same thing on newer
+    // Windows, SE_ERR_FNF (2) for "file not found".
+    let code = h as isize;
+    if code > 32 {
+        return Ok(());
+    }
+    let why = match code {
+        2 => "powershell.exe not found",
+        5 | 1223 => "you cancelled the UAC prompt",
+        _ => "ShellExecuteW failed",
+    };
+    Err(format!(
+        "{why} (code {code}). Open an elevated PowerShell and run:\n\
+         powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+        script.display()
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn to_wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1627,18 +1681,82 @@ fn pose_delta_to_view_delta_vpu(dx_mm: f32, dy_mm: f32, dz_mm: f32) -> (f32, f32
 fn init_tracing(sink: Arc<Mutex<VecDeque<String>>>) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_env("HEADTRACKING_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .with_writer(std::io::stderr);
+
+    // Console layer — only when stderr is actually a terminal. On a fresh
+    // Windows release build (windows_subsystem = "windows") stderr is not
+    // attached, so we don't even register the layer; on a `cargo run` from
+    // a shell it lights up as usual.
+    let stderr_layer = std::io::stderr().is_terminal().then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(std::io::stderr)
+    });
+
+    // File layer — `headtracking-demo.log` next to the binary (append).
+    // Same on every OS so triage instructions ("send me your log") are
+    // uniform. If the file can't be opened (e.g. read-only Program Files
+    // install), we skip it silently — the in-app panel still works.
+    let file_layer = open_log_file().map(|f| {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(FileSink {
+                inner: Arc::new(Mutex::new(f)),
+            })
+    });
+
     let panel_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
         .with_writer(LogQueue { sink });
+
     tracing_subscriber::registry()
         .with(env_filter)
         .with(stderr_layer)
+        .with(file_layer)
         .with(panel_layer)
         .init();
+}
+
+/// Open `headtracking-demo.log` next to the executable in append mode.
+/// Returns `None` when the executable path can't be resolved or the file
+/// can't be opened (read-only install dir, missing permissions) — the
+/// caller drops the file layer in that case.
+fn open_log_file() -> Option<std::fs::File> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.join("headtracking-demo.log");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()
+}
+
+/// `MakeWriter` over a shared `File`. Each formatted event locks the file
+/// for the duration of its write — fine here, the demo is mostly
+/// single-threaded and tracing events are small. Avoids pulling
+/// `tracing-appender` just for this.
+#[derive(Clone)]
+struct FileSink {
+    inner: Arc<Mutex<std::fs::File>>,
+}
+
+impl<'a> MakeWriter<'a> for FileSink {
+    type Writer = FileGuard<'a>;
+    fn make_writer(&'a self) -> FileGuard<'a> {
+        FileGuard(self.inner.lock())
+    }
+}
+
+struct FileGuard<'a>(parking_lot::MutexGuard<'a, std::fs::File>);
+
+impl Write for FileGuard<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0.write(data)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 #[derive(Clone)]
