@@ -217,16 +217,17 @@ const KINECT_ACCESS_BUTTON: &str = "";
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 const KINECT_ACCESS_OK_NOTE: &str = "";
 
-/// `true` when `detect_backends` should have found a Kinect but didn't, and
-/// the reason is the missing OS access prerequisite (so the fix banner is
-/// worth showing). Always `false` on macOS.
-fn compute_kinect_access_hint(available: &[BackendEntry]) -> bool {
-    let kinect_listed = available
-        .iter()
-        .any(|e| matches!(e.backend, Backend::KinectV1 | Backend::KinectV2));
-    if kinect_listed {
-        return false;
-    }
+/// `true` when at least one Kinect on the USB bus lacks its OS access
+/// prerequisite (Linux udev rule / Windows WinUSB binding), so the fix
+/// banner is worth showing. Always `false` on macOS.
+///
+/// We deliberately *don't* short-circuit on "a Kinect is already in the
+/// dropdown" — on Linux, libfreenect's v1 enumeration (`freenect_num_devices`)
+/// doesn't need device access, so a v1 with no udev rule still shows up in
+/// the dropdown but errors out at open time with EACCES. The presence-in-
+/// dropdown signal is therefore unreliable; `kinect_present_but_not_set_up`
+/// is the only authoritative source.
+fn compute_kinect_access_hint() -> bool {
     if !kinect_present_but_not_set_up() {
         return false;
     }
@@ -783,7 +784,7 @@ struct Baseline {
 impl App {
     fn new(logs: Arc<Mutex<VecDeque<String>>>) -> Self {
         let available = detect_backends();
-        let kinect_access_hint = compute_kinect_access_hint(&available);
+        let kinect_access_hint = compute_kinect_access_hint();
         Self {
             selected: Backend::None,
             available,
@@ -813,7 +814,7 @@ impl App {
         }
         self.selected = Backend::None;
         self.available = detect_backends();
-        self.kinect_access_hint = compute_kinect_access_hint(&self.available);
+        self.kinect_access_hint = compute_kinect_access_hint();
         self.kinect_access_result = None;
     }
 
