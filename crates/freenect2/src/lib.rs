@@ -29,7 +29,7 @@ use cxx::UniquePtr;
 use parking_lot::Mutex;
 
 use freenect2_sys as sys;
-pub use freenect2_sys::{DepthFrame, IrCameraParams, RgbFrame};
+pub use freenect2_sys::{DepthFrame, IrCameraParams, RgbFrame, take_last_log_error};
 
 /// Top-level libfreenect2 context. Construct one per process; opening multiple
 /// devices off the same context is supported by libfreenect2 itself.

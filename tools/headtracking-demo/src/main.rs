@@ -1600,20 +1600,18 @@ fn open_backend(b: Backend) -> Result<Active, String> {
 
 fn open_kinect_v2() -> Result<Active, String> {
     let ctx = freenect2::Context::new().map_err(|e| format!("freenect2 Context::new: {e}"))?;
+    // Drain any stale libfreenect2 error from a previous call before we
+    // run the one whose error we want to surface.
+    let _ = freenect2::take_last_log_error();
     let count = ctx.enumerate();
     if count <= 0 {
-        // Distinguish "really not plugged in" from "plugged in but
-        // libusb can't open it" (the common case on Linux without
-        // udev rules / on Windows without WinUSB). On Linux we can
-        // probe sysfs cheaply; otherwise fall back to a generic
-        // message that points at the banner.
-        #[cfg(target_os = "linux")]
-        if linux_v2_present_on_usb() {
-            return Err(
-                "Kinect v2 on USB but libfreenect2 cannot open it (LIBUSB_ERROR_ACCESS) — \
-                 install the udev rule via the banner above, then click 'rescan'."
-                    .to_string(),
-            );
+        // `enumerate()` returns 0 with no `Err` for two distinct cases:
+        // "really not plugged in" and "plugged in but libusb_open
+        // failed". libfreenect2 logs the latter ("failed to open Kinect
+        // v2: … LIBUSB_ERROR_ACCESS") via the bridge; pop that line
+        // and use it verbatim so the UI shows the actual C++ reason.
+        if let Some(reason) = freenect2::take_last_log_error() {
+            return Err(reason);
         }
         return Err("no Kinect v2 found on USB".to_string());
     }

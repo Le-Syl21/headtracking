@@ -10,13 +10,34 @@
 //! `poll_depth` from any thread, but `start`/`stop`/`open_default` should be
 //! treated as single-threaded ownership of the device.
 
+use std::cell::RefCell;
+
+thread_local! {
+    /// Most recent `Error`-level message emitted by libfreenect2 on this
+    /// thread. Populated by the logger bridge; drained by
+    /// [`take_last_log_error`] so callers can surface the precise C++
+    /// reason (e.g. "failed to open Kinect v2: ... LIBUSB_ERROR_ACCESS")
+    /// in their own `Result::Err` instead of inventing a generic string.
+    ///
+    /// Thread-local so a v1 open on the tracker thread can't poison a
+    /// v2 open on the main thread, and so packet-pipeline worker threads
+    /// that emit error logs during streaming don't overwrite the slot the
+    /// caller is about to read.
+    static LAST_LOG_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 /// Forward a libfreenect2 internal log message into Rust tracing.
 /// Called from C++ on whichever thread libfreenect2 was on (USB IO,
 /// packet pipeline worker, …) — `tracing` macros are thread-safe.
 ///
 /// `level` matches `libfreenect2::Logger::Level`: 1=Error, 2=Warning,
-/// 3=Info, 4=Debug. Anything else is dropped.
+/// 3=Info, 4=Debug. Anything else is dropped. Error messages are also
+/// stashed in [`LAST_LOG_ERROR`] (per-thread) so callers can read the
+/// last C++ reason verbatim — see [`take_last_log_error`].
 fn freenect2_log_forward(level: u32, message: &str) {
+    if level == 1 {
+        LAST_LOG_ERROR.with(|cell| *cell.borrow_mut() = Some(message.to_string()));
+    }
     match level {
         1 => tracing::error!(target: "libfreenect2", "{}", message),
         2 => tracing::warn!(target: "libfreenect2", "{}", message),
@@ -24,6 +45,16 @@ fn freenect2_log_forward(level: u32, message: &str) {
         4 => tracing::debug!(target: "libfreenect2", "{}", message),
         _ => {}
     }
+}
+
+/// Take and clear the most recent `Error`-level libfreenect2 message
+/// observed on the calling thread. Returns `None` if no error has been
+/// logged since the last `take_*`. Use this right after a libfreenect2
+/// call that failed silently (e.g. `enumerate()` returning 0, or
+/// `open_default()` returning a null pointer) to recover the precise
+/// C++-side reason.
+pub fn take_last_log_error() -> Option<String> {
+    LAST_LOG_ERROR.with(|cell| cell.borrow_mut().take())
 }
 
 #[cxx::bridge(namespace = "freenect2_shim")]
