@@ -9,6 +9,7 @@
 
 #include <libfreenect2/libfreenect2.hpp>
 #include <libfreenect2/frame_listener.hpp>
+#include <libfreenect2/logger.h>
 
 #include <atomic>
 #include <cstdint>
@@ -75,7 +76,21 @@ struct Freenect2Dev {
     Freenect2Dev &operator=(const Freenect2Dev &) = delete;
 };
 
+// Subclass of libfreenect2's Logger that forwards each log call into
+// Rust tracing. The bridge in `lib.rs` declares the Rust receiver
+// `freenect2_log_forward(u32, &str)`. Heap-allocated and handed to
+// `libfreenect2::setGlobalLogger`, which takes ownership and frees
+// the previous logger when replaced.
+class RustLogger : public libfreenect2::Logger {
+public:
+    explicit RustLogger(libfreenect2::Logger::Level lvl);
+    libfreenect2::Logger::Level level() const override;
+    void log(libfreenect2::Logger::Level level,
+             const std::string &message) override;
+};
+
 // Free functions exposed through the cxx bridge.
+void install_logger(uint32_t level);
 std::unique_ptr<Freenect2Ctx> new_context();
 int32_t enumerate(Freenect2Ctx &ctx);
 std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx);

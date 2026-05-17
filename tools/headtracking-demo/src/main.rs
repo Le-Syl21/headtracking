@@ -1602,6 +1602,19 @@ fn open_kinect_v2() -> Result<Active, String> {
     let ctx = freenect2::Context::new().map_err(|e| format!("freenect2 Context::new: {e}"))?;
     let count = ctx.enumerate();
     if count <= 0 {
+        // Distinguish "really not plugged in" from "plugged in but
+        // libusb can't open it" (the common case on Linux without
+        // udev rules / on Windows without WinUSB). On Linux we can
+        // probe sysfs cheaply; otherwise fall back to a generic
+        // message that points at the banner.
+        #[cfg(target_os = "linux")]
+        if linux_v2_present_on_usb() {
+            return Err(
+                "Kinect v2 on USB but libfreenect2 cannot open it (LIBUSB_ERROR_ACCESS) — \
+                 install the udev rule via the banner above, then click 'rescan'."
+                    .to_string(),
+            );
+        }
         return Err("no Kinect v2 found on USB".to_string());
     }
     let device = ctx

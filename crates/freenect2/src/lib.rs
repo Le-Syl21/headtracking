@@ -37,9 +37,37 @@ pub struct Context {
     inner: Mutex<UniquePtr<sys::Freenect2Ctx>>,
 }
 
+/// Install our Rust-forwarding logger as libfreenect2's global logger
+/// the first time any `Context` is built. Default cap is `Info` to match
+/// libfreenect2's own default; `LIBFREENECT2_LOGGER_LEVEL=Debug` (the same
+/// env var the upstream ConsoleLogger honours) bumps it to Debug for
+/// debugging USB enumeration / packet pipeline issues. We deliberately
+/// open the floodgates at the C++ side and let Rust's `tracing` env
+/// filter (`HEADTRACKING_LOG=libfreenect2=debug`) do the runtime
+/// filtering — single config point.
+fn ensure_logger_installed() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let level: u32 = std::env::var("LIBFREENECT2_LOGGER_LEVEL")
+            .ok()
+            .and_then(|s| match s.to_ascii_lowercase().trim() {
+                "none" => Some(0),
+                "error" => Some(1),
+                "warning" | "warn" => Some(2),
+                "info" => Some(3),
+                "debug" => Some(4),
+                _ => None,
+            })
+            .unwrap_or(3);
+        sys::install_logger(level);
+    });
+}
+
 impl Context {
     /// Build a fresh libfreenect2 context. Cheap; does not touch USB yet.
     pub fn new() -> Result<Self, Error> {
+        ensure_logger_installed();
         let ctx = sys::new_context();
         if ctx.is_null() {
             return Err(Error::ContextInit);

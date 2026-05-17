@@ -9,6 +9,31 @@
 
 namespace freenect2_shim {
 
+RustLogger::RustLogger(libfreenect2::Logger::Level lvl) {
+    level_ = lvl;
+}
+
+libfreenect2::Logger::Level RustLogger::level() const {
+    return level_;
+}
+
+void RustLogger::log(libfreenect2::Logger::Level level,
+                     const std::string &message) {
+    // cxx's `rust::Str` is a non-owning UTF-8 view; libfreenect2 hands
+    // us ASCII/UTF-8 messages, so the conversion is safe.
+    freenect2_log_forward(static_cast<uint32_t>(level),
+                          rust::Str(message.data(), message.size()));
+}
+
+void install_logger(uint32_t level) {
+    // setGlobalLogger takes ownership and deletes any previously-
+    // installed logger. Allocating a fresh RustLogger on every call
+    // keeps the API idempotent — repeated calls just replace the
+    // current logger.
+    libfreenect2::setGlobalLogger(new RustLogger(
+        static_cast<libfreenect2::Logger::Level>(level)));
+}
+
 bool DepthSink::onNewFrame(libfreenect2::Frame::Type type,
                            libfreenect2::Frame *frame) {
     if (type != libfreenect2::Frame::Depth) {

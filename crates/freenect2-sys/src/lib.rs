@@ -10,6 +10,22 @@
 //! `poll_depth` from any thread, but `start`/`stop`/`open_default` should be
 //! treated as single-threaded ownership of the device.
 
+/// Forward a libfreenect2 internal log message into Rust tracing.
+/// Called from C++ on whichever thread libfreenect2 was on (USB IO,
+/// packet pipeline worker, …) — `tracing` macros are thread-safe.
+///
+/// `level` matches `libfreenect2::Logger::Level`: 1=Error, 2=Warning,
+/// 3=Info, 4=Debug. Anything else is dropped.
+fn freenect2_log_forward(level: u32, message: &str) {
+    match level {
+        1 => tracing::error!(target: "libfreenect2", "{}", message),
+        2 => tracing::warn!(target: "libfreenect2", "{}", message),
+        3 => tracing::info!(target: "libfreenect2", "{}", message),
+        4 => tracing::debug!(target: "libfreenect2", "{}", message),
+        _ => {}
+    }
+}
+
 #[cxx::bridge(namespace = "freenect2_shim")]
 mod ffi {
     /// Depth frame copied out of libfreenect2's internal buffer.
@@ -50,6 +66,12 @@ mod ffi {
         pub p2: f32,
     }
 
+    extern "Rust" {
+        /// Bridge symbol called from the C++ `RustLogger`. Must match the
+        /// free function defined above; cxx generates the trampoline.
+        fn freenect2_log_forward(level: u32, message: &str);
+    }
+
     unsafe extern "C++" {
         include!("shim.h");
 
@@ -58,6 +80,13 @@ mod ffi {
 
         /// Wraps a `libfreenect2::Freenect2Device*` plus our depth FrameListener.
         type Freenect2Dev;
+
+        /// Install a `RustLogger` as libfreenect2's global logger, capped
+        /// at the given verbosity. `level` matches
+        /// `libfreenect2::Logger::Level`: 1=Error, 2=Warning, 3=Info,
+        /// 4=Debug. Replaces (and frees) any previously-installed logger.
+        /// Idempotent — call once at startup.
+        fn install_logger(level: u32);
 
         /// Construct a libfreenect2 context. Cheap; does not yet enumerate.
         fn new_context() -> UniquePtr<Freenect2Ctx>;
@@ -93,8 +122,8 @@ mod ffi {
 
 pub use ffi::{DepthFrame, Freenect2Ctx, Freenect2Dev, IrCameraParams, RgbFrame};
 pub use ffi::{
-    enumerate, ir_params, new_context, open_default, poll_depth, poll_rgb, start_depth,
-    start_streams, stop_device,
+    enumerate, install_logger, ir_params, new_context, open_default, poll_depth, poll_rgb,
+    start_depth, start_streams, stop_device,
 };
 
 // SAFETY: libfreenect2 spawns its own internal worker threads; the

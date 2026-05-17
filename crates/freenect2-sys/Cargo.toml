@@ -10,6 +10,10 @@ publish = false
 
 [dependencies]
 cxx = "1.0"
+# Forward libfreenect2's internal Logger calls into Rust tracing —
+# `lib.rs` exposes an `extern "Rust"` callback the C++ shim invokes
+# from its RustLogger subclass.
+tracing = "0.1"
 # Vendored libjpeg-turbo so libfreenect2's RGB packet processor links
 # against a PIC-enabled static archive — Ubuntu's `libturbojpeg.a` is
 # non-PIC and refuses to land in a cdylib.
