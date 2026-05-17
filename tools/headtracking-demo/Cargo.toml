@@ -1,6 +1,6 @@
 [package]
 name = "headtracking-demo"
-version = "0.0.11"
+version = "0.0.12"
 edition.workspace = true
 license.workspace = true
 description = "Standalone visualization of the Kinect / webcam head-tracker (RGB + face bbox + VPX delta + logs)"
@@ -21,3 +21,8 @@ parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 os_info = { version = "3", default-features = false }
+# PNG encoder for the in-app screenshot button (saves the latest RGB
+# frame next to the binary, named after the active device + timestamp).
+# Already in the lockfile as a transitive dep — listing it here just
+# makes the direct usage explicit, no extra build cost.
+png = "0.17"

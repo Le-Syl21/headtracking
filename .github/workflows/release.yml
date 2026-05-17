@@ -464,6 +464,21 @@ jobs:
           for d in dist/*/; do
             name=$(basename "$d")
             mv "$d" "release-staging/$name"
+            # `actions/upload-artifact` round-trips through a zip blob,
+            # which doesn't preserve POSIX executable bits. Files come
+            # back from `download-artifact` as 0644, so the demo binary
+            # is non-executable when end-users extract the tarball
+            # (macOS testers hit this hardest — Gatekeeper friction on
+            # top of a missing `+x`). Restore the bit before re-archiving.
+            # Windows is unaffected (`.exe` extension is what matters).
+            case "$name" in
+              *windows*) : ;;
+              *)
+                for bin in headtracking-demo libheadtracking.so libheadtracking.dylib; do
+                  [ -e "release-staging/$name/$bin" ] && chmod +x "release-staging/$name/$bin" || true
+                done
+                ;;
+            esac
             case "$name" in
               *windows*) ( cd "release-staging/$name" && zip -r "../../release-assets/${name}.zip" . ) ;;
               *)         tar -C "release-staging/$name" -czf "release-assets/${name}.tar.gz" . ;;

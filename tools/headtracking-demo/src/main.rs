@@ -180,9 +180,10 @@ fn detect_backends() -> Vec<BackendEntry> {
 //
 // A Kinect only shows up in `detect_backends` if libusb can actually open
 // it, and that has an OS-level prerequisite:
-//   * Linux  — a udev rule giving the USB node 0666 (libfreenect2 ships
-//              `90-kinect2.rules` for exactly this); without it
-//              `freenect2::Context::enumerate()` probes each candidate,
+//   * Linux  — a udev rule giving each Kinect USB node 0666 (libfreenect
+//              ships `66-kinect.rules` for v1 PIDs, libfreenect2 ships
+//              `90-kinect2.rules` for v2 PIDs); without them
+//              `freenect{,2}::Context::enumerate()` probes each candidate,
 //              hits `LIBUSB_ERROR_ACCESS`, and silently drops it.
 //   * Windows — a libusb-capable kernel driver (WinUSB) bound to the
 //              Kinect interfaces; a fresh Windows binds nothing, the
@@ -195,7 +196,8 @@ fn detect_backends() -> Vec<BackendEntry> {
 
 // Banner copy — picked at compile time so the message names the real fix.
 #[cfg(target_os = "linux")]
-const KINECT_ACCESS_PROBLEM: &str = "— libfreenect2 needs a udev rule (0666) to open the sensor.";
+const KINECT_ACCESS_PROBLEM: &str =
+    "— libfreenect / libfreenect2 need a udev rule (0666) to open the sensor.";
 #[cfg(target_os = "linux")]
 const KINECT_ACCESS_BUTTON: &str = "Install udev rule (asks for password)";
 #[cfg(target_os = "linux")]
@@ -240,28 +242,45 @@ fn compute_kinect_access_hint(available: &[BackendEntry]) -> bool {
     true
 }
 
-/// Linux: a Kinect v2 USB device is plugged in (`045e:02c4` / `02d8` /
-/// `02d9`, read from sysfs without privileges) and no udev rule mentioning
-/// it exists in the standard rules directories.
+/// Linux: any Kinect v1 (Xbox 360 model 1414: `02ae`/`02ad`/`02b0`;
+/// Kinect-for-Windows model 1473: `02c2`/`02be`/`02bf`) or Kinect v2
+/// (`02c4`/`02d8`/`02d9`) USB device is plugged in (read from sysfs without
+/// privileges) and at least one of the present PIDs isn't covered by any
+/// udev rule under the standard rules directories. Returns true if so —
+/// the banner needs to fire.
 #[cfg(target_os = "linux")]
 fn kinect_present_but_not_set_up() -> bool {
-    let sysfs_has_v2 = std::fs::read_dir("/sys/bus/usb/devices")
+    use std::collections::HashSet;
+
+    // PIDs libfreenect / libfreenect2 need 0666 on to open over libusb.
+    const KINECT_PIDS: &[&str] = &[
+        "02ae", "02ad", "02b0", // v1 Xbox 360 (1414): camera, audio, motor
+        "02c2", "02be", "02bf", // v1 Kinect for Windows (1473): camera, audio, motor
+        "02c4", "02d8", "02d9", // v2: sensor, firmware-update, adapter hub
+    ];
+
+    let present: HashSet<String> = std::fs::read_dir("/sys/bus/usb/devices")
         .into_iter()
         .flatten()
         .flatten()
-        .any(|entry| {
+        .filter_map(|entry| {
             let dir = entry.path();
             let id = |name: &str| {
                 std::fs::read_to_string(dir.join(name))
                     .ok()
                     .map(|s| s.trim().to_ascii_lowercase())
             };
-            id("idVendor").as_deref() == Some("045e")
-                && matches!(id("idProduct").as_deref(), Some("02c4" | "02d8" | "02d9"))
-        });
-    if !sysfs_has_v2 {
+            if id("idVendor").as_deref() != Some("045e") {
+                return None;
+            }
+            let pid = id("idProduct")?;
+            KINECT_PIDS.contains(&pid.as_str()).then_some(pid)
+        })
+        .collect();
+    if present.is_empty() {
         return false;
     }
+
     const RULES_DIRS: &[&str] = &[
         "/etc/udev/rules.d",
         "/run/udev/rules.d",
@@ -269,20 +288,33 @@ fn kinect_present_but_not_set_up() -> bool {
         "/usr/lib/udev/rules.d",
         "/lib/udev/rules.d",
     ];
-    let rule_present = RULES_DIRS
+    // A PID is "covered" iff some `.rules` file mentions BOTH `045e` and
+    // that PID — same per-file conjunction the v2-only check used,
+    // generalised to the union of detected PIDs.
+    let mut covered: HashSet<String> = HashSet::new();
+    for path in RULES_DIRS
         .iter()
         .flat_map(std::fs::read_dir)
         .flatten()
         .flatten()
-        .any(|entry| {
-            let path = entry.path();
-            path.extension().and_then(|e| e.to_str()) == Some("rules")
-                && std::fs::read_to_string(&path).is_ok_and(|t| {
-                    let l = t.to_ascii_lowercase();
-                    l.contains("045e") && l.contains("02c4")
-                })
-        });
-    !rule_present
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rules"))
+    {
+        let Ok(txt) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lower = txt.to_ascii_lowercase();
+        if !lower.contains("045e") {
+            continue;
+        }
+        for pid in &present {
+            if lower.contains(pid.as_str()) {
+                covered.insert(pid.clone());
+            }
+        }
+    }
+    // Banner fires if at least one present Kinect PID has no rule.
+    !present.is_subset(&covered)
 }
 
 /// Windows: a Kinect (v1 sub-device or v2 sensor) is present on the USB
@@ -333,8 +365,9 @@ fn kinect_present_but_not_set_up() -> bool {
 /// kicked off (the user still has to confirm an elevation prompt and wait);
 /// `Err` carries a fallback hint for the UI to display.
 ///
-/// * Linux: stage libfreenect2's `90-kinect2.rules`, install it into
-///   `/etc/udev/rules.d/` via `pkexec` then `sudo`, reload udev.
+/// * Linux: stage a combined v1 + v2 rules file (`90-kinect.rules`) and
+///   install it into `/etc/udev/rules.d/` via `pkexec` then `sudo`, then
+///   reload udev.
 /// * Windows: locate `setup\setup.ps1` from the release layout and spawn
 ///   a hidden non-elevated PowerShell that calls
 ///   `Start-Process -Verb RunAs` on `powershell.exe -ExecutionPolicy
@@ -345,20 +378,32 @@ fn fix_kinect_access() -> Result<(), String> {
     use std::io::ErrorKind;
     use std::process::Command;
 
-    // Inlined copy of crates/freenect2-sys/vendor/libfreenect2/platform/
-    // linux/udev/90-kinect2.rules so the installer works from a release
-    // build that doesn't ship the submodule.
+    // Combined v1 + v2 rules — merge of libfreenect's 66-kinect.rules
+    // (v1 PIDs) and libfreenect2's 90-kinect2.rules (v2 PIDs), inlined
+    // so the installer works from a release build that doesn't ship
+    // the submodules. MODE 0666 to drop the GROUP=video requirement
+    // libfreenect's upstream rule uses (no group membership to manage).
     const RULES: &str = "\
-# Kinect for Windows v2 — USB access for libfreenect2.
-# Installed by headtracking-demo. Upstream: libfreenect2 90-kinect2.rules.
+# Kinect v1 + v2 — USB access for libfreenect / libfreenect2.
+# Installed by headtracking-demo. Upstream sources: libfreenect
+# 66-kinect.rules and libfreenect2 90-kinect2.rules, merged here.
+# v1 Xbox 360 (model 1414):
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02ae\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02ad\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02b0\", MODE=\"0666\"
+# v1 Kinect for Windows (model 1473):
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02c2\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02be\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02bf\", MODE=\"0666\"
+# v2 sensor + firmware-update + adapter hub:
 SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02c4\", MODE=\"0666\"
 SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02d8\", MODE=\"0666\"
 SUBSYSTEM==\"usb\", ATTR{idVendor}==\"045e\", ATTR{idProduct}==\"02d9\", MODE=\"0666\"
 ";
-    let staged = std::env::temp_dir().join("headtracking-90-kinect2.rules");
+    let staged = std::env::temp_dir().join("headtracking-90-kinect.rules");
     std::fs::write(&staged, RULES).map_err(|e| format!("staging rules file: {e}"))?;
     let inner = format!(
-        "set -e; install -m 0644 '{}' /etc/udev/rules.d/90-kinect2.rules; \
+        "set -e; install -m 0644 '{}' /etc/udev/rules.d/90-kinect.rules; \
          udevadm control --reload-rules; udevadm trigger",
         staged.display()
     );
@@ -470,6 +515,10 @@ struct App {
     /// `Err` carries a fallback hint (manual command line / "re-download
     /// the release ZIP"). Cleared on rescan.
     kinect_access_result: Option<Result<String, String>>,
+    /// Outcome of the last "Screenshot" click — kept until the next click
+    /// (or backend change) so the user has time to read the saved path.
+    /// `Ok` carries the full saved path, `Err` carries the failure reason.
+    screenshot_status: Option<Result<std::path::PathBuf, String>>,
 }
 
 impl App {
@@ -509,6 +558,10 @@ struct Active {
     /// at 320×320 on CPU.
     face_detector: Option<face::Detector>,
     last_faces: Vec<face::FaceDetection>,
+    /// Latest RGB888 frame (width, height, bytes) — kept so the
+    /// "Screenshot" button can write it to disk without re-grabbing
+    /// from the device. `None` until the first frame arrives.
+    last_rgb_frame: Option<(u32, u32, Vec<u8>)>,
 }
 
 mod filter_alias {
@@ -739,6 +792,7 @@ impl App {
             logs,
             kinect_access_hint,
             kinect_access_result: None,
+            screenshot_status: None,
         }
     }
 
@@ -807,13 +861,15 @@ impl App {
         match &mut active.inner {
             Inner::KinectV2 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
+                    // Convert BGRX → RGB888 once; both the face detector
+                    // and the screenshot button want packed RGB.
+                    let rgb888 = bgrx_to_rgb888(&rgb.data);
                     if let Some(detector) = active.face_detector.as_ref() {
-                        // YuNet wants RGB888; v2 ships BGRX. Convert in place.
-                        let rgb888 = bgrx_to_rgb888(&rgb.data);
                         active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
                     }
                     let img = bgrx_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
+                    active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
                 }
                 if let Some(depth) = device.poll_depth() {
                     // Prefer face-anchored depth sampling: the face detector
@@ -853,6 +909,7 @@ impl App {
                     }
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
+                    active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
                 }
                 if let Some(depth) = device.poll_depth() {
                     // libfreenect ships u16 mm; widen for the shared algo.
@@ -900,6 +957,7 @@ impl App {
                     }
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
+                    active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
                 }
             }
         }
@@ -1083,6 +1141,45 @@ impl eframe::App for App {
                     });
                 if ui.small_button("rescan").clicked() {
                     self.refresh_available();
+                }
+                // Screenshot: writes the latest RGB frame next to the
+                // binary as `<backend-slug>_<YYYYMMDD-HHMMSS>.png`.
+                // Disabled until a frame has been received.
+                let shot_ready = self
+                    .active
+                    .as_ref()
+                    .is_some_and(|a| a.last_rgb_frame.is_some());
+                let shot_resp = ui.add_enabled(
+                    shot_ready,
+                    egui::Button::new("📷 screenshot").small(),
+                );
+                if shot_resp.clicked()
+                    && let Some(active) = self.active.as_ref()
+                    && let Some((w, h, bytes)) = active.last_rgb_frame.as_ref()
+                {
+                    let slug = backend_slug(active.backend);
+                    self.screenshot_status = Some(save_rgb_screenshot(&slug, *w, *h, bytes));
+                    match &self.screenshot_status {
+                        Some(Ok(p)) => info!(path = %p.display(), "screenshot saved"),
+                        Some(Err(e)) => error!(error = %e, "screenshot failed"),
+                        None => {}
+                    }
+                }
+                if let Some(status) = &self.screenshot_status {
+                    match status {
+                        Ok(path) => ui.label(
+                            RichText::new(format!(
+                                "saved → {}",
+                                path.file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("(?)")
+                            ))
+                            .color(Color32::from_rgb(0x90, 0xee, 0x90))
+                            .small(),
+                        )
+                        .on_hover_text(path.display().to_string()),
+                        Err(e) => ui.colored_label(Color32::LIGHT_RED, format!("save failed: {e}")),
+                    };
                 }
                 ui.separator();
                 if let Some(active) = self.active.as_mut()
@@ -1495,6 +1592,7 @@ fn open_kinect_v2() -> Result<Active, String> {
         last_lockbar: None,
         face_detector: detector,
         last_faces: Vec::new(),
+        last_rgb_frame: None,
     })
 }
 
@@ -1557,6 +1655,7 @@ fn open_kinect_v1() -> Result<Active, String> {
         last_lockbar: None,
         face_detector: detector,
         last_faces: Vec::new(),
+        last_rgb_frame: None,
     })
 }
 
@@ -1605,6 +1704,7 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         last_lockbar: None,
         face_detector: detector,
         last_faces: Vec::new(),
+        last_rgb_frame: None,
     })
 }
 
@@ -1648,6 +1748,76 @@ fn rgb888_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
         size: [width as usize, height as usize],
         pixels,
     }
+}
+
+// ============================================================ Screenshot
+
+/// Compact slug for a backend, used in screenshot filenames. Mirrors the
+/// dropdown label but stripped of spaces / punctuation so the file is
+/// easy to grep and predictable in shells.
+fn backend_slug(b: Backend) -> String {
+    match b {
+        Backend::None => "demo".to_string(),
+        Backend::KinectV1 => "kinect-v1".to_string(),
+        Backend::KinectV2 => "kinect-v2".to_string(),
+        Backend::Webcam(i) => format!("webcam-{i}"),
+    }
+}
+
+/// Format a UNIX-epoch-seconds value as `YYYYMMDD-HHMMSS` in UTC.
+/// Inlined to avoid pulling `time` / `chrono` for one timestamp.
+/// Algorithm: Howard Hinnant's civil-from-days. Valid 1970-01-01 → 9999.
+fn format_utc_stamp(secs: u64) -> String {
+    let total_days = (secs / 86_400) as i64;
+    let secs_in_day = secs % 86_400;
+    let h = secs_in_day / 3600;
+    let m = (secs_in_day / 60) % 60;
+    let s = secs_in_day % 60;
+    let days = total_days + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y_civil = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month_civil = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = y_civil + i64::from(mp >= 10);
+    format!("{y:04}{month_civil:02}{d:02}-{h:02}{m:02}{s:02}")
+}
+
+/// Encode an RGB888 buffer as PNG and write it next to the running
+/// executable. Returns the saved path on success. Used by the
+/// "Screenshot" toolbar button.
+fn save_rgb_screenshot(
+    slug: &str,
+    width: u32,
+    height: u32,
+    rgb888: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("clock before UNIX epoch: {e}"))?
+        .as_secs();
+    let stamp = format_utc_stamp(secs);
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let path = dir.join(format!("{slug}_{stamp}.png"));
+
+    let file = std::fs::File::create(&path).map_err(|e| format!("create {path:?}: {e}"))?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut wr = encoder
+        .write_header()
+        .map_err(|e| format!("png header: {e}"))?;
+    wr.write_image_data(rgb888)
+        .map_err(|e| format!("png write: {e}"))?;
+    Ok(path)
 }
 
 // ============================================================ VPU mapping
