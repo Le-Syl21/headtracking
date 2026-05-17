@@ -104,6 +104,7 @@ fn detect_backends() -> Vec<BackendEntry> {
     }];
 
     // ---- Kinect v2 (libfreenect2)
+    let mut v2_listed = false;
     match freenect2::Context::new() {
         Ok(ctx) => {
             let n = ctx.enumerate();
@@ -113,9 +114,24 @@ fn detect_backends() -> Vec<BackendEntry> {
                     backend: Backend::KinectV2,
                     label: "Kinect v2".to_string(),
                 });
+                v2_listed = true;
             }
         }
         Err(e) => warn!(?e, "scan: kinect v2 context init failed"),
+    }
+    // Linux fallback: libfreenect2's `enumerate()` *opens* each matching
+    // device via libusb and silently drops those returning EACCES, so a
+    // v2 without its udev rule is invisible. Probe sysfs by VID/PID and
+    // surface the device anyway — the user gets a clickable entry, the
+    // open attempt later produces a readable error, and the access-hint
+    // banner explains the fix in parallel.
+    #[cfg(target_os = "linux")]
+    if !v2_listed && linux_v2_present_on_usb() {
+        info!("scan: kinect v2 — surfaced via sysfs fallback (no libfreenect2 access)");
+        out.push(BackendEntry {
+            backend: Backend::KinectV2,
+            label: "Kinect v2".to_string(),
+        });
     }
 
     // ---- Kinect v1 (libfreenect)
@@ -243,24 +259,22 @@ fn compute_kinect_access_hint() -> bool {
     true
 }
 
-/// Linux: any Kinect v1 (Xbox 360 model 1414: `02ae`/`02ad`/`02b0`;
-/// Kinect-for-Windows model 1473: `02c2`/`02be`/`02bf`) or Kinect v2
-/// (`02c4`/`02d8`/`02d9`) USB device is plugged in (read from sysfs without
-/// privileges) and at least one of the present PIDs isn't covered by any
-/// udev rule under the standard rules directories. Returns true if so —
-/// the banner needs to fire.
+/// PIDs libfreenect / libfreenect2 need 0666 on to open over libusb.
 #[cfg(target_os = "linux")]
-fn kinect_present_but_not_set_up() -> bool {
-    use std::collections::HashSet;
+const KINECT_PIDS: &[&str] = &[
+    "02ae", "02ad", "02b0", // v1 Xbox 360 (1414): camera, audio, motor
+    "02c2", "02be", "02bf", // v1 Kinect for Windows (1473): camera, audio, motor
+    "02c4", "02d8", "02d9", // v2: sensor, firmware-update, adapter hub
+];
 
-    // PIDs libfreenect / libfreenect2 need 0666 on to open over libusb.
-    const KINECT_PIDS: &[&str] = &[
-        "02ae", "02ad", "02b0", // v1 Xbox 360 (1414): camera, audio, motor
-        "02c2", "02be", "02bf", // v1 Kinect for Windows (1473): camera, audio, motor
-        "02c4", "02d8", "02d9", // v2: sensor, firmware-update, adapter hub
-    ];
-
-    let present: HashSet<String> = std::fs::read_dir("/sys/bus/usb/devices")
+/// Linux: scan `/sys/bus/usb/devices` for currently-plugged Kinect USB
+/// devices and return the set of matching product IDs (lowercase hex).
+/// Read-only; no privileges needed. Used by both the access-hint check
+/// and the `detect_backends` fallback that surfaces a v2 in the dropdown
+/// even when libfreenect2's open-based `enumerate()` rejects it.
+#[cfg(target_os = "linux")]
+fn sysfs_present_kinect_pids() -> std::collections::HashSet<String> {
+    std::fs::read_dir("/sys/bus/usb/devices")
         .into_iter()
         .flatten()
         .flatten()
@@ -277,7 +291,31 @@ fn kinect_present_but_not_set_up() -> bool {
             let pid = id("idProduct")?;
             KINECT_PIDS.contains(&pid.as_str()).then_some(pid)
         })
-        .collect();
+        .collect()
+}
+
+/// Linux: `true` iff at least one Kinect v2 PID (`02c4`/`02d8`/`02d9`)
+/// is plugged in on USB right now. Used as a fallback in
+/// [`detect_backends`] when libfreenect2's `enumerate()` reports 0
+/// (typically because libusb_open returns EACCES without the udev rule).
+#[cfg(target_os = "linux")]
+fn linux_v2_present_on_usb() -> bool {
+    sysfs_present_kinect_pids()
+        .iter()
+        .any(|p| matches!(p.as_str(), "02c4" | "02d8" | "02d9"))
+}
+
+/// Linux: any Kinect v1 (Xbox 360 model 1414: `02ae`/`02ad`/`02b0`;
+/// Kinect-for-Windows model 1473: `02c2`/`02be`/`02bf`) or Kinect v2
+/// (`02c4`/`02d8`/`02d9`) USB device is plugged in (read from sysfs without
+/// privileges) and at least one of the present PIDs isn't covered by any
+/// udev rule under the standard rules directories. Returns true if so —
+/// the banner needs to fire.
+#[cfg(target_os = "linux")]
+fn kinect_present_but_not_set_up() -> bool {
+    use std::collections::HashSet;
+
+    let present = sysfs_present_kinect_pids();
     if present.is_empty() {
         return false;
     }
