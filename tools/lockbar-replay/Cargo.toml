@@ -1,0 +1,17 @@
+[package]
+name = "lockbar-replay"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Decode a PNG and run detect_lockbar_rgb on it — fast local iteration for the lockbar algo"
+publish = false
+
+[[bin]]
+name = "lockbar-replay"
+path = "src/main.rs"
+
+[dependencies]
+headtracking = { path = "../..", default-features = false }
+png = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

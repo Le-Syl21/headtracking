@@ -227,6 +227,7 @@ struct FittedLine {
     intercept: f64,
     left_col: u32,
     right_col: u32,
+    #[allow(dead_code)]
     n_inliers: u32,
 }
 
@@ -332,6 +333,13 @@ pub struct LockbarRgbParams {
     /// ratio regardless of camera distance.
     pub min_aspect_ratio: f32,
     pub max_aspect_ratio: f32,
+    /// The detected pair's top edge must sit at least this far down
+    /// the frame (as a fraction of frame height). Cabs are placed
+    /// roughly head-height with the camera on the backbox tilted
+    /// downward, so the lockbar always falls into the lower portion
+    /// of the frame — shelves, door frames, window sills that pass
+    /// aspect-ratio are rejected here.
+    pub min_top_edge_row_fraction: f32,
 }
 
 impl Default for LockbarRgbParams {
@@ -339,23 +347,34 @@ impl Default for LockbarRgbParams {
         Self {
             bottom_fraction: 0.75,
             min_edge_strength: 20.0,
-            // 0.10 = 10% of frame width. The Kinect v2's wide FOV
+            // 0.05 = 5% of frame width. The Kinect v2's wide FOV
             // means a 61 cm lockbar at ~76 cm camera-to-bar distance
-            // projects to ~15% of 1920 columns. Lower threshold lets
-            // the algo find it; the aspect-ratio gate kills false
-            // positives from short horizontal features.
-            min_width_fraction: 0.10,
+            // projects to ~10% of 1920 columns; after the joint-
+            // column intersection (columns must have peaks at
+            // BOTH lockbar edges) that drops further. Aspect-ratio
+            // + min-top-row gates keep false positives out.
+            min_width_fraction: 0.05,
             max_width_fraction: 0.85,
             max_row_deviation: 12,
             min_separation: 8,
             max_separation: 120,
-            max_slope_diff_deg: 3.0,
+            // Wide-FOV / fisheye webcams curve horizontal lines —
+            // top and bottom of the lockbar diverge slightly in
+            // image space. 5° is enough for the cheap action-cam
+            // we tested without letting wildly mismatched pairs in.
+            max_slope_diff_deg: 5.0,
             // 40 cm × 10 cm = 4.0 (skinniest plausible cab),
             // 80 cm × 5 cm = 16.0 (widest plausible cab). 18 leaves
             // some slack for edge measurement noise inflating
             // the apparent thickness.
             min_aspect_ratio: 4.0,
             max_aspect_ratio: 18.0,
+            // 0.80 = lockbar's top edge must be in the bottom 20% of
+            // the frame. Trades a bit of permissiveness for false
+            // negatives if the camera angle puts the lockbar higher,
+            // for very strong rejection of shelves / horizons /
+            // baseboards that look like a lockbar by aspect alone.
+            min_top_edge_row_fraction: 0.80,
         }
     }
 }
@@ -394,173 +413,462 @@ pub fn detect_lockbar_rgb(
         ((r_ + g + b) >> 8) as u16
     };
 
-    // Find the strongest gradient row in `rows` for column `c`.
-    // `mask_pred` is an optional predicate: if it returns true for a
-    // row, that row is skipped (used to exclude the band around line
-    // A when searching for line B).
-    let scan_col = |c: usize, mask_pred: &dyn Fn(u32) -> bool| -> Option<u32> {
-        let mut best_row: u32 = 0;
-        let mut best_grad: i32 = 0;
+    // For each column, find the row(s) of every local-maximum
+    // gradient above `min_edge_strength`. Keep the TOP-K strongest
+    // peaks per column. K=4 is generous because the disambiguation
+    // is done downstream by the JOINT-column intersection (lockbar
+    // columns must have peaks near BOTH the top and bottom edge
+    // simultaneously) — the K=2 setting we tried earlier left
+    // textured columns without enough peaks for the intersection
+    // to succeed.
+    const TOP_K_PEAKS: usize = 4;
+    let scan_col = |c: usize, mask_pred: &dyn Fn(u32) -> bool| -> Vec<u32> {
+        // Walk the column once, find all local-max rows with
+        // gradient >= threshold, keep the top K by strength.
+        let mut peaks: Vec<(i32, u32)> = Vec::new(); // (grad, row)
+        let mut prev_g: i32 = 0;
+        let mut rising = false;
         for r in row_start..(h - 1) {
             if mask_pred(r as u32) {
+                rising = false;
+                prev_g = 0;
                 continue;
             }
             let above = luma(c, r) as i32;
             let below = luma(c, r + 1) as i32;
             let g = (below - above).abs();
-            if g > best_grad {
-                best_grad = g;
-                best_row = r as u32;
+            if rising && g < prev_g && prev_g >= params.min_edge_strength as i32 {
+                peaks.push((prev_g, (r - 1) as u32));
+                rising = false;
             }
+            if g > prev_g {
+                rising = true;
+            }
+            prev_g = g;
         }
-        ((best_grad as f32) >= params.min_edge_strength).then_some(best_row)
+        if rising && prev_g >= params.min_edge_strength as i32 {
+            peaks.push((prev_g, (h - 2) as u32));
+        }
+        peaks.sort_unstable_by_key(|&(g, _)| std::cmp::Reverse(g));
+        peaks.truncate(TOP_K_PEAKS);
+        peaks.into_iter().map(|(_, r)| r).collect()
     };
 
-    // Pass 1: find line A (strongest edge in the unfiltered ROI).
+    // Pre-scan once: all top-K peaks per column.
     let no_mask = |_r: u32| false;
-    let per_col_a: Vec<Option<u32>> = (0..w).map(|c| scan_col(c, &no_mask)).collect();
-    let n_votes_a = per_col_a.iter().filter(|o| o.is_some()).count();
-    let line_a = match fit_line(&per_col_a, min_cols, max_cols, params.max_row_deviation) {
-        Some(l) => l,
-        None => {
-            tracing::debug!(
-                target: "lockbar",
-                "reject: no line A — {n_votes_a} columns above edge threshold, \
-                 need {min_cols}–{max_cols} columns inside ±{} rows of median",
-                params.max_row_deviation
-            );
-            return None;
-        }
-    };
-
-    // Pass 2: find line B by masking out the ±min_separation/2 band
-    // around line A's prediction, per column.
-    let half_band = params.min_separation.max(1);
-    let per_col_b: Vec<Option<u32>> = (0..w)
-        .map(|c| {
-            let target = line_a.row_at(c as u32) as i32;
-            let mask = |r: u32| (r as i32 - target).unsigned_abs() <= half_band;
-            scan_col(c, &mask)
-        })
-        .collect();
-    let n_votes_b = per_col_b.iter().filter(|o| o.is_some()).count();
-    let line_b = match fit_line(&per_col_b, min_cols, max_cols, params.max_row_deviation) {
-        Some(l) => l,
-        None => {
-            tracing::debug!(
-                target: "lockbar",
-                "reject: no line B — line A at row≈{} width≈{}; second-pass got {n_votes_b} \
-                 columns (need ≥{min_cols}, ≤{max_cols})",
-                line_a.mean_row(),
-                line_a.right_col - line_a.left_col + 1
-            );
-            return None;
-        }
-    };
-
-    // Validate pair geometry.
-    let slope_diff = (line_a.slope_deg() - line_b.slope_deg()).abs();
-    if slope_diff > params.max_slope_diff_deg {
+    let per_col_full: Vec<Vec<u32>> = (0..w).map(|c| scan_col(c, &no_mask)).collect();
+    let n_cols_voting = per_col_full.iter().filter(|p| !p.is_empty()).count();
+    if n_cols_voting < min_cols {
         tracing::debug!(
             target: "lockbar",
-            "reject: slope diff {slope_diff:.2}° > max {:.2}° (A={:.2}°, B={:.2}°)",
-            params.max_slope_diff_deg,
-            line_a.slope_deg(),
-            line_b.slope_deg()
-        );
-        return None;
-    }
-    // Sort by mean row so `top` is closer to the top of the image
-    // (smaller row index). Image Y is downward.
-    let (top, bottom) = if line_a.mean_row() < line_b.mean_row() {
-        (line_a, line_b)
-    } else {
-        (line_b, line_a)
-    };
-    let sep_left = bottom
-        .row_at(top.left_col)
-        .saturating_sub(top.row_at(top.left_col));
-    let sep_right = bottom
-        .row_at(top.right_col)
-        .saturating_sub(top.row_at(top.right_col));
-    let thickness = (sep_left + sep_right) / 2;
-    if thickness < params.min_separation || thickness > params.max_separation {
-        tracing::debug!(
-            target: "lockbar",
-            "reject: thickness {thickness} px outside [{}, {}] (top row≈{}, bottom row≈{})",
-            params.min_separation,
-            params.max_separation,
-            top.mean_row(),
-            bottom.mean_row()
+            "reject: only {n_cols_voting} columns produced any peak (need ≥{min_cols})"
         );
         return None;
     }
 
-    // Build the closing quad on the conservative left/right extents
-    // shared by both edges (avoids drawing a corner that only the top
-    // OR only the bottom edge actually observed).
-    let left_col = top.left_col.max(bottom.left_col);
-    let right_col = top.right_col.min(bottom.right_col);
-    if right_col <= left_col {
+    // Enumerate ALL valid horizontal line candidates (peaks in the
+    // row distribution that have ≥ min_cols unique-column voters
+    // and width ≤ max_cols). Then iterate every pair, score by how
+    // close the aspect ratio lands to the physical lockbar's 8.7,
+    // and return the best pair that passes every geometry gate.
+    let dev = params.max_row_deviation;
+    let candidates = fit_all_lines(&per_col_full, min_cols, max_cols, dev);
+    if candidates.is_empty() {
         tracing::debug!(
             target: "lockbar",
-            "reject: top [{},{}] and bottom [{},{}] columns don't overlap",
-            top.left_col, top.right_col, bottom.left_col, bottom.right_col
-        );
-        return None;
-    }
-    let mean_width = (right_col - left_col + 1) as f32;
-    let aspect = if thickness > 0 {
-        mean_width / thickness as f32
-    } else {
-        f32::INFINITY
-    };
-    if aspect < params.min_aspect_ratio || aspect > params.max_aspect_ratio {
-        tracing::debug!(
-            target: "lockbar",
-            "reject: aspect {aspect:.1} outside [{:.1}, {:.1}] (width={} px, thickness={} px)",
-            params.min_aspect_ratio,
-            params.max_aspect_ratio,
-            mean_width as u32,
-            thickness
+            "reject: no candidate horizontal lines (n_cols_voting={n_cols_voting}, \
+             min_cols={min_cols}, max_cols={max_cols})"
         );
         return None;
     }
     tracing::debug!(
         target: "lockbar",
-        "accept: row≈{}, width={} px, thickness={} px, aspect={:.1}, slope={:.2}°, \
-         inliers top={} bottom={}",
+        "{} line candidates, scanning {} pairs",
+        candidates.len(),
+        candidates.len() * (candidates.len() - 1) / 2
+    );
+
+    let min_top_row = (params.min_top_edge_row_fraction * height as f32) as u32;
+    let target_aspect: f32 = (LOCKBAR_WIDTH_MM / 70.0).max(4.0); // ≈ 8.7
+
+    // For each candidate pair, compute the COLUMN INTERSECTION:
+    // columns that have a peak near top_row AND a peak near
+    // bot_row. This isolates true lockbar columns from columns
+    // that only have one of the two edges visible (shelves /
+    // floor seams). The lockbar's actual horizontal extent is
+    // the longest contiguous run inside this intersection.
+    let mut best: Option<(f32, FittedLine, FittedLine, u32, u32, u32, u32)> = None;
+
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            let (a, b) = (candidates[i], candidates[j]);
+            let slope_diff = (a.slope_deg() - b.slope_deg()).abs();
+            if slope_diff > params.max_slope_diff_deg {
+                tracing::trace!(
+                    target: "lockbar",
+                    "pair ({},{})→ slope diff {:.2}° > {:.2}°",
+                    a.mean_row(),
+                    b.mean_row(),
+                    slope_diff,
+                    params.max_slope_diff_deg
+                );
+                continue;
+            }
+            let (top, bottom) = if a.mean_row() < b.mean_row() {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            if top.mean_row() < min_top_row {
+                tracing::trace!(
+                    target: "lockbar",
+                    "pair ({},{})→ top {} < min_top {}",
+                    top.mean_row(),
+                    bottom.mean_row(),
+                    top.mean_row(),
+                    min_top_row
+                );
+                continue;
+            }
+
+            // Find every column with a peak near BOTH top.row_at(col)
+            // and bottom.row_at(col). Walk columns and check.
+            let mut joint_cols: Vec<u32> = Vec::new();
+            for (c, peaks) in per_col_full.iter().enumerate() {
+                let target_top = top.row_at(c as u32);
+                let target_bot = bottom.row_at(c as u32);
+                let has_top = peaks.iter().any(|r| r.abs_diff(target_top) <= dev);
+                let has_bot = peaks.iter().any(|r| r.abs_diff(target_bot) <= dev);
+                if has_top && has_bot {
+                    joint_cols.push(c as u32);
+                }
+            }
+            if joint_cols.len() < min_cols {
+                tracing::trace!(
+                    target: "lockbar",
+                    "pair ({},{})→ joint cols {} < min {}",
+                    top.mean_row(),
+                    bottom.mean_row(),
+                    joint_cols.len(),
+                    min_cols
+                );
+                continue;
+            }
+
+            // Longest contiguous run in joint_cols.
+            const MAX_COL_GAP: u32 = 24;
+            let mut best_start = 0usize;
+            let mut best_end = 0usize;
+            let mut run_start = 0usize;
+            for k in 1..joint_cols.len() {
+                if joint_cols[k] - joint_cols[k - 1] > MAX_COL_GAP {
+                    if k - 1 - run_start > best_end - best_start {
+                        best_start = run_start;
+                        best_end = k - 1;
+                    }
+                    run_start = k;
+                }
+            }
+            let last = joint_cols.len() - 1;
+            if last - run_start > best_end - best_start {
+                best_start = run_start;
+                best_end = last;
+            }
+            let lc = joint_cols[best_start];
+            let rc = joint_cols[best_end];
+            let n_joint_run = (best_end - best_start + 1) as u32;
+            if (n_joint_run as usize) < min_cols {
+                tracing::trace!(
+                    target: "lockbar",
+                    "pair ({},{})→ contig run {} < min {}",
+                    top.mean_row(),
+                    bottom.mean_row(),
+                    n_joint_run,
+                    min_cols
+                );
+                continue;
+            }
+
+            let mean_width = (rc - lc + 1) as f32;
+            if mean_width > max_cols as f32 {
+                tracing::trace!(
+                    target: "lockbar",
+                    "pair ({},{})→ width {} > max {}",
+                    top.mean_row(),
+                    bottom.mean_row(),
+                    mean_width,
+                    max_cols
+                );
+                continue;
+            }
+            let sep_left = bottom.row_at(lc).saturating_sub(top.row_at(lc));
+            let sep_right = bottom.row_at(rc).saturating_sub(top.row_at(rc));
+            let thickness = (sep_left + sep_right) / 2;
+            if thickness < params.min_separation || thickness > params.max_separation {
+                tracing::trace!(
+                    target: "lockbar",
+                    "pair ({},{})→ thickness {} not in [{}, {}]",
+                    top.mean_row(),
+                    bottom.mean_row(),
+                    thickness,
+                    params.min_separation,
+                    params.max_separation
+                );
+                continue;
+            }
+            let aspect = if thickness > 0 {
+                mean_width / thickness as f32
+            } else {
+                continue;
+            };
+            if aspect < params.min_aspect_ratio || aspect > params.max_aspect_ratio {
+                tracing::trace!(
+                    target: "lockbar",
+                    "pair ({},{})→ aspect {:.1} not in [{:.1}, {:.1}] (w={} t={})",
+                    top.mean_row(),
+                    bottom.mean_row(),
+                    aspect,
+                    params.min_aspect_ratio,
+                    params.max_aspect_ratio,
+                    mean_width as u32,
+                    thickness
+                );
+                continue;
+            }
+            let aspect_err = (aspect - target_aspect).abs() / target_aspect;
+            // Strong inlier counts beat near-perfect aspect; tie-break
+            // by sharpness only.
+            let inlier_bonus = 1.0 / (1.0 + n_joint_run as f32 / 100.0);
+            let score = aspect_err + 0.1 * inlier_bonus;
+            if best.as_ref().is_none_or(|(s, _, _, _, _, _, _)| score < *s) {
+                best = Some((score, top, bottom, lc, rc, thickness, n_joint_run));
+            }
+        }
+    }
+
+    let (score, top, bottom, lc, rc, thickness, n_joint_run) = best.or_else(|| {
+        tracing::debug!(
+            target: "lockbar",
+            "reject: no candidate pair passed all gates after joint-column intersection"
+        );
+        None
+    })?;
+    let mean_width = (rc - lc + 1) as f32;
+    let aspect = mean_width / thickness as f32;
+    tracing::debug!(
+        target: "lockbar",
+        "accept: row≈{}, width={} px, thickness={} px, aspect={:.1} (target {:.1}, score={:.3}), \
+         slope={:.2}°, joint cols={n_joint_run}",
         top.mean_row(),
         mean_width as u32,
         thickness,
         aspect,
+        target_aspect,
+        score,
         top.slope_deg(),
-        top.n_inliers,
-        bottom.n_inliers,
     );
     let bound_row = |r: u32| r.min((h - 1) as u32);
     let corners = [
-        (left_col, bound_row(top.row_at(left_col))),
-        (right_col, bound_row(top.row_at(right_col))),
-        (right_col, bound_row(bottom.row_at(right_col))),
-        (left_col, bound_row(bottom.row_at(left_col))),
+        (lc, bound_row(top.row_at(lc))),
+        (rc, bound_row(top.row_at(rc))),
+        (rc, bound_row(bottom.row_at(rc))),
+        (lc, bound_row(bottom.row_at(lc))),
     ];
-
     Some(LockbarQuadRgb {
         frame_width: width,
         frame_height: height,
         corners,
         slope_deg: top.slope_deg(),
         thickness_px: thickness,
-        n_inliers_top: top.n_inliers,
-        n_inliers_bottom: bottom.n_inliers,
+        n_inliers_top: n_joint_run,
+        n_inliers_bottom: n_joint_run,
     })
 }
 
-/// Median-then-least-squares fit on per-column row votes. Rejects when
-/// the inlier set spans too few or too many columns, or when no
-/// consistent line emerges.
-fn fit_line(
+/// Enumerate every fittable horizontal line in `per_col` — i.e.
+/// every distinct row cluster (peak in the row distribution) that
+/// has at least `min_cols` unique-column voters and fits inside
+/// `max_cols` width. Returns candidates ordered from highest row
+/// (image bottom) to lowest (image top); the caller iterates pairs
+/// and scores them by lockbar shape.
+fn fit_all_lines(
+    per_col: &[Vec<u32>],
+    min_cols: usize,
+    max_cols: usize,
+    max_row_deviation: u32,
+) -> Vec<FittedLine> {
+    let mut all_peaks: Vec<(usize, u32)> = per_col
+        .iter()
+        .enumerate()
+        .flat_map(|(c, peaks)| peaks.iter().map(move |&r| (c, r)))
+        .collect();
+    if all_peaks.len() < min_cols {
+        return Vec::new();
+    }
+    all_peaks.sort_unstable_by_key(|&(_, r)| r);
+    let dev = max_row_deviation;
+    // Cluster span tighter than the inlier radius: the lockbar's
+    // top and bottom edges land in the same per-column peak set
+    // and must be detected as DISTINCT clusters. `span = dev`
+    // (window ±dev/2) resolves edges separated by `dev` pixels,
+    // while the wider inlier collection (±dev = ±max_row_deviation)
+    // still pulls in noise around each edge centre.
+    let span = dev;
+    let n = all_peaks.len();
+
+    let mut out: Vec<FittedLine> = Vec::new();
+    // Track which row centres we've already emitted so we don't
+    // produce many overlapping fits for the same cluster. Threshold
+    // is `dev` (not `span = 2*dev`) so two parallel edges only one
+    // band thick apart still count as distinct candidates — that's
+    // the lockbar's own top/bottom edges in the limit case.
+    let mut emitted_centers: Vec<u32> = Vec::new();
+    let separated_enough =
+        |c: u32, prev: &[u32]| -> bool { prev.iter().all(|&p| c.abs_diff(p) > dev) };
+
+    let mut hi = n;
+    let mut lo = n;
+    while hi > 0 {
+        hi -= 1;
+        while lo > 0 && all_peaks[hi].1 - all_peaks[lo - 1].1 <= span {
+            lo -= 1;
+        }
+        let window = &all_peaks[lo..=hi];
+        let mut cols_in: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &(c, _) in window {
+            cols_in.insert(c);
+        }
+        if cols_in.len() < min_cols {
+            tracing::trace!(
+                target: "lockbar",
+                "fit: hi={} row={} window=[{},{}] cols={} < {}",
+                hi,
+                all_peaks[hi].1,
+                window.first().unwrap().1,
+                window.last().unwrap().1,
+                cols_in.len(),
+                min_cols
+            );
+            continue;
+        }
+        let center = (window.first().unwrap().1 + window.last().unwrap().1) / 2;
+        tracing::trace!(
+            target: "lockbar",
+            "fit: hi={} row={} window=[{},{}] center={} cols={}",
+            hi,
+            all_peaks[hi].1,
+            window.first().unwrap().1,
+            window.last().unwrap().1,
+            center,
+            cols_in.len()
+        );
+        if !separated_enough(center, &emitted_centers) {
+            tracing::trace!(target: "lockbar", "fit: center={center} too close to emitted");
+            continue;
+        }
+        let mut inliers: Vec<(usize, u32)> = Vec::with_capacity(cols_in.len());
+        for &col in &cols_in {
+            let best = per_col[col]
+                .iter()
+                .copied()
+                .filter(|r| r.abs_diff(center) <= max_row_deviation)
+                .min_by_key(|r| r.abs_diff(center));
+            if let Some(r) = best {
+                inliers.push((col, r));
+            }
+        }
+        if inliers.len() < min_cols {
+            tracing::trace!(target: "lockbar", "fit: center={center} inliers={} < {min_cols}", inliers.len());
+            continue;
+        }
+        // Contiguity filter: keep only the longest run of inlier
+        // columns where consecutive ones are at most MAX_COL_GAP
+        // apart. The lockbar is a localised object; without this,
+        // co-row features elsewhere in the frame get bundled in.
+        const MAX_COL_GAP: usize = 24;
+        inliers.sort_unstable_by_key(|&(c, _)| c);
+        let mut best_start = 0usize;
+        let mut best_end = 0usize;
+        let mut run_start = 0usize;
+        for k in 1..inliers.len() {
+            if inliers[k].0 - inliers[k - 1].0 > MAX_COL_GAP {
+                if k - 1 - run_start > best_end - best_start {
+                    best_start = run_start;
+                    best_end = k - 1;
+                }
+                run_start = k;
+            }
+        }
+        let last_idx = inliers.len() - 1;
+        if last_idx - run_start > best_end - best_start {
+            best_start = run_start;
+            best_end = last_idx;
+        }
+        let run_inliers: Vec<(usize, u32)> = inliers[best_start..=best_end].to_vec();
+        if run_inliers.len() < min_cols {
+            tracing::trace!(
+                target: "lockbar",
+                "fit: center={center} longest run {} < {min_cols}",
+                run_inliers.len()
+            );
+            continue;
+        }
+        let inliers = run_inliers;
+        let lc = inliers.first().unwrap().0;
+        let rc = inliers.last().unwrap().0;
+        if rc - lc + 1 > max_cols {
+            tracing::trace!(target: "lockbar", "fit: center={center} run span={} > {max_cols}", rc - lc + 1);
+            continue;
+        }
+        let np = inliers.len() as f64;
+        let mut sx = 0.0f64;
+        let mut sy = 0.0f64;
+        let mut sxx = 0.0f64;
+        let mut sxy = 0.0f64;
+        for &(c, r) in &inliers {
+            let cx = c as f64;
+            let ry = f64::from(r);
+            sx += cx;
+            sy += ry;
+            sxx += cx * cx;
+            sxy += cx * ry;
+        }
+        let denom = np * sxx - sx * sx;
+        let (slope, intercept) = if denom.abs() > 1e-6 {
+            let a = (np * sxy - sx * sy) / denom;
+            let b = (sy - a * sx) / np;
+            (a, b)
+        } else {
+            (0.0, sy / np)
+        };
+        tracing::trace!(
+            target: "lockbar",
+            "candidate line: center≈{}, span=[{},{}] ({} cols), {} inliers",
+            center,
+            lc,
+            rc,
+            rc - lc + 1,
+            inliers.len()
+        );
+        out.push(FittedLine {
+            slope,
+            intercept,
+            left_col: lc as u32,
+            right_col: rc as u32,
+            n_inliers: inliers.len() as u32,
+        });
+        emitted_centers.push(center);
+    }
+    out
+}
+
+/// Legacy single-peak path — superseded by `fit_all_lines` but
+/// kept around as a reference implementation. The synthetic unit
+/// tests construct one peak per column, which this path handles
+/// directly; the production path translates that into a multi-peak
+/// vector and uses `fit_all_lines`.
+#[allow(dead_code)]
+fn fit_line_densest_legacy(
     per_col: &[Option<u32>],
     min_cols: usize,
     max_cols: usize,
@@ -574,14 +882,26 @@ fn fit_line(
     if votes.len() < min_cols {
         return None;
     }
-
     let mut rows_sorted: Vec<u32> = votes.iter().map(|(_, r)| *r).collect();
     rows_sorted.sort_unstable();
-    let median_row = rows_sorted[rows_sorted.len() / 2];
-
+    let dev = max_row_deviation;
+    let span = 2 * dev;
+    let mut best_count = 0usize;
+    let mut best_center = rows_sorted[rows_sorted.len() / 2];
+    let mut lo = 0usize;
+    for hi in 0..rows_sorted.len() {
+        while rows_sorted[hi] - rows_sorted[lo] > span {
+            lo += 1;
+        }
+        let count = hi - lo + 1;
+        if count > best_count {
+            best_count = count;
+            best_center = (rows_sorted[lo] + rows_sorted[hi]) / 2;
+        }
+    }
     let inliers: Vec<(usize, u32)> = votes
         .into_iter()
-        .filter(|(_, r)| r.abs_diff(median_row) <= max_row_deviation)
+        .filter(|(_, r)| r.abs_diff(best_center) <= max_row_deviation)
         .collect();
     if inliers.len() < min_cols {
         return None;
@@ -738,10 +1058,12 @@ mod tests {
 
     #[test]
     fn rgb_detects_band_in_bottom_zone() {
-        // 200×200 frame, dark band at rows 160..175 spanning cols
+        // 200×200 frame, dark band at rows 170..185 spanning cols
         // 30..170 (~70% width, ~15 px thick). bottom_fraction default
-        // 0.75 → search starts at row 150 → band fully in scope.
-        let data = rgb_with_band(200, 200, 160, 175, 30, 170);
+        // 0.75 → search starts at row 150 → band fully in scope; and
+        // min_top_edge_row_fraction 0.80 → top must be ≥ 160 → the
+        // top peak at row 169 satisfies it with margin.
+        let data = rgb_with_band(200, 200, 170, 185, 30, 170);
         let q =
             detect_lockbar_rgb(&data, 200, 200, &LockbarRgbParams::default()).expect("detected");
         assert!(
