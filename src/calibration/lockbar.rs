@@ -198,92 +198,174 @@ fn best_of(prev: Option<Run>, candidate: Run, min_len: usize) -> Option<Run> {
 //
 // The RGB path is the universal one: it works on any camera that
 // produces a colour frame (Kinect v1/v2 RGB stream + webcam), regardless
-// of whether depth is available. It looks for the strongest horizontal
-// luminance edge in the bottom slice of the frame, which corresponds to
-// the lockbar's top boundary — the transition between the lockbar
-// surface (black-oxide / brushed stainless / chrome / painted wood) and
-// the playfield (or cabinet interior) behind it.
+// of whether depth is available. The lockbar surface (700 mm wide × ~70
+// mm deep) projects to a narrow horizontal BAND in the image with two
+// roughly parallel edges:
 //
-// Per-column gradient + median + least-squares line fit was preferred
-// over Canny+HoughLinesP to keep dependencies tight (no OpenCV /
-// imageproc). The algorithm is O(W * (H * bottom_fraction)) — ~2 ms on
-// a 1920×1080 frame and microseconds on 640×480, which fits comfortably
-// in a frame budget at 30–60 fps.
+//   * TOP edge — boundary between the lockbar and the playfield/cab
+//     interior behind it (from the camera's POV looking down at the
+//     player)
+//   * BOTTOM edge — boundary between the lockbar and the floor / player
+//     front
+//
+// We find the strongest horizontal luminance edge in the bottom slice
+// (line A), mask out a band around it, find a SECOND horizontal edge
+// elsewhere (line B), and validate the pair: separation must match the
+// expected band thickness (~20–80 px depending on backend), slopes must
+// agree, and the band must NOT span the full frame width (that
+// signature belongs to room features like horizons, not a finite cab).
+//
+// Per-column gradient + median + least-squares line fit avoids any
+// OpenCV / imageproc dependency. ~2 ms on a 1920×1080 frame and tens of
+// microseconds on 640×480 — fits in a 30–60 fps budget.
 
-/// Detected lockbar in the RGB image. Endpoints are the leftmost and
-/// rightmost inlier columns from the line fit; the line may be tilted,
-/// so `left_row` and `right_row` can differ.
+/// A fitted line in image space, returned by the internal helper.
+/// `row(col)` = slope * col + intercept.
 #[derive(Debug, Clone, Copy)]
-pub struct LockbarObservationRgb {
-    pub frame_width: u32,
-    pub frame_height: u32,
-    pub left_col: u32,
-    pub left_row: u32,
-    pub right_col: u32,
-    pub right_row: u32,
-    /// Slope of the detected edge in degrees. Image Y axis points down,
-    /// so a positive value means the right endpoint sits lower in the
-    /// image than the left — i.e. the camera is rolled CCW around its
-    /// optical axis (or the cab itself is tilted). Useful as a roll
-    /// signal for the camera calibration.
-    pub slope_deg: f32,
-    /// Number of columns that contributed to the line fit after the
-    /// outlier filter. Confidence proxy — `0..frame_width`.
-    pub n_inliers: u32,
+struct FittedLine {
+    slope: f64,
+    intercept: f64,
+    left_col: u32,
+    right_col: u32,
+    n_inliers: u32,
 }
 
-impl LockbarObservationRgb {
-    /// Horizontal extent of the detected edge in pixels.
-    pub fn width_px(&self) -> u32 {
-        self.right_col - self.left_col + 1
+impl FittedLine {
+    fn row_at(&self, col: u32) -> u32 {
+        (self.slope * f64::from(col) + self.intercept)
+            .round()
+            .max(0.0) as u32
     }
+    fn mean_row(&self) -> u32 {
+        (self.row_at(self.left_col) + self.row_at(self.right_col)) / 2
+    }
+    fn slope_deg(&self) -> f32 {
+        self.slope.atan().to_degrees() as f32
+    }
+}
 
-    /// Mean image row of the two endpoints — handy when the consumer
-    /// just wants a single Y reference and doesn't care about tilt.
+/// Detected lockbar in the RGB image, expressed as a 4-corner quad
+/// (clockwise from top-left). With perspective the quad is generally a
+/// trapezoid — top and bottom edges aren't required to be parallel in
+/// pixel space.
+#[derive(Debug, Clone, Copy)]
+pub struct LockbarQuadRgb {
+    pub frame_width: u32,
+    pub frame_height: u32,
+    /// `[top_left, top_right, bottom_right, bottom_left]`. Top has the
+    /// smaller row index (image Y points down).
+    pub corners: [(u32, u32); 4],
+    /// Slope of the top edge in degrees. Image Y points down, so a
+    /// positive value means the right endpoint sits lower in the image
+    /// than the left — i.e. the camera is rolled CCW around its
+    /// optical axis (or the cab itself is tilted).
+    pub slope_deg: f32,
+    /// Mean vertical separation between top and bottom edges in
+    /// pixels. Reflects the apparent thickness of the lockbar's 70 mm
+    /// depth at the current camera distance.
+    pub thickness_px: u32,
+    /// Inlier counts for the two fitted lines. Higher = more confident.
+    pub n_inliers_top: u32,
+    pub n_inliers_bottom: u32,
+}
+
+impl LockbarQuadRgb {
+    /// Width in pixels at the top edge.
+    pub fn top_width_px(&self) -> u32 {
+        self.corners[1].0.saturating_sub(self.corners[0].0) + 1
+    }
+    /// Width in pixels at the bottom edge.
+    pub fn bottom_width_px(&self) -> u32 {
+        self.corners[2].0.saturating_sub(self.corners[3].0) + 1
+    }
+    /// Mean of top and bottom widths — single number when the consumer
+    /// just wants a "size" reference.
+    pub fn mean_width_px(&self) -> u32 {
+        (self.top_width_px() + self.bottom_width_px()) / 2
+    }
+    /// Vertical mid-row of the quad (mean of top and bottom edges).
     pub fn mean_row(&self) -> u32 {
-        (self.left_row + self.right_row) / 2
+        (self.corners[0].1 + self.corners[1].1 + self.corners[2].1 + self.corners[3].1) / 4
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct LockbarRgbParams {
-    /// Start the row search at `bottom_fraction * height`. `0.65` keeps
-    /// the bottom 35% of the frame in scope, which matches the typical
-    /// camera-on-backbox geometry.
+    /// Start the row search at `bottom_fraction * height`. The 70 mm
+    /// lockbar at a typical 0.7–1.0 m camera distance projects into
+    /// the last 10–20% of the frame, so the default 0.75 keeps the
+    /// bottom 25% in scope with margin.
     pub bottom_fraction: f32,
     /// Minimum absolute luminance gradient (0..255 scale) for a column
-    /// to vote. Columns where the player's body produces only weak
-    /// gradients (uniform skin / fabric) fall below this.
+    /// to vote. Columns occluded by the player produce weak gradients
+    /// over uniform skin / fabric and fall below this.
     pub min_edge_strength: f32,
     /// Required fraction of columns voting consistently for the line
-    /// to call it a real lockbar. `0.40` = 40% of the image width.
+    /// to be considered a real edge. `0.30` = 30% of the image width.
     pub min_width_fraction: f32,
+    /// Upper cap on edge width — a "lockbar" spanning >85% of the
+    /// frame is almost certainly a room horizon / wall trim, not the
+    /// finite cab front. Rejecting wide edges kills the most common
+    /// false positive.
+    pub max_width_fraction: f32,
     /// Inlier filter: drop columns whose detected row is farther than
     /// this many pixels from the median row of all voters.
     pub max_row_deviation: u32,
+    /// Minimum pixel separation between top and bottom edges of the
+    /// lockbar band. Below this we treat the two edges as the same
+    /// detection (noise / single edge), reject the pair.
+    pub min_separation: u32,
+    /// Maximum pixel separation. The 70 mm bar at 0.5–1.5 m projects
+    /// into ~20–100 px depending on backend focal length; anything
+    /// thicker is a different surface entirely.
+    pub max_separation: u32,
+    /// Maximum allowed slope difference between top and bottom edges
+    /// (in degrees). The two lockbar edges must be parallel within
+    /// measurement noise; a big mismatch means we paired the wrong
+    /// two horizontals.
+    pub max_slope_diff_deg: f32,
+    /// Minimum pixel ratio of `width / thickness`. Physical lockbars
+    /// span ~40 cm × 10 cm at the skinniest to ~80 cm × 5 cm at the
+    /// boxiest (Sylvain's widebody = 61 cm × 7 cm → ratio ≈ 8.7).
+    /// Perspective preserves length ratios on a fronto-parallel
+    /// surface, so the pixel ratio should land near the physical
+    /// ratio regardless of camera distance.
+    pub min_aspect_ratio: f32,
+    pub max_aspect_ratio: f32,
 }
 
 impl Default for LockbarRgbParams {
     fn default() -> Self {
         Self {
-            bottom_fraction: 0.65,
+            bottom_fraction: 0.75,
             min_edge_strength: 20.0,
-            min_width_fraction: 0.40,
+            min_width_fraction: 0.30,
+            max_width_fraction: 0.85,
             max_row_deviation: 12,
+            min_separation: 8,
+            max_separation: 120,
+            max_slope_diff_deg: 3.0,
+            // 40 cm × 10 cm = 4.0 (skinniest plausible cab),
+            // 80 cm × 5 cm = 16.0 (widest plausible cab). 18 leaves
+            // some slack for edge measurement noise inflating
+            // the apparent thickness.
+            min_aspect_ratio: 4.0,
+            max_aspect_ratio: 18.0,
         }
     }
 }
 
 /// Detect the lockbar in an RGB888 frame (row-major, 3 bytes/pixel,
-/// channel order R,G,B). Returns `None` when the candidate edge spans
-/// too little of the frame width or no consistent line emerges. See the
-/// module-level comment for algorithm rationale.
+/// channel order R,G,B). Returns `None` unless we find a PAIR of
+/// roughly parallel horizontal edges in the bottom slice that's
+/// geometrically consistent with a lockbar band — see
+/// [`LockbarRgbParams`] for the gating constraints.
 pub fn detect_lockbar_rgb(
     rgb888: &[u8],
     width: u32,
     height: u32,
     params: &LockbarRgbParams,
-) -> Option<LockbarObservationRgb> {
+) -> Option<LockbarQuadRgb> {
     let w = width as usize;
     let h = height as usize;
     if w == 0 || h < 4 || rgb888.len() < w * h * 3 {
@@ -294,6 +376,7 @@ pub fn detect_lockbar_rgb(
         return None;
     }
     let min_cols = ((params.min_width_fraction * width as f32) as usize).max(2);
+    let max_cols = ((params.max_width_fraction * width as f32) as usize).max(2);
 
     // Rec.709 integer luma — avoids per-pixel f32 conversion.
     // 54/183/19 ≈ 0.2126/0.7152/0.0722 scaled by 256, then >>8.
@@ -305,12 +388,17 @@ pub fn detect_lockbar_rgb(
         ((r_ + g + b) >> 8) as u16
     };
 
-    // Per-column: row of strongest vertical gradient in the ROI.
-    let mut per_col_row: Vec<Option<u32>> = Vec::with_capacity(w);
-    for c in 0..w {
+    // Find the strongest gradient row in `rows` for column `c`.
+    // `mask_pred` is an optional predicate: if it returns true for a
+    // row, that row is skipped (used to exclude the band around line
+    // A when searching for line B).
+    let scan_col = |c: usize, mask_pred: &dyn Fn(u32) -> bool| -> Option<u32> {
         let mut best_row: u32 = 0;
         let mut best_grad: i32 = 0;
         for r in row_start..(h - 1) {
+            if mask_pred(r as u32) {
+                continue;
+            }
             let above = luma(c, r) as i32;
             let below = luma(c, r + 1) as i32;
             let g = (below - above).abs();
@@ -319,15 +407,94 @@ pub fn detect_lockbar_rgb(
                 best_row = r as u32;
             }
         }
-        per_col_row.push(if (best_grad as f32) >= params.min_edge_strength {
-            Some(best_row)
-        } else {
-            None
-        });
+        ((best_grad as f32) >= params.min_edge_strength).then_some(best_row)
+    };
+
+    // Pass 1: find line A (strongest edge in the unfiltered ROI).
+    let no_mask = |_r: u32| false;
+    let per_col_a: Vec<Option<u32>> = (0..w).map(|c| scan_col(c, &no_mask)).collect();
+    let line_a = fit_line(&per_col_a, min_cols, max_cols, params.max_row_deviation)?;
+
+    // Pass 2: find line B by masking out the ±min_separation/2 band
+    // around line A's prediction, per column.
+    let half_band = params.min_separation.max(1);
+    let per_col_b: Vec<Option<u32>> = (0..w)
+        .map(|c| {
+            let target = line_a.row_at(c as u32) as i32;
+            let mask = |r: u32| (r as i32 - target).unsigned_abs() <= half_band;
+            scan_col(c, &mask)
+        })
+        .collect();
+    let line_b = fit_line(&per_col_b, min_cols, max_cols, params.max_row_deviation)?;
+
+    // Validate pair geometry.
+    if (line_a.slope_deg() - line_b.slope_deg()).abs() > params.max_slope_diff_deg {
+        return None;
+    }
+    // Sort by mean row so `top` is closer to the top of the image
+    // (smaller row index). Image Y is downward.
+    let (top, bottom) = if line_a.mean_row() < line_b.mean_row() {
+        (line_a, line_b)
+    } else {
+        (line_b, line_a)
+    };
+    let sep_left = bottom
+        .row_at(top.left_col)
+        .saturating_sub(top.row_at(top.left_col));
+    let sep_right = bottom
+        .row_at(top.right_col)
+        .saturating_sub(top.row_at(top.right_col));
+    let thickness = (sep_left + sep_right) / 2;
+    if thickness < params.min_separation || thickness > params.max_separation {
+        return None;
     }
 
-    // Collect raw votes.
-    let votes: Vec<(usize, u32)> = per_col_row
+    // Build the closing quad on the conservative left/right extents
+    // shared by both edges (avoids drawing a corner that only the top
+    // OR only the bottom edge actually observed).
+    let left_col = top.left_col.max(bottom.left_col);
+    let right_col = top.right_col.min(bottom.right_col);
+    if right_col <= left_col {
+        return None;
+    }
+    let mean_width = (right_col - left_col + 1) as f32;
+    let aspect = if thickness > 0 {
+        mean_width / thickness as f32
+    } else {
+        f32::INFINITY
+    };
+    if aspect < params.min_aspect_ratio || aspect > params.max_aspect_ratio {
+        return None;
+    }
+    let bound_row = |r: u32| r.min((h - 1) as u32);
+    let corners = [
+        (left_col, bound_row(top.row_at(left_col))),
+        (right_col, bound_row(top.row_at(right_col))),
+        (right_col, bound_row(bottom.row_at(right_col))),
+        (left_col, bound_row(bottom.row_at(left_col))),
+    ];
+
+    Some(LockbarQuadRgb {
+        frame_width: width,
+        frame_height: height,
+        corners,
+        slope_deg: top.slope_deg(),
+        thickness_px: thickness,
+        n_inliers_top: top.n_inliers,
+        n_inliers_bottom: bottom.n_inliers,
+    })
+}
+
+/// Median-then-least-squares fit on per-column row votes. Rejects when
+/// the inlier set spans too few or too many columns, or when no
+/// consistent line emerges.
+fn fit_line(
+    per_col: &[Option<u32>],
+    min_cols: usize,
+    max_cols: usize,
+    max_row_deviation: u32,
+) -> Option<FittedLine> {
+    let votes: Vec<(usize, u32)> = per_col
         .iter()
         .enumerate()
         .filter_map(|(c, &r)| r.map(|r| (c, r)))
@@ -336,21 +503,24 @@ pub fn detect_lockbar_rgb(
         return None;
     }
 
-    // Median row → inlier filter.
     let mut rows_sorted: Vec<u32> = votes.iter().map(|(_, r)| *r).collect();
     rows_sorted.sort_unstable();
     let median_row = rows_sorted[rows_sorted.len() / 2];
-    let dev = params.max_row_deviation;
 
     let inliers: Vec<(usize, u32)> = votes
         .into_iter()
-        .filter(|(_, r)| r.abs_diff(median_row) <= dev)
+        .filter(|(_, r)| r.abs_diff(median_row) <= max_row_deviation)
         .collect();
     if inliers.len() < min_cols {
         return None;
     }
 
-    // Least-squares line fit row = slope * col + intercept.
+    let left_col = inliers.iter().map(|(c, _)| *c).min().unwrap();
+    let right_col = inliers.iter().map(|(c, _)| *c).max().unwrap();
+    if right_col - left_col + 1 > max_cols {
+        return None;
+    }
+
     let n = inliers.len() as f64;
     let mut sx = 0.0f64;
     let mut sy = 0.0f64;
@@ -373,24 +543,11 @@ pub fn detect_lockbar_rgb(
         (0.0, sy / n)
     };
 
-    let left_col = inliers.iter().map(|(c, _)| *c).min().unwrap();
-    let right_col = inliers.iter().map(|(c, _)| *c).max().unwrap();
-    let left_row = (slope * left_col as f64 + intercept)
-        .round()
-        .clamp(0.0, (h - 1) as f64) as u32;
-    let right_row = (slope * right_col as f64 + intercept)
-        .round()
-        .clamp(0.0, (h - 1) as f64) as u32;
-    let slope_deg = slope.atan().to_degrees() as f32;
-
-    Some(LockbarObservationRgb {
-        frame_width: width,
-        frame_height: height,
+    Some(FittedLine {
+        slope,
+        intercept,
         left_col: left_col as u32,
-        left_row,
         right_col: right_col as u32,
-        right_row,
-        slope_deg,
         n_inliers: inliers.len() as u32,
     })
 }
@@ -482,85 +639,112 @@ mod tests {
 
     // ============================== RGB detection tests
 
-    /// Build a synthetic RGB frame: white above `band_top`, black from
-    /// `band_top` onward. The transition row is the lockbar's top edge.
-    fn rgb_with_horizontal_edge(width: u32, height: u32, band_top: u32) -> Vec<u8> {
-        let mut out = vec![0u8; (width as usize) * (height as usize) * 3];
-        for v in 0..height {
-            let lum: u8 = if v < band_top { 240 } else { 20 };
-            for u in 0..width {
+    /// Build an RGB888 frame with a horizontal dark BAND between rows
+    /// `band_top` and `band_bot` (inclusive). Everything else is white.
+    /// `left_col`/`right_col` (inclusive) determine the band's
+    /// horizontal extent; outside those columns the band rows are
+    /// also white. This simulates a finite-width lockbar surface.
+    fn rgb_with_band(
+        width: u32,
+        height: u32,
+        band_top: u32,
+        band_bot: u32,
+        left_col: u32,
+        right_col: u32,
+    ) -> Vec<u8> {
+        let mut out = vec![240u8; (width as usize) * (height as usize) * 3];
+        for v in band_top..=band_bot.min(height - 1) {
+            for u in left_col..=right_col.min(width - 1) {
                 let i = ((v * width + u) as usize) * 3;
-                out[i] = lum;
-                out[i + 1] = lum;
-                out[i + 2] = lum;
+                out[i] = 20;
+                out[i + 1] = 20;
+                out[i + 2] = 20;
             }
         }
         out
     }
 
     #[test]
-    fn rgb_detects_horizontal_edge_in_bottom_zone() {
-        // 100×100 frame, edge at row 80 → bottom 35% covers 65..100.
-        let data = rgb_with_horizontal_edge(100, 100, 80);
-        let obs =
-            detect_lockbar_rgb(&data, 100, 100, &LockbarRgbParams::default()).expect("detected");
-        // The gradient peak between row 79 (white) and row 80 (black)
-        // → strongest at row 79 (above = white, below = black).
+    fn rgb_detects_band_in_bottom_zone() {
+        // 200×200 frame, dark band at rows 160..175 spanning cols
+        // 30..170 (~70% width, ~15 px thick). bottom_fraction default
+        // 0.75 → search starts at row 150 → band fully in scope.
+        let data = rgb_with_band(200, 200, 160, 175, 30, 170);
+        let q =
+            detect_lockbar_rgb(&data, 200, 200, &LockbarRgbParams::default()).expect("detected");
         assert!(
-            obs.mean_row() >= 78 && obs.mean_row() <= 80,
-            "mean row was {}",
-            obs.mean_row()
+            q.thickness_px >= 10 && q.thickness_px <= 20,
+            "thickness {} px not near 15",
+            q.thickness_px
         );
-        assert_eq!(obs.left_col, 0);
-        assert_eq!(obs.right_col, 99);
+        // Quad spans the band roughly 30..170 horizontally — allow a
+        // few pixels of slack at the edges (the gradient at columns
+        // 30/170 vs 29/171 picks up subtly).
         assert!(
-            obs.slope_deg.abs() < 0.5,
+            q.corners[0].0 <= 35 && q.corners[1].0 >= 165,
+            "horizontal extent off: corners {:?}",
+            q.corners
+        );
+        assert!(
+            q.slope_deg.abs() < 0.5,
             "should be flat, got {}°",
-            obs.slope_deg
+            q.slope_deg
         );
-        assert!(obs.n_inliers >= 90, "n_inliers = {}", obs.n_inliers);
+        assert!(q.n_inliers_top >= 100 && q.n_inliers_bottom >= 100);
     }
 
     #[test]
-    fn rgb_ignores_edge_in_top_zone() {
-        // Edge at row 20 — outside the bottom 35% search zone.
-        let data = rgb_with_horizontal_edge(100, 100, 20);
-        let obs = detect_lockbar_rgb(&data, 100, 100, &LockbarRgbParams::default());
-        assert!(obs.is_none(), "top-zone edge should not be detected");
-    }
-
-    #[test]
-    fn rgb_recovers_slope_from_tilted_edge() {
-        // Tilted edge: row = 80 + (col - 50) * 0.1 → slope ≈ atan(0.1) ≈ 5.7°
-        let width = 200u32;
-        let height = 100u32;
-        let mut out = vec![0u8; (width as usize) * (height as usize) * 3];
-        for u in 0..width {
-            let edge_row = 80.0 + ((u as f32) - 100.0) * 0.1;
-            for v in 0..height {
-                let lum: u8 = if (v as f32) < edge_row { 240 } else { 20 };
-                let i = ((v * width + u) as usize) * 3;
-                out[i] = lum;
-                out[i + 1] = lum;
-                out[i + 2] = lum;
+    fn rgb_rejects_single_edge() {
+        // Half-white / half-dark frame — only ONE horizontal edge in
+        // the ROI. The pair-finder shouldn't manufacture a second one.
+        let mut data = vec![240u8; 200 * 200 * 3];
+        for v in 170..200 {
+            for u in 0..200 {
+                let i = ((v * 200 + u) as usize) * 3;
+                data[i] = 20;
+                data[i + 1] = 20;
+                data[i + 2] = 20;
             }
         }
-        let obs = detect_lockbar_rgb(&out, width, height, &LockbarRgbParams::default())
-            .expect("detected");
-        let expected_deg = 0.1f32.atan().to_degrees();
-        assert!(
-            (obs.slope_deg - expected_deg).abs() < 1.0,
-            "slope {}° not within ±1° of expected {}°",
-            obs.slope_deg,
-            expected_deg
-        );
+        let q = detect_lockbar_rgb(&data, 200, 200, &LockbarRgbParams::default());
+        assert!(q.is_none(), "single edge must not produce a quad");
+    }
+
+    #[test]
+    fn rgb_rejects_full_width_horizon() {
+        // Dark band spans the full width — looks like a room horizon
+        // line, NOT a finite cabinet front. max_width_fraction 0.85
+        // by default should reject it.
+        let data = rgb_with_band(200, 200, 160, 175, 0, 199);
+        let q = detect_lockbar_rgb(&data, 200, 200, &LockbarRgbParams::default());
+        assert!(q.is_none(), "full-width band must be rejected");
+    }
+
+    #[test]
+    fn rgb_ignores_band_in_top_zone() {
+        // Band high in the frame — outside the bottom 25% ROI.
+        let data = rgb_with_band(200, 200, 20, 35, 30, 170);
+        let q = detect_lockbar_rgb(&data, 200, 200, &LockbarRgbParams::default());
+        assert!(q.is_none(), "top-zone band should not be detected");
     }
 
     #[test]
     fn rgb_rejects_uniform_frame() {
-        // All-gray frame: no edge anywhere.
-        let data = vec![128u8; 100 * 100 * 3];
-        let obs = detect_lockbar_rgb(&data, 100, 100, &LockbarRgbParams::default());
-        assert!(obs.is_none(), "uniform frame should produce no detection");
+        let data = vec![128u8; 200 * 200 * 3];
+        let q = detect_lockbar_rgb(&data, 200, 200, &LockbarRgbParams::default());
+        assert!(q.is_none(), "uniform frame should produce no detection");
+    }
+
+    #[test]
+    fn rgb_rejects_band_with_implausible_aspect_ratio() {
+        // Band 50 px wide × 30 px thick → ratio 1.67, way below
+        // min_aspect_ratio 4.0. That looks like a square panel, not
+        // a long-and-flat lockbar.
+        let data = rgb_with_band(200, 200, 150, 180, 75, 124);
+        let q = detect_lockbar_rgb(&data, 200, 200, &LockbarRgbParams::default());
+        assert!(
+            q.is_none(),
+            "near-square band should be rejected by aspect ratio"
+        );
     }
 }

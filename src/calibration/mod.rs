@@ -20,6 +20,6 @@ pub mod lockbar;
 #[cfg(any(feature = "kinect-v2", feature = "kinect-v1", feature = "webcam"))]
 pub use hand_fiducial::{HandFiducialFrame, HandPair, LockbarGeometry, observe};
 pub use lockbar::{
-    LOCKBAR_WIDTH_MM, LockbarObservation, LockbarObservationRgb, LockbarParams, LockbarRgbParams,
+    LOCKBAR_WIDTH_MM, LockbarObservation, LockbarParams, LockbarQuadRgb, LockbarRgbParams,
     detect_lockbar, detect_lockbar_rgb,
 };

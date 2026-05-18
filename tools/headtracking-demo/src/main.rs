@@ -61,6 +61,26 @@ fn main() -> eframe::Result {
         "headtracking-demo starting"
     );
 
+    // CLI: `--capture <backend>` runs a headless capture (no eframe)
+    // and exits. Used by `ssh` from a remote workstation to iterate
+    // on the lockbar algorithm without needing a body in front of
+    // the camera.
+    match parse_cli() {
+        Err(msg) => {
+            eprintln!("error: {msg}\n\n{CLI_USAGE}");
+            std::process::exit(2);
+        }
+        Ok(Some(cap)) => match run_headless_capture(cap) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                error!(error = %e, "headless capture failed");
+                eprintln!("capture failed: {e}");
+                std::process::exit(1);
+            }
+        },
+        Ok(None) => {}
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])
@@ -73,6 +93,191 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| Ok(Box::new(App::new(logs)))),
     )
+}
+
+// ============================================================ CLI parsing
+
+const CLI_USAGE: &str = "\
+Usage: headtracking-demo [--capture <backend> [--out <path>] [--wait <secs>]]
+
+  --capture <backend>   Run headless: open backend, settle for `--wait`
+                        seconds, save one PNG, exit.
+                        backend = kinect-v2 | kinect-v1 | webcam | webcam-<N>
+  --out <path>          Output PNG path. Default: next to the binary,
+                        named `<backend>_<UTC-timestamp>.png`.
+  --wait <secs>         Seconds to let the device warm up + face/lockbar
+                        detectors lock on before the capture (default 3).
+  -h, --help            Print this message.
+
+No arguments → launches the interactive GUI.";
+
+struct CaptureArgs {
+    backend: Backend,
+    out_path: Option<std::path::PathBuf>,
+    wait_secs: f32,
+}
+
+fn parse_cli() -> Result<Option<CaptureArgs>, String> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{CLI_USAGE}");
+        std::process::exit(0);
+    }
+
+    let mut backend: Option<Backend> = None;
+    let mut out_path: Option<std::path::PathBuf> = None;
+    let mut wait_secs: f32 = 3.0;
+    let mut iter = raw.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--capture" => {
+                let v = iter.next().ok_or("--capture needs a backend name")?;
+                backend = Some(parse_backend_arg(v)?);
+            }
+            "--out" => {
+                let v = iter.next().ok_or("--out needs a path")?;
+                out_path = Some(std::path::PathBuf::from(v));
+            }
+            "--wait" => {
+                let v = iter.next().ok_or("--wait needs a seconds value")?;
+                wait_secs = v
+                    .parse()
+                    .map_err(|e| format!("--wait value '{v}' invalid: {e}"))?;
+            }
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+    let backend = backend.ok_or("--capture <backend> is required for non-GUI mode")?;
+    Ok(Some(CaptureArgs {
+        backend,
+        out_path,
+        wait_secs,
+    }))
+}
+
+fn parse_backend_arg(s: &str) -> Result<Backend, String> {
+    match s {
+        "kinect-v2" => Ok(Backend::KinectV2),
+        "kinect-v1" => Ok(Backend::KinectV1),
+        "webcam" => Ok(Backend::Webcam(1)),
+        s if s.starts_with("webcam-") => {
+            let n: u32 = s
+                .strip_prefix("webcam-")
+                .unwrap()
+                .parse()
+                .map_err(|e| format!("bad webcam index in '{s}': {e}"))?;
+            Ok(Backend::Webcam(n))
+        }
+        other => Err(format!(
+            "unknown backend '{other}' (expected kinect-v2, kinect-v1, webcam, or webcam-<N>)"
+        )),
+    }
+}
+
+// ============================================================ Headless capture
+
+fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
+    info!(
+        backend = ?cap.backend,
+        wait_secs = cap.wait_secs,
+        out = ?cap.out_path,
+        "headless capture starting"
+    );
+    let mut active = open_backend(cap.backend)?;
+    let deadline = Instant::now() + Duration::from_secs_f32(cap.wait_secs.max(0.1));
+    while Instant::now() < deadline {
+        poll_active_headless(&mut active);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    let (w, h, rgb) = active
+        .last_rgb_frame
+        .as_ref()
+        .ok_or_else(|| format!("no RGB frame received in {:.1}s", cap.wait_secs))?;
+
+    let path = if let Some(p) = cap.out_path {
+        save_rgb_screenshot_at(
+            &p,
+            *w,
+            *h,
+            rgb,
+            &active.last_faces,
+            active.last_lockbar.as_ref(),
+        )?;
+        p
+    } else {
+        let slug = backend_slug(active.backend);
+        save_rgb_screenshot(
+            &slug,
+            *w,
+            *h,
+            rgb,
+            &active.last_faces,
+            active.last_lockbar.as_ref(),
+        )?
+    };
+
+    info!(
+        path = %path.display(),
+        n_faces = active.last_faces.len(),
+        lockbar_found = active.last_lockbar.is_some(),
+        "headless capture saved"
+    );
+    Ok(())
+}
+
+/// Same as `App::poll` minus the egui texture upload (we don't render
+/// anything in headless mode) and the depth → head-pose path (the
+/// screenshot only cares about RGB + face boxes + lockbar quad).
+fn poll_active_headless(active: &mut Active) {
+    match &mut active.inner {
+        Inner::KinectV2 { device, .. } => {
+            if let Some(rgb) = device.poll_rgb() {
+                let rgb888 = bgrx_to_rgb888(&rgb.data);
+                if let Some(detector) = active.face_detector.as_ref() {
+                    active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
+                }
+                active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                    &rgb888,
+                    rgb.width,
+                    rgb.height,
+                    &headtracking::calibration::LockbarRgbParams::default(),
+                );
+                active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
+            }
+        }
+        Inner::KinectV1 { device, .. } => {
+            if let Some(rgb) = device.poll_rgb() {
+                if let Some(detector) = active.face_detector.as_ref() {
+                    active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
+                }
+                active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                    &rgb.data,
+                    rgb.width,
+                    rgb.height,
+                    &headtracking::calibration::LockbarRgbParams::default(),
+                );
+                active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
+            }
+        }
+        Inner::Webcam { camera } => {
+            if let Some(rgb) = camera.poll_rgb() {
+                if let Some(detector) = active.face_detector.as_mut() {
+                    active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
+                }
+                active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                    &rgb.data,
+                    rgb.width,
+                    rgb.height,
+                    &headtracking::calibration::LockbarRgbParams::default(),
+                );
+                active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
+            }
+        }
+    }
 }
 
 // ============================================================ Backend dropdown
@@ -578,7 +783,7 @@ struct Active {
     started_at: Instant,
     /// Latest RGB-based lockbar detection — runs unconditionally on
     /// every frame from any backend (Kinect v1/v2 RGB or webcam).
-    last_lockbar: Option<headtracking::calibration::LockbarObservationRgb>,
+    last_lockbar: Option<headtracking::calibration::LockbarQuadRgb>,
     /// `Some` when face detection is enabled (currently auto-enabled for
     /// the webcam backend). Cheap to keep around — YuNet runs in <10 ms
     /// at 320×320 on CPU.
@@ -1187,7 +1392,14 @@ impl eframe::App for App {
                     && let Some((w, h, bytes)) = active.last_rgb_frame.as_ref()
                 {
                     let slug = backend_slug(active.backend);
-                    self.screenshot_status = Some(save_rgb_screenshot(&slug, *w, *h, bytes));
+                    self.screenshot_status = Some(save_rgb_screenshot(
+                        &slug,
+                        *w,
+                        *h,
+                        bytes,
+                        &active.last_faces,
+                        active.last_lockbar.as_ref(),
+                    ));
                     match &self.screenshot_status {
                         Some(Ok(p)) => info!(path = %p.display(), "screenshot saved"),
                         Some(Err(e)) => error!(error = %e, "screenshot failed"),
@@ -1216,11 +1428,14 @@ impl eframe::App for App {
                 {
                     ui.label(
                         RichText::new(format!(
-                            "lockbar row {}, width {} px, slope {:+.1}°, n={}",
+                            "lockbar row {}, w {}px, t {}px, ratio {:.1}, slope {:+.1}°, n={}/{}",
                             bar.mean_row(),
-                            bar.width_px(),
+                            bar.mean_width_px(),
+                            bar.thickness_px,
+                            bar.mean_width_px() as f32 / bar.thickness_px.max(1) as f32,
                             bar.slope_deg,
-                            bar.n_inliers,
+                            bar.n_inliers_top,
+                            bar.n_inliers_bottom,
                         ))
                         .color(LOCKBAR_COLOR)
                         .monospace()
@@ -1541,7 +1756,7 @@ fn draw_face_bbox(painter: &egui::Painter, rect: Rect, face: &face::FaceDetectio
 fn draw_lockbar(
     painter: &egui::Painter,
     rect: Rect,
-    bar: headtracking::calibration::LockbarObservationRgb,
+    bar: headtracking::calibration::LockbarQuadRgb,
 ) {
     if bar.frame_width == 0 || bar.frame_height == 0 {
         return;
@@ -1555,21 +1770,17 @@ fn draw_lockbar(
                 (row as f32 / fh) * rect.height(),
             )
     };
-    let p_left = to_screen(bar.left_col, bar.left_row);
-    let p_right = to_screen(bar.right_col, bar.right_row);
-    painter.line_segment([p_left, p_right], Stroke::new(3.0, LOCKBAR_COLOR));
-    // Vertical tick marks at each end of the fitted line.
-    painter.line_segment(
-        [p_left + Vec2::new(0.0, -8.0), p_left + Vec2::new(0.0, 8.0)],
-        Stroke::new(2.0, LOCKBAR_COLOR),
-    );
-    painter.line_segment(
-        [
-            p_right + Vec2::new(0.0, -8.0),
-            p_right + Vec2::new(0.0, 8.0),
-        ],
-        Stroke::new(2.0, LOCKBAR_COLOR),
-    );
+    let pts: [Pos2; 4] = [
+        to_screen(bar.corners[0].0, bar.corners[0].1),
+        to_screen(bar.corners[1].0, bar.corners[1].1),
+        to_screen(bar.corners[2].0, bar.corners[2].1),
+        to_screen(bar.corners[3].0, bar.corners[3].1),
+    ];
+    let stroke = Stroke::new(3.0, LOCKBAR_COLOR);
+    painter.line_segment([pts[0], pts[1]], stroke);
+    painter.line_segment([pts[1], pts[2]], stroke);
+    painter.line_segment([pts[2], pts[3]], stroke);
+    painter.line_segment([pts[3], pts[0]], stroke);
 }
 
 // ============================================================ Backend opening
@@ -1818,14 +2029,145 @@ fn format_utc_stamp(secs: u64) -> String {
     format!("{y:04}{month_civil:02}{d:02}-{h:02}{m:02}{s:02}")
 }
 
-/// Encode an RGB888 buffer as PNG and write it next to the running
-/// executable. Returns the saved path on success. Used by the
-/// "Screenshot" toolbar button.
+/// Paint a single pixel into a row-major RGB888 buffer. No-op when
+/// out of bounds — callers can clip downstream without checking.
+fn put_pixel(buf: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 3]) {
+    if x < 0 || y < 0 || (x as u32) >= width || (y as u32) >= height {
+        return;
+    }
+    let i = ((y as u32 * width + x as u32) as usize) * 3;
+    buf[i] = color[0];
+    buf[i + 1] = color[1];
+    buf[i + 2] = color[2];
+}
+
+/// Bresenham line, thickened by `radius` (Chebyshev). `radius = 0`
+/// paints a single-pixel line; `radius = 1` paints a 3-px-thick line.
+fn draw_line(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    (mut x0, mut y0): (i32, i32),
+    (x1, y1): (i32, i32),
+    color: [u8; 3],
+    radius: i32,
+) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        for ox in -radius..=radius {
+            for oy in -radius..=radius {
+                put_pixel(buf, width, height, x0 + ox, y0 + oy, color);
+            }
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/// Draw the outline of an axis-aligned rectangle (face bbox).
+fn draw_rect_outline(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    (x0, y0): (i32, i32),
+    (x1, y1): (i32, i32),
+    color: [u8; 3],
+    radius: i32,
+) {
+    draw_line(buf, width, height, (x0, y0), (x1, y0), color, radius);
+    draw_line(buf, width, height, (x1, y0), (x1, y1), color, radius);
+    draw_line(buf, width, height, (x1, y1), (x0, y1), color, radius);
+    draw_line(buf, width, height, (x0, y1), (x0, y0), color, radius);
+}
+
+/// Bake the same overlays the GUI draws (face bbox in red, lockbar
+/// quad in cyan) directly into a copy of the RGB888 buffer. Used by
+/// the screenshot path so users can read back what the algorithms
+/// saw, not just the raw frame.
+fn bake_overlays(
+    width: u32,
+    height: u32,
+    rgb888: &[u8],
+    faces: &[face::FaceDetection],
+    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+) -> Vec<u8> {
+    const FACE_RGB: [u8; 3] = [0xff, 0x60, 0x60];
+    const LOCKBAR_RGB: [u8; 3] = [0x00, 0xe5, 0xff];
+    let mut out = rgb888.to_vec();
+    for face in faces {
+        let x0 = face.x.round() as i32;
+        let y0 = face.y.round() as i32;
+        let x1 = (face.x + face.width).round() as i32;
+        let y1 = (face.y + face.height).round() as i32;
+        draw_rect_outline(&mut out, width, height, (x0, y0), (x1, y1), FACE_RGB, 1);
+    }
+    if let Some(bar) = lockbar {
+        for w in 0..4 {
+            let a = bar.corners[w];
+            let b = bar.corners[(w + 1) % 4];
+            draw_line(
+                &mut out,
+                width,
+                height,
+                (a.0 as i32, a.1 as i32),
+                (b.0 as i32, b.1 as i32),
+                LOCKBAR_RGB,
+                1,
+            );
+        }
+    }
+    out
+}
+
+/// Encode an RGB888 buffer as PNG with overlays baked in and write
+/// to the given path. Returns Ok on success.
+fn save_rgb_screenshot_at(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgb888: &[u8],
+    faces: &[face::FaceDetection],
+    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+) -> Result<(), String> {
+    let painted = bake_overlays(width, height, rgb888, faces, lockbar);
+    let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut wr = encoder
+        .write_header()
+        .map_err(|e| format!("png header: {e}"))?;
+    wr.write_image_data(&painted)
+        .map_err(|e| format!("png write: {e}"))?;
+    Ok(())
+}
+
+/// Save a screenshot to the default location: next to the running
+/// executable, named `<slug>_<UTC-timestamp>.png`. Used by the
+/// "Screenshot" toolbar button and the headless capture mode when
+/// the user didn't pass `--out`.
 fn save_rgb_screenshot(
     slug: &str,
     width: u32,
     height: u32,
     rgb888: &[u8],
+    faces: &[face::FaceDetection],
+    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
 ) -> Result<std::path::PathBuf, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -1838,17 +2180,7 @@ fn save_rgb_screenshot(
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = dir.join(format!("{slug}_{stamp}.png"));
-
-    let file = std::fs::File::create(&path).map_err(|e| format!("create {path:?}: {e}"))?;
-    let writer = std::io::BufWriter::new(file);
-    let mut encoder = png::Encoder::new(writer, width, height);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut wr = encoder
-        .write_header()
-        .map_err(|e| format!("png header: {e}"))?;
-    wr.write_image_data(rgb888)
-        .map_err(|e| format!("png write: {e}"))?;
+    save_rgb_screenshot_at(&path, width, height, rgb888, faces, lockbar)?;
     Ok(path)
 }
 
