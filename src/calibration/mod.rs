@@ -1,9 +1,10 @@
 //! Calibration helpers — pincab geometry and per-sensor anchoring.
 //!
 //! Two complementary fiducial paths:
-//! * [`lockbar`] — depth-based detection of the bar's silhouette.
-//!   Robust on Kinect, fragile on webcam (occluded by hands, lit
-//!   poorly by ambient light).
+//! * [`lockbar`] — bar-silhouette detection. Depth-based variant
+//!   ([`detect_lockbar`]) is Kinect-only; RGB-based variant
+//!   ([`detect_lockbar_rgb`]) works on any camera (Kinect RGB stream,
+//!   webcam) by tracking the strongest horizontal luminance edge.
 //! * [`hand_fiducial`] — 2D detection of the player's hands as a
 //!   known-width fiducial. Always visible during play; supersedes
 //!   `lockbar` for the webcam tracker once BlazePalm is wired in.
@@ -18,4 +19,7 @@ pub mod lockbar;
 
 #[cfg(any(feature = "kinect-v2", feature = "kinect-v1", feature = "webcam"))]
 pub use hand_fiducial::{HandFiducialFrame, HandPair, LockbarGeometry, observe};
-pub use lockbar::{LockbarObservation, LockbarParams, detect_lockbar};
+pub use lockbar::{
+    LOCKBAR_WIDTH_MM, LockbarObservation, LockbarObservationRgb, LockbarParams, LockbarRgbParams,
+    detect_lockbar, detect_lockbar_rgb,
+};

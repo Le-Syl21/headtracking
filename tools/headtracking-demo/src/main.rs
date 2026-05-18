@@ -38,6 +38,13 @@ const DEPTH_MAX_MM: f32 = 2_500.0;
 
 const LOG_BUFFER_LINES: usize = 1_000;
 
+// Overlay colours, kept here so the toolbar status text and the canvas
+// drawing stay in sync. Face → soft red; lockbar → bright cyan
+// (high contrast against red, visible on both bright playfield reflections
+// and dark cabinet interiors).
+const FACE_COLOR: Color32 = Color32::from_rgb(0xff, 0x60, 0x60);
+const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
+
 fn main() -> eframe::Result {
     let logs: Arc<Mutex<VecDeque<String>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_LINES)));
@@ -104,7 +111,13 @@ fn detect_backends() -> Vec<BackendEntry> {
     }];
 
     // ---- Kinect v2 (libfreenect2)
-    let mut v2_listed = false;
+    //
+    // We deliberately *don't* fall back to a sysfs probe when
+    // `enumerate()` returns 0: the access-hint banner already fires on
+    // any uncovered Kinect PID, and the libfreenect2 logger bridge
+    // surfaces the precise `LIBUSB_ERROR_ACCESS` reason in the log
+    // panel. Adding a fake "Kinect v2" entry that errors on click was
+    // misleading once the banner+log pipeline became actionable.
     match freenect2::Context::new() {
         Ok(ctx) => {
             let n = ctx.enumerate();
@@ -114,24 +127,9 @@ fn detect_backends() -> Vec<BackendEntry> {
                     backend: Backend::KinectV2,
                     label: "Kinect v2".to_string(),
                 });
-                v2_listed = true;
             }
         }
         Err(e) => warn!(?e, "scan: kinect v2 context init failed"),
-    }
-    // Linux fallback: libfreenect2's `enumerate()` *opens* each matching
-    // device via libusb and silently drops those returning EACCES, so a
-    // v2 without its udev rule is invisible. Probe sysfs by VID/PID and
-    // surface the device anyway — the user gets a clickable entry, the
-    // open attempt later produces a readable error, and the access-hint
-    // banner explains the fix in parallel.
-    #[cfg(target_os = "linux")]
-    if !v2_listed && linux_v2_present_on_usb() {
-        info!("scan: kinect v2 — surfaced via sysfs fallback (no libfreenect2 access)");
-        out.push(BackendEntry {
-            backend: Backend::KinectV2,
-            label: "Kinect v2".to_string(),
-        });
     }
 
     // ---- Kinect v1 (libfreenect)
@@ -292,17 +290,6 @@ fn sysfs_present_kinect_pids() -> std::collections::HashSet<String> {
             KINECT_PIDS.contains(&pid.as_str()).then_some(pid)
         })
         .collect()
-}
-
-/// Linux: `true` iff at least one Kinect v2 PID (`02c4`/`02d8`/`02d9`)
-/// is plugged in on USB right now. Used as a fallback in
-/// [`detect_backends`] when libfreenect2's `enumerate()` reports 0
-/// (typically because libusb_open returns EACCES without the udev rule).
-#[cfg(target_os = "linux")]
-fn linux_v2_present_on_usb() -> bool {
-    sysfs_present_kinect_pids()
-        .iter()
-        .any(|p| matches!(p.as_str(), "02c4" | "02d8" | "02d9"))
 }
 
 /// Linux: any Kinect v1 (Xbox 360 model 1414: `02ae`/`02ad`/`02b0`;
@@ -589,9 +576,9 @@ struct Active {
     v1_controls: Option<V1Controls>,
     pose_filter: filter_alias::OneEuroPose3D,
     started_at: Instant,
-    /// Run lockbar detection on each depth frame and overlay it.
-    lockbar_enabled: bool,
-    last_lockbar: Option<headtracking::calibration::LockbarObservation>,
+    /// Latest RGB-based lockbar detection — runs unconditionally on
+    /// every frame from any backend (Kinect v1/v2 RGB or webcam).
+    last_lockbar: Option<headtracking::calibration::LockbarObservationRgb>,
     /// `Some` when face detection is enabled (currently auto-enabled for
     /// the webcam backend). Cheap to keep around — YuNet runs in <10 ms
     /// at 320×320 on CPU.
@@ -900,12 +887,19 @@ impl App {
         match &mut active.inner {
             Inner::KinectV2 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
-                    // Convert BGRX → RGB888 once; both the face detector
-                    // and the screenshot button want packed RGB.
+                    // Convert BGRX → RGB888 once; face detector, lockbar
+                    // detector and screenshot button all consume the
+                    // packed-RGB buffer.
                     let rgb888 = bgrx_to_rgb888(&rgb.data);
                     if let Some(detector) = active.face_detector.as_ref() {
                         active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
                     }
+                    active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                        &rgb888,
+                        rgb.width,
+                        rgb.height,
+                        &headtracking::calibration::LockbarRgbParams::default(),
+                    );
                     let img = bgrx_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
@@ -931,14 +925,6 @@ impl App {
                     let smoothed = smooth_head(head, &mut active.pose_filter, active.started_at);
                     capture_baseline(&mut active.baseline, smoothed);
                     active.last_head = smoothed;
-                    if active.lockbar_enabled {
-                        active.last_lockbar = headtracking::calibration::detect_lockbar(
-                            &depth.data,
-                            depth.width,
-                            depth.height,
-                            &headtracking::calibration::LockbarParams::default(),
-                        );
-                    }
                 }
             }
             Inner::KinectV1 { device, .. } => {
@@ -946,6 +932,12 @@ impl App {
                     if let Some(detector) = active.face_detector.as_ref() {
                         active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
                     }
+                    active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                        &rgb.data,
+                        rgb.width,
+                        rgb.height,
+                        &headtracking::calibration::LockbarRgbParams::default(),
+                    );
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
@@ -968,14 +960,6 @@ impl App {
                     let smoothed = smooth_head(head, &mut active.pose_filter, active.started_at);
                     capture_baseline(&mut active.baseline, smoothed);
                     active.last_head = smoothed;
-                    if active.lockbar_enabled {
-                        active.last_lockbar = headtracking::calibration::detect_lockbar(
-                            &f32_data,
-                            depth.width,
-                            depth.height,
-                            &headtracking::calibration::LockbarParams::default(),
-                        );
-                    }
                 }
             }
             Inner::Webcam { camera } => {
@@ -994,6 +978,12 @@ impl App {
                             active.last_head = None;
                         }
                     }
+                    active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                        &rgb.data,
+                        rgb.width,
+                        rgb.height,
+                        &headtracking::calibration::LockbarRgbParams::default(),
+                    );
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
@@ -1221,27 +1211,21 @@ impl eframe::App for App {
                     };
                 }
                 ui.separator();
-                if let Some(active) = self.active.as_mut()
-                    && active.inner.has_head_tracker()
+                if let Some(active) = self.active.as_ref()
+                    && let Some(bar) = active.last_lockbar
                 {
-                    ui.checkbox(&mut active.lockbar_enabled, "lockbar");
-                    if !active.lockbar_enabled {
-                        active.last_lockbar = None;
-                    }
-                    if let Some(bar) = active.last_lockbar {
-                        ui.label(
-                            RichText::new(format!(
-                                "row {}, width {} px, depth {:.0} mm (σ {:.1})",
-                                bar.row,
-                                bar.width_px(),
-                                bar.mean_depth_mm,
-                                bar.depth_stddev_mm,
-                            ))
-                            .color(Color32::from_rgb(0xff, 0x40, 0x80))
-                            .monospace()
-                            .size(11.0),
-                        );
-                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "lockbar row {}, width {} px, slope {:+.1}°, n={}",
+                            bar.mean_row(),
+                            bar.width_px(),
+                            bar.slope_deg,
+                            bar.n_inliers,
+                        ))
+                        .color(LOCKBAR_COLOR)
+                        .monospace()
+                        .size(11.0),
+                    );
                     ui.separator();
                 }
                 if let Some(active) = self.active.as_ref() {
@@ -1541,49 +1525,50 @@ fn draw_face_bbox(painter: &egui::Painter, rect: Rect, face: &face::FaceDetectio
     let p2 = to_screen(face.x + face.width, face.y);
     let p3 = to_screen(face.x + face.width, face.y + face.height);
     let p4 = to_screen(face.x, face.y + face.height);
-    let red = Color32::from_rgb(0xff, 0x60, 0x60);
-    painter.line_segment([p1, p2], Stroke::new(2.0, red));
-    painter.line_segment([p2, p3], Stroke::new(2.0, red));
-    painter.line_segment([p3, p4], Stroke::new(2.0, red));
-    painter.line_segment([p4, p1], Stroke::new(2.0, red));
+    painter.line_segment([p1, p2], Stroke::new(2.0, FACE_COLOR));
+    painter.line_segment([p2, p3], Stroke::new(2.0, FACE_COLOR));
+    painter.line_segment([p3, p4], Stroke::new(2.0, FACE_COLOR));
+    painter.line_segment([p4, p1], Stroke::new(2.0, FACE_COLOR));
     painter.text(
         p1 + Vec2::new(2.0, -14.0),
         egui::Align2::LEFT_BOTTOM,
         format!("{:.0}%", face.confidence * 100.0),
         egui::FontId::monospace(11.0),
-        red,
+        FACE_COLOR,
     );
 }
 
 fn draw_lockbar(
     painter: &egui::Painter,
     rect: Rect,
-    bar: headtracking::calibration::LockbarObservation,
+    bar: headtracking::calibration::LockbarObservationRgb,
 ) {
     if bar.frame_width == 0 || bar.frame_height == 0 {
         return;
     }
-    // Same caveat as the head crosshair: depth frame and RGB frame on the
-    // Kinect v2 are not co-axial, so the bar visualisation is a few pixels
-    // off the true RGB position. Good enough for "is it locked on?".
-    let v_norm = bar.row as f32 / bar.frame_height as f32;
-    let l_norm = bar.left_col as f32 / bar.frame_width as f32;
-    let r_norm = bar.right_col as f32 / bar.frame_width as f32;
-    let p_left = rect.left_top() + Vec2::new(l_norm * rect.width(), v_norm * rect.height());
-    let p_right = rect.left_top() + Vec2::new(r_norm * rect.width(), v_norm * rect.height());
-    let pink = Color32::from_rgb(0xff, 0x40, 0x80);
-    painter.line_segment([p_left, p_right], Stroke::new(3.0, pink));
-    // Tick marks at each end.
+    let fw = bar.frame_width as f32;
+    let fh = bar.frame_height as f32;
+    let to_screen = |col: u32, row: u32| -> Pos2 {
+        rect.left_top()
+            + Vec2::new(
+                (col as f32 / fw) * rect.width(),
+                (row as f32 / fh) * rect.height(),
+            )
+    };
+    let p_left = to_screen(bar.left_col, bar.left_row);
+    let p_right = to_screen(bar.right_col, bar.right_row);
+    painter.line_segment([p_left, p_right], Stroke::new(3.0, LOCKBAR_COLOR));
+    // Vertical tick marks at each end of the fitted line.
     painter.line_segment(
         [p_left + Vec2::new(0.0, -8.0), p_left + Vec2::new(0.0, 8.0)],
-        Stroke::new(2.0, pink),
+        Stroke::new(2.0, LOCKBAR_COLOR),
     );
     painter.line_segment(
         [
             p_right + Vec2::new(0.0, -8.0),
             p_right + Vec2::new(0.0, 8.0),
         ],
-        Stroke::new(2.0, pink),
+        Stroke::new(2.0, LOCKBAR_COLOR),
     );
 }
 
@@ -1638,7 +1623,6 @@ fn open_kinect_v2() -> Result<Active, String> {
         v1_controls: None,
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
-        lockbar_enabled: false,
         last_lockbar: None,
         face_detector: detector,
         last_faces: Vec::new(),
@@ -1701,7 +1685,6 @@ fn open_kinect_v1() -> Result<Active, String> {
         v1_controls: Some(controls),
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
-        lockbar_enabled: false,
         last_lockbar: None,
         face_detector: detector,
         last_faces: Vec::new(),
@@ -1750,7 +1733,6 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         v1_controls: None,
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
-        lockbar_enabled: false,
         last_lockbar: None,
         face_detector: detector,
         last_faces: Vec::new(),
