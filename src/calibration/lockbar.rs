@@ -306,7 +306,7 @@ pub fn detect_lockbar_rgb(
     };
 
     // Per-column: row of strongest vertical gradient in the ROI.
-    let mut per_col_row: Vec<Option<u32>> = vec![None; w];
+    let mut per_col_row: Vec<Option<u32>> = Vec::with_capacity(w);
     for c in 0..w {
         let mut best_row: u32 = 0;
         let mut best_grad: i32 = 0;
@@ -319,9 +319,11 @@ pub fn detect_lockbar_rgb(
                 best_row = r as u32;
             }
         }
-        if (best_grad as f32) >= params.min_edge_strength {
-            per_col_row[c] = Some(best_row);
-        }
+        per_col_row.push(if (best_grad as f32) >= params.min_edge_strength {
+            Some(best_row)
+        } else {
+            None
+        });
     }
 
     // Collect raw votes.
@@ -373,7 +375,9 @@ pub fn detect_lockbar_rgb(
 
     let left_col = inliers.iter().map(|(c, _)| *c).min().unwrap();
     let right_col = inliers.iter().map(|(c, _)| *c).max().unwrap();
-    let left_row = (slope * left_col as f64 + intercept).round().clamp(0.0, (h - 1) as f64) as u32;
+    let left_row = (slope * left_col as f64 + intercept)
+        .round()
+        .clamp(0.0, (h - 1) as f64) as u32;
     let right_row = (slope * right_col as f64 + intercept)
         .round()
         .clamp(0.0, (h - 1) as f64) as u32;
@@ -509,7 +513,11 @@ mod tests {
         );
         assert_eq!(obs.left_col, 0);
         assert_eq!(obs.right_col, 99);
-        assert!(obs.slope_deg.abs() < 0.5, "should be flat, got {}°", obs.slope_deg);
+        assert!(
+            obs.slope_deg.abs() < 0.5,
+            "should be flat, got {}°",
+            obs.slope_deg
+        );
         assert!(obs.n_inliers >= 90, "n_inliers = {}", obs.n_inliers);
     }
 
@@ -537,8 +545,8 @@ mod tests {
                 out[i + 2] = lum;
             }
         }
-        let obs =
-            detect_lockbar_rgb(&out, width, height, &LockbarRgbParams::default()).expect("detected");
+        let obs = detect_lockbar_rgb(&out, width, height, &LockbarRgbParams::default())
+            .expect("detected");
         let expected_deg = 0.1f32.atan().to_degrees();
         assert!(
             (obs.slope_deg - expected_deg).abs() < 1.0,
