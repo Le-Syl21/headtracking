@@ -339,7 +339,12 @@ impl Default for LockbarRgbParams {
         Self {
             bottom_fraction: 0.75,
             min_edge_strength: 20.0,
-            min_width_fraction: 0.30,
+            // 0.10 = 10% of frame width. The Kinect v2's wide FOV
+            // means a 61 cm lockbar at ~76 cm camera-to-bar distance
+            // projects to ~15% of 1920 columns. Lower threshold lets
+            // the algo find it; the aspect-ratio gate kills false
+            // positives from short horizontal features.
+            min_width_fraction: 0.10,
             max_width_fraction: 0.85,
             max_row_deviation: 12,
             min_separation: 8,
@@ -369,6 +374,7 @@ pub fn detect_lockbar_rgb(
     let w = width as usize;
     let h = height as usize;
     if w == 0 || h < 4 || rgb888.len() < w * h * 3 {
+        tracing::debug!(target: "lockbar", "reject: bad frame {w}x{h} / {} bytes", rgb888.len());
         return None;
     }
     let row_start = ((params.bottom_fraction * height as f32) as usize).min(h.saturating_sub(2));
@@ -413,7 +419,19 @@ pub fn detect_lockbar_rgb(
     // Pass 1: find line A (strongest edge in the unfiltered ROI).
     let no_mask = |_r: u32| false;
     let per_col_a: Vec<Option<u32>> = (0..w).map(|c| scan_col(c, &no_mask)).collect();
-    let line_a = fit_line(&per_col_a, min_cols, max_cols, params.max_row_deviation)?;
+    let n_votes_a = per_col_a.iter().filter(|o| o.is_some()).count();
+    let line_a = match fit_line(&per_col_a, min_cols, max_cols, params.max_row_deviation) {
+        Some(l) => l,
+        None => {
+            tracing::debug!(
+                target: "lockbar",
+                "reject: no line A — {n_votes_a} columns above edge threshold, \
+                 need {min_cols}–{max_cols} columns inside ±{} rows of median",
+                params.max_row_deviation
+            );
+            return None;
+        }
+    };
 
     // Pass 2: find line B by masking out the ±min_separation/2 band
     // around line A's prediction, per column.
@@ -425,10 +443,31 @@ pub fn detect_lockbar_rgb(
             scan_col(c, &mask)
         })
         .collect();
-    let line_b = fit_line(&per_col_b, min_cols, max_cols, params.max_row_deviation)?;
+    let n_votes_b = per_col_b.iter().filter(|o| o.is_some()).count();
+    let line_b = match fit_line(&per_col_b, min_cols, max_cols, params.max_row_deviation) {
+        Some(l) => l,
+        None => {
+            tracing::debug!(
+                target: "lockbar",
+                "reject: no line B — line A at row≈{} width≈{}; second-pass got {n_votes_b} \
+                 columns (need ≥{min_cols}, ≤{max_cols})",
+                line_a.mean_row(),
+                line_a.right_col - line_a.left_col + 1
+            );
+            return None;
+        }
+    };
 
     // Validate pair geometry.
-    if (line_a.slope_deg() - line_b.slope_deg()).abs() > params.max_slope_diff_deg {
+    let slope_diff = (line_a.slope_deg() - line_b.slope_deg()).abs();
+    if slope_diff > params.max_slope_diff_deg {
+        tracing::debug!(
+            target: "lockbar",
+            "reject: slope diff {slope_diff:.2}° > max {:.2}° (A={:.2}°, B={:.2}°)",
+            params.max_slope_diff_deg,
+            line_a.slope_deg(),
+            line_b.slope_deg()
+        );
         return None;
     }
     // Sort by mean row so `top` is closer to the top of the image
@@ -446,6 +485,14 @@ pub fn detect_lockbar_rgb(
         .saturating_sub(top.row_at(top.right_col));
     let thickness = (sep_left + sep_right) / 2;
     if thickness < params.min_separation || thickness > params.max_separation {
+        tracing::debug!(
+            target: "lockbar",
+            "reject: thickness {thickness} px outside [{}, {}] (top row≈{}, bottom row≈{})",
+            params.min_separation,
+            params.max_separation,
+            top.mean_row(),
+            bottom.mean_row()
+        );
         return None;
     }
 
@@ -455,6 +502,11 @@ pub fn detect_lockbar_rgb(
     let left_col = top.left_col.max(bottom.left_col);
     let right_col = top.right_col.min(bottom.right_col);
     if right_col <= left_col {
+        tracing::debug!(
+            target: "lockbar",
+            "reject: top [{},{}] and bottom [{},{}] columns don't overlap",
+            top.left_col, top.right_col, bottom.left_col, bottom.right_col
+        );
         return None;
     }
     let mean_width = (right_col - left_col + 1) as f32;
@@ -464,8 +516,28 @@ pub fn detect_lockbar_rgb(
         f32::INFINITY
     };
     if aspect < params.min_aspect_ratio || aspect > params.max_aspect_ratio {
+        tracing::debug!(
+            target: "lockbar",
+            "reject: aspect {aspect:.1} outside [{:.1}, {:.1}] (width={} px, thickness={} px)",
+            params.min_aspect_ratio,
+            params.max_aspect_ratio,
+            mean_width as u32,
+            thickness
+        );
         return None;
     }
+    tracing::debug!(
+        target: "lockbar",
+        "accept: row≈{}, width={} px, thickness={} px, aspect={:.1}, slope={:.2}°, \
+         inliers top={} bottom={}",
+        top.mean_row(),
+        mean_width as u32,
+        thickness,
+        aspect,
+        top.slope_deg(),
+        top.n_inliers,
+        bottom.n_inliers,
+    );
     let bound_row = |r: u32| r.min((h - 1) as u32);
     let corners = [
         (left_col, bound_row(top.row_at(left_col))),
