@@ -28,3 +28,23 @@ target
 
 # Claude Code session-local state
 .claude/
+
+# Research artifacts — large, derived, or transient. Scripts under
+# `research/scripts/` and `research/label-studio/` (the config + start
+# script, not its DB) ARE checked in; everything else gets generated.
+/research/dataset/
+/research/runs/
+/research/label-studio/data/
+/research/label-studio/server.log
+/research/__pycache__/
+/research/scripts/__pycache__/
+/research/*.png
+/research/*.jpg
+/research/*.webp
+/research/yolo_pred_*.png
+/research/result_*.png
+/output/
+
+# Mirror of crates/lockbar-onnx/models/lockbar.onnx — only the in-crate
+# copy is checked in (build pulls from there via include_bytes!).
+/models/

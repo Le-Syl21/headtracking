@@ -1,0 +1,21 @@
+# One URL per line. Comments (#) and blank lines ignored.
+#
+# Supported:
+#   - direct image links (.jpg .png .webp)
+#   - Pinside.com showroom / topic pages
+#   - Reddit r/pinball, r/pinballcabinets posts
+#   - Imgur galleries
+#   - Generic web pages (scrapes <img> + og:image)
+#
+# Run:
+#   uv run scripts/download_images.py
+# Output: research/dataset/raw/<sha1>.{jpg,png,webp}
+#
+# Example seeds (replace / extend with your own picks):
+# https://www.pinside.com/pinball/forum/topic/show-off-your-pincab
+# https://www.reddit.com/r/pincab/top/?t=year
+
+# Wikimedia smoke-test (CC images, og:image is high-res)
+https://en.wikipedia.org/wiki/Pinball
+https://en.wikipedia.org/wiki/Visual_Pinball
+https://commons.wikimedia.org/wiki/Category:Pinball_machines

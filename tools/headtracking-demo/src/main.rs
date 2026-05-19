@@ -240,11 +240,16 @@ fn poll_active_headless(active: &mut Active) {
                 if let Some(detector) = active.face_detector.as_ref() {
                     active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
                 }
-                active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                update_lockbar(
+                    &mut active.lockbar_detector,
+                    &mut active.lockbar_last_run_at,
+                    &mut active.lockbar_first_detection_at,
+                    &mut active.lockbar_locked,
+                    &mut active.lockbar_best_conf,
+                    &mut active.last_lockbar,
                     &rgb888,
                     rgb.width,
                     rgb.height,
-                    &headtracking::calibration::LockbarRgbParams::default(),
                 );
                 active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
             }
@@ -254,11 +259,16 @@ fn poll_active_headless(active: &mut Active) {
                 if let Some(detector) = active.face_detector.as_ref() {
                     active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
                 }
-                active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                update_lockbar(
+                    &mut active.lockbar_detector,
+                    &mut active.lockbar_last_run_at,
+                    &mut active.lockbar_first_detection_at,
+                    &mut active.lockbar_locked,
+                    &mut active.lockbar_best_conf,
+                    &mut active.last_lockbar,
                     &rgb.data,
                     rgb.width,
                     rgb.height,
-                    &headtracking::calibration::LockbarRgbParams::default(),
                 );
                 active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
             }
@@ -268,11 +278,16 @@ fn poll_active_headless(active: &mut Active) {
                 if let Some(detector) = active.face_detector.as_mut() {
                     active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
                 }
-                active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
+                update_lockbar(
+                    &mut active.lockbar_detector,
+                    &mut active.lockbar_last_run_at,
+                    &mut active.lockbar_first_detection_at,
+                    &mut active.lockbar_locked,
+                    &mut active.lockbar_best_conf,
+                    &mut active.last_lockbar,
                     &rgb.data,
                     rgb.width,
                     rgb.height,
-                    &headtracking::calibration::LockbarRgbParams::default(),
                 );
                 active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
             }
@@ -781,9 +796,34 @@ struct Active {
     v1_controls: Option<V1Controls>,
     pose_filter: filter_alias::OneEuroPose3D,
     started_at: Instant,
-    /// Latest RGB-based lockbar detection — runs unconditionally on
-    /// every frame from any backend (Kinect v1/v2 RGB or webcam).
+    /// Latest RGB-based lockbar detection — refreshed by
+    /// [`update_lockbar`] on a throttled cadence (see
+    /// [`LOCKBAR_RECOMPUTE_INTERVAL`]) so the 300 ms tract inference
+    /// doesn't pace the UI thread on every frame.
     last_lockbar: Option<headtracking::calibration::LockbarQuadRgb>,
+    /// YOLOv11n-OBB detector backing [`last_lockbar`]. Lazy-init: stays
+    /// `None` until the first successful `LockbarDetector::new()`. If
+    /// init fails (corrupt model file etc.) we leave it `None` and log
+    /// — the demo still runs minus the lockbar overlay.
+    lockbar_detector: Option<lockbar_onnx::LockbarDetector>,
+    /// `Some(Instant)` when [`update_lockbar`] last ran. Used to skip
+    /// the inference call when the cache is still fresh during the
+    /// warmup window.
+    lockbar_last_run_at: Option<Instant>,
+    /// `Some(Instant)` of the first frame where the detector returned
+    /// a quad. The warmup window (during which we keep refining the
+    /// detection) is timed from this instant; on its expiry the
+    /// best-conf detection seen so far gets frozen.
+    lockbar_first_detection_at: Option<Instant>,
+    /// `true` once the warmup window completed and `last_lockbar` was
+    /// frozen to the highest-confidence detection seen during warmup.
+    /// While locked, [`update_lockbar`] is a no-op — no more
+    /// inference, CPU goes to the head-tracking thread.
+    lockbar_locked: bool,
+    /// Highest YOLO confidence observed since the backend opened.
+    /// During warmup, a new detection overwrites [`last_lockbar`]
+    /// only when its confidence beats this — best-of-N averaging.
+    lockbar_best_conf: f32,
     /// `Some` when face detection is enabled (currently auto-enabled for
     /// the webcam backend). Cheap to keep around — YuNet runs in <10 ms
     /// at 320×320 on CPU.
@@ -793,6 +833,132 @@ struct Active {
     /// "Screenshot" button can write it to disk without re-grabbing
     /// from the device. `None` until the first frame arrives.
     last_rgb_frame: Option<(u32, u32, Vec<u8>)>,
+}
+
+/// How long a lockbar detection stays valid before [`update_lockbar`]
+/// re-runs inference. The lockbar doesn't move while the camera is
+/// mounted, so refreshing every ~1.5 s gives the overlay a live feel
+/// without paying the ~300 ms tract cost on every frame.
+const LOCKBAR_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Window between the first successful lockbar detection and freezing
+/// the best one — at ~1.5 s cadence we collect 3-4 candidate quads
+/// and keep the highest-confidence one. After this elapses,
+/// [`update_lockbar`] stops running until a backend switch reopens
+/// `Active`.
+const LOCKBAR_WARMUP_DURATION: Duration = Duration::from_secs(5);
+
+/// Run the YOLOv11n-OBB lockbar detector on the latest RGB frame and
+/// update `last_lockbar` using a best-of-warmup auto-lock strategy:
+///
+///  1. Skip entirely when `*locked` is true (calibration frozen).
+///  2. Otherwise throttle to [`LOCKBAR_RECOMPUTE_INTERVAL`] so the
+///     ~300 ms tract inference doesn't pace the UI thread.
+///  3. Run inference. If a detection comes back, update
+///     `*last_lockbar` only if its confidence beats `*best_conf` —
+///     this keeps the best quad seen so far.
+///  4. The warmup clock starts at the *first* successful detection
+///     (`*first_detection_at`). When [`LOCKBAR_WARMUP_DURATION`]
+///     elapses past that instant, flip `*locked = true` so the
+///     detector goes silent.
+///
+/// The lockbar doesn't physically move once the camera is mounted,
+/// so this gives us 3-4 inference rounds to pick the cleanest quad,
+/// then frees the CPU for head tracking. No user button — pure auto.
+///
+/// Takes the relevant `Active` fields by `&mut` (rather than
+/// `&mut Active`) so the call site can keep `&mut active.inner`
+/// alive simultaneously — the borrow checker can split disjoint
+/// fields, but not from inside a `match &mut active.inner` arm.
+/// Eight `&mut` params triggers clippy's `too_many_arguments`;
+/// wrapping them in a struct would force every `active.last_lockbar`
+/// read site (12 of them in the overlay code) to indirect, which is
+/// more churn than the lint avoids — narrow `#[allow]` instead.
+#[allow(clippy::too_many_arguments)]
+fn update_lockbar(
+    detector: &mut Option<lockbar_onnx::LockbarDetector>,
+    last_run_at: &mut Option<Instant>,
+    first_detection_at: &mut Option<Instant>,
+    locked: &mut bool,
+    best_conf: &mut f32,
+    last_lockbar: &mut Option<headtracking::calibration::LockbarQuadRgb>,
+    rgb888: &[u8],
+    w: u32,
+    h: u32,
+) {
+    if *locked {
+        return;
+    }
+    let now = Instant::now();
+    if let Some(last) = *last_run_at
+        && now.duration_since(last) < LOCKBAR_RECOMPUTE_INTERVAL
+    {
+        return;
+    }
+    if detector.is_none() {
+        match lockbar_onnx::LockbarDetector::new() {
+            Ok(d) => {
+                info!("lockbar YOLO detector initialised");
+                *detector = Some(d);
+            }
+            Err(e) => {
+                warn!(?e, "lockbar YOLO detector init failed");
+                *last_run_at = Some(now);
+                return;
+            }
+        }
+    }
+    let det = detector.as_ref().expect("init checked above");
+    *last_run_at = Some(now);
+    if let Some(o) = det.detect(rgb888, w, h) {
+        if o.confidence > *best_conf {
+            *best_conf = o.confidence;
+            *last_lockbar = Some(obb_to_lockbar_quad(&o, w, h));
+            info!(conf = o.confidence, "lockbar: new best detection");
+        }
+        if first_detection_at.is_none() {
+            *first_detection_at = Some(now);
+        }
+    }
+    // Warmup expired? Freeze the current best.
+    if let Some(first) = *first_detection_at
+        && now.duration_since(first) >= LOCKBAR_WARMUP_DURATION
+    {
+        *locked = true;
+        info!(best_conf = *best_conf, "lockbar: warmup over, calibration locked");
+    }
+}
+
+/// Bridge [`lockbar_onnx::LockbarObb`] (f32 corners, confidence as
+/// float) into the legacy [`LockbarQuadRgb`] shape consumed by the
+/// existing overlay rendering. Confidence is exposed via the
+/// `n_inliers_*` fields scaled ×100 so the UI's "lockbar conf" hint
+/// stays meaningful (1.00 → 100, 0.20 → 20).
+fn obb_to_lockbar_quad(
+    obb: &lockbar_onnx::LockbarObb,
+    w: u32,
+    h: u32,
+) -> headtracking::calibration::LockbarQuadRgb {
+    let clamp_xy = |(x, y): (f32, f32)| -> (u32, u32) {
+        let x = x.round().clamp(0.0, (w.saturating_sub(1)) as f32) as u32;
+        let y = y.round().clamp(0.0, (h.saturating_sub(1)) as f32) as u32;
+        (x, y)
+    };
+    let n = (obb.confidence * 100.0).clamp(0.0, 1_000.0) as u32;
+    headtracking::calibration::LockbarQuadRgb {
+        frame_width: w,
+        frame_height: h,
+        corners: [
+            clamp_xy(obb.corners[0]),
+            clamp_xy(obb.corners[1]),
+            clamp_xy(obb.corners[2]),
+            clamp_xy(obb.corners[3]),
+        ],
+        slope_deg: obb.slope_deg,
+        thickness_px: obb.thickness_px.round().max(0.0) as u32,
+        n_inliers_top: n,
+        n_inliers_bottom: n,
+    }
 }
 
 mod filter_alias {
@@ -1099,12 +1265,17 @@ impl App {
                     if let Some(detector) = active.face_detector.as_ref() {
                         active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
                     }
-                    active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
-                        &rgb888,
-                        rgb.width,
-                        rgb.height,
-                        &headtracking::calibration::LockbarRgbParams::default(),
-                    );
+                    update_lockbar(
+                    &mut active.lockbar_detector,
+                    &mut active.lockbar_last_run_at,
+                    &mut active.lockbar_first_detection_at,
+                    &mut active.lockbar_locked,
+                    &mut active.lockbar_best_conf,
+                    &mut active.last_lockbar,
+                    &rgb888,
+                    rgb.width,
+                    rgb.height,
+                );
                     let img = bgrx_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
@@ -1137,12 +1308,17 @@ impl App {
                     if let Some(detector) = active.face_detector.as_ref() {
                         active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
                     }
-                    active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
-                        &rgb.data,
-                        rgb.width,
-                        rgb.height,
-                        &headtracking::calibration::LockbarRgbParams::default(),
-                    );
+                    update_lockbar(
+                    &mut active.lockbar_detector,
+                    &mut active.lockbar_last_run_at,
+                    &mut active.lockbar_first_detection_at,
+                    &mut active.lockbar_locked,
+                    &mut active.lockbar_best_conf,
+                    &mut active.last_lockbar,
+                    &rgb.data,
+                    rgb.width,
+                    rgb.height,
+                );
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
@@ -1183,12 +1359,17 @@ impl App {
                             active.last_head = None;
                         }
                     }
-                    active.last_lockbar = headtracking::calibration::detect_lockbar_rgb(
-                        &rgb.data,
-                        rgb.width,
-                        rgb.height,
-                        &headtracking::calibration::LockbarRgbParams::default(),
-                    );
+                    update_lockbar(
+                    &mut active.lockbar_detector,
+                    &mut active.lockbar_last_run_at,
+                    &mut active.lockbar_first_detection_at,
+                    &mut active.lockbar_locked,
+                    &mut active.lockbar_best_conf,
+                    &mut active.last_lockbar,
+                    &rgb.data,
+                    rgb.width,
+                    rgb.height,
+                );
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
@@ -1835,6 +2016,11 @@ fn open_kinect_v2() -> Result<Active, String> {
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
         last_lockbar: None,
+        lockbar_detector: None,
+        lockbar_last_run_at: None,
+        lockbar_first_detection_at: None,
+        lockbar_locked: false,
+        lockbar_best_conf: 0.0,
         face_detector: detector,
         last_faces: Vec::new(),
         last_rgb_frame: None,
@@ -1897,6 +2083,11 @@ fn open_kinect_v1() -> Result<Active, String> {
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
         last_lockbar: None,
+        lockbar_detector: None,
+        lockbar_last_run_at: None,
+        lockbar_first_detection_at: None,
+        lockbar_locked: false,
+        lockbar_best_conf: 0.0,
         face_detector: detector,
         last_faces: Vec::new(),
         last_rgb_frame: None,
@@ -1945,6 +2136,11 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
         last_lockbar: None,
+        lockbar_detector: None,
+        lockbar_last_run_at: None,
+        lockbar_first_detection_at: None,
+        lockbar_locked: false,
+        lockbar_best_conf: 0.0,
         face_detector: detector,
         last_faces: Vec::new(),
         last_rgb_frame: None,

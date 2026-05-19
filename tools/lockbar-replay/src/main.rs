@@ -1,44 +1,24 @@
 //! Decode a PNG (typically a `headtracking-demo` screenshot) and run
-//! `detect_lockbar_rgb` against it, dumping the result + debug logs.
-//! With `--out <PNG>` it also rasterises the detected quad onto a
-//! copy of the input so we can SEE where the algo locked on.
+//! the YOLOv11n-OBB lockbar detector against it, dumping the result
+//! plus an optional debug overlay. The legacy HSV/gradient detector
+//! that used to back this tool was retired in v0.0.21.
 //!
 //! `cargo run -p lockbar-replay -- /tmp/v18-v2.png --out /tmp/dbg.png`
-//! Set `HEADTRACKING_LOG=lockbar=debug` to see every rejection gate.
+//! Use `--score <f>` to override the default 0.25 confidence
+//! threshold. Set `HEADTRACKING_LOG=info` to see init / inference logs.
 
 use std::env;
 use std::fs::File;
 use std::path::PathBuf;
 
-use headtracking::calibration::{LockbarQuadRgb, LockbarRgbParams, detect_lockbar_rgb};
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_env("HEADTRACKING_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("lockbar=debug,info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let path = env::args()
         .nth(1)
-        .ok_or("usage: lockbar-replay <PNG-PATH | --synthetic> [tweaks]")?;
-
-    if path == "--synthetic" {
-        let w = 200u32;
-        let h = 200u32;
-        let mut out = vec![240u8; (w * h * 3) as usize];
-        for v in 170..=185u32 {
-            for u in 30..=170u32 {
-                let i = ((v * w + u) * 3) as usize;
-                out[i] = 20;
-                out[i + 1] = 20;
-                out[i + 2] = 20;
-            }
-        }
-        let params = LockbarRgbParams::default();
-        println!("synthetic 200×200 band rows 170-185 cols 30-170");
-        let q = detect_lockbar_rgb(&out, w, h, &params);
-        println!("result: {q:#?}");
-        return Ok(());
-    }
+        .ok_or("usage: lockbar-replay <PNG-PATH> [--out PNG] [--score F]")?;
 
     let decoder = png::Decoder::new(File::open(&path)?);
     let mut reader = decoder.read_info()?;
@@ -58,116 +38,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("loaded {path}: {width}×{height} RGB888");
-    let mut params = LockbarRgbParams::default();
     let mut out_path: Option<PathBuf> = None;
+    let mut score_thresh: Option<f32> = None;
     let mut it = env::args().skip(2);
     while let Some(k) = it.next() {
         let v = it.next().ok_or_else(|| format!("missing value for {k}"))?;
         match k.as_str() {
-            "--bottom" => params.bottom_fraction = v.parse()?,
-            "--strength" => params.min_edge_strength = v.parse()?,
-            "--min-w" => params.min_width_fraction = v.parse()?,
-            "--max-w" => params.max_width_fraction = v.parse()?,
-            "--min-sep" => params.min_separation = v.parse()?,
-            "--max-sep" => params.max_separation = v.parse()?,
-            "--min-aspect" => params.min_aspect_ratio = v.parse()?,
-            "--max-aspect" => params.max_aspect_ratio = v.parse()?,
-            "--max-slope" => params.max_slope_diff_deg = v.parse()?,
-            "--dev" => params.max_row_deviation = v.parse()?,
-            "--min-top-row" => params.min_top_edge_row_fraction = v.parse()?,
             "--out" => out_path = Some(PathBuf::from(v)),
-            other => return Err(format!("unknown tweak '{other}'").into()),
+            "--score" => score_thresh = Some(v.parse()?),
+            other => return Err(format!("unknown flag '{other}'").into()),
         }
     }
-    println!("params: {params:?}");
 
-    let q = detect_lockbar_rgb(&buf, width, height, &params);
-    println!("\nresult: {q:#?}");
+    let mut detector = lockbar_onnx::LockbarDetector::new()?;
+    if let Some(t) = score_thresh {
+        detector.set_score_threshold(t);
+    }
+    let start = std::time::Instant::now();
+    let obb = detector.detect(&buf, width, height);
+    let elapsed = start.elapsed();
+    println!("inference took {:.1} ms", elapsed.as_secs_f32() * 1000.0);
+    println!("result: {obb:#?}");
+    // Machine-readable summary line for batch scripts. Parsed by
+    // `research/scripts/batch_detect.py`.
+    match obb.as_ref() {
+        Some(o) => {
+            println!(
+                "SUMMARY conf={:.4} slope_deg={:.3} thickness_px={:.2} \
+                 corners=[[{:.1},{:.1}],[{:.1},{:.1}],[{:.1},{:.1}],[{:.1},{:.1}]]",
+                o.confidence,
+                o.slope_deg,
+                o.thickness_px,
+                o.corners[0].0,
+                o.corners[0].1,
+                o.corners[1].0,
+                o.corners[1].1,
+                o.corners[2].0,
+                o.corners[2].1,
+                o.corners[3].0,
+                o.corners[3].1
+            );
+        }
+        None => println!("SUMMARY conf=0.0000 no_detection=true"),
+    }
 
     if let Some(p) = out_path {
         let mut painted = buf.clone();
-        // Scatter-plot all per-column max-gradient rows as orange dots
-        // — see where the algo's votes actually land. This is the
-        // diagnostic that lets me triage "wrong cluster selected" vs
-        // "algo never saw the lockbar at all".
-        bake_gradient_scatter(&mut painted, width, height, &buf, &params);
-        if let Some(quad) = q.as_ref() {
-            bake_quad(&mut painted, width, height, quad);
+        if let Some(o) = obb.as_ref() {
+            bake_obb(&mut painted, width, height, o);
         }
         write_png(&p, width, height, &painted)?;
-        println!("wrote debug overlay → {}", p.display());
+        println!("wrote overlay → {}", p.display());
     }
 
     Ok(())
-}
-
-/// Find ALL local-maximum vertical-gradient rows above the strength
-/// threshold per column in the same ROI `detect_lockbar_rgb` uses,
-/// keep the top-K by strength, and paint each as a colored dot
-/// (orange = #1, yellow = #2, green = #3, blue = #4). Shows the
-/// row distribution that `fit_all_lines` consumes.
-fn bake_gradient_scatter(
-    painted: &mut [u8],
-    width: u32,
-    height: u32,
-    rgb: &[u8],
-    params: &LockbarRgbParams,
-) {
-    let w = width as usize;
-    let h = height as usize;
-    if w == 0 || h < 4 {
-        return;
-    }
-    let row_start = ((params.bottom_fraction * height as f32) as usize).min(h.saturating_sub(2));
-    let luma = |c: usize, r: usize| -> i32 {
-        let i = (r * w + c) * 3;
-        let g = i32::from(rgb[i + 1]) * 183;
-        let r_ = i32::from(rgb[i]) * 54;
-        let b = i32::from(rgb[i + 2]) * 19;
-        (r_ + g + b) >> 8
-    };
-    const COLORS: [[u8; 3]; 4] = [
-        [0xff, 0x88, 0x00], // orange — strongest
-        [0xff, 0xee, 0x00], // yellow — 2nd
-        [0x88, 0xff, 0x00], // green  — 3rd
-        [0x00, 0xaa, 0xff], // blue   — 4th
-    ];
-    for c in 0..w {
-        let mut peaks: Vec<(i32, usize)> = Vec::new();
-        let mut prev_g: i32 = 0;
-        let mut rising = false;
-        for r in row_start..(h - 1) {
-            let g = (luma(c, r + 1) - luma(c, r)).abs();
-            if rising && g < prev_g && prev_g >= params.min_edge_strength as i32 {
-                peaks.push((prev_g, r - 1));
-                rising = false;
-            }
-            if g > prev_g {
-                rising = true;
-            }
-            prev_g = g;
-        }
-        if rising && prev_g >= params.min_edge_strength as i32 {
-            peaks.push((prev_g, h - 2));
-        }
-        peaks.sort_unstable_by_key(|&(g, _)| std::cmp::Reverse(g));
-        peaks.truncate(COLORS.len());
-        for (rank, (_, row)) in peaks.iter().enumerate() {
-            let color = COLORS[rank];
-            for ox in -1..=1i32 {
-                for oy in -1..=1i32 {
-                    put_pixel(
-                        painted,
-                        width,
-                        height,
-                        c as i32 + ox,
-                        *row as i32 + oy,
-                        color,
-                    );
-                }
-            }
-        }
-    }
 }
 
 const CYAN: [u8; 3] = [0x00, 0xe5, 0xff];
@@ -209,7 +133,7 @@ fn draw_line(buf: &mut [u8], w: u32, h: u32, (mut x0, mut y0): (i32, i32), (x1, 
     }
 }
 
-fn bake_quad(buf: &mut [u8], w: u32, h: u32, q: &LockbarQuadRgb) {
+fn bake_obb(buf: &mut [u8], w: u32, h: u32, q: &lockbar_onnx::LockbarObb) {
     for i in 0..4 {
         let a = q.corners[i];
         let b = q.corners[(i + 1) % 4];

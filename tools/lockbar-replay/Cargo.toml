@@ -3,7 +3,7 @@ name = "lockbar-replay"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Decode a PNG and run detect_lockbar_rgb on it — fast local iteration for the lockbar algo"
+description = "Decode a PNG and run the YOLO lockbar detector on it — fast local iteration tool"
 publish = false
 
 [[bin]]
@@ -11,7 +11,7 @@ name = "lockbar-replay"
 path = "src/main.rs"
 
 [dependencies]
-headtracking = { path = "../..", default-features = false }
+lockbar-onnx = { path = "../../crates/lockbar-onnx" }
 png = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

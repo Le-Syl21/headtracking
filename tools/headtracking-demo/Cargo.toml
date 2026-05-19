@@ -1,6 +1,6 @@
 [package]
 name = "headtracking-demo"
-version = "0.0.20"
+version = "0.0.21"
 edition.workspace = true
 license.workspace = true
 description = "Standalone visualization of the Kinect / webcam head-tracker (RGB + face bbox + VPX delta + logs)"
@@ -14,6 +14,7 @@ path = "src/main.rs"
 face = { path = "../../crates/face" }
 freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
+lockbar-onnx = { path = "../../crates/lockbar-onnx" }
 webcam = { path = "../../crates/webcam" }
 headtracking = { path = "../.." }
 eframe = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
