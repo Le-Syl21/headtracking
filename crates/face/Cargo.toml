@@ -10,7 +10,7 @@ publish = false
 # Pure-Rust ONNX inference. Slower than the C++ ONNX Runtime but no native
 # runtime to ship. Inference of YuNet (~76k params) at 320×320 on CPU
 # stays under ~10 ms in our usage, fine for 30 Hz head tracking.
-tract-onnx = { version = "0.21", default-features = false }
+tract-onnx = { version = "0.22", default-features = false }
 # `image` for resize-to-model-input. We only need basic ops.
 image = { version = "0.25", default-features = false }
 thiserror = "2"

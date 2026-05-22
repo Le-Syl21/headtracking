@@ -54,7 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 os_info = { version = "3", default-features = false }
 arc-swap = "1"
 parking_lot = "0.12"
-nalgebra = "0.33"
+nalgebra = "0.34"
 thiserror = "2"
 freenect = { path = "crates/freenect", optional = true }
 freenect2 = { path = "crates/freenect2", optional = true }
@@ -64,10 +64,10 @@ face = { path = "crates/face", optional = true }
 # linking SDL3 statically into the plugin and ending up with two SDL3
 # state machines in the same process. Standalone tools (headtracking-demo) keep
 # the static SDL3 path via the `webcam` workspace crate.
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9", optional = true }
 
 [build-dependencies]
-bindgen = "0.71"
+bindgen = "0.72"
 
 [profile.release]
 lto = "thin"

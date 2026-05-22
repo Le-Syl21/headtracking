@@ -26,4 +26,4 @@ os_info = { version = "3", default-features = false }
 # frame next to the binary, named after the active device + timestamp).
 # Already in the lockfile as a transitive dep — listing it here just
 # makes the direct usage explicit, no extra build cost.
-png = "0.17"
+png = "0.18"

@@ -9,6 +9,7 @@
 
 use std::env;
 use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,9 +21,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: lockbar-replay <PNG-PATH> [--out PNG] [--score F]")?;
 
-    let decoder = png::Decoder::new(File::open(&path)?);
+    // png 0.18 requires a BufRead source for the decoder.
+    let decoder = png::Decoder::new(BufReader::new(File::open(&path)?));
     let mut reader = decoder.read_info()?;
-    let mut buf = vec![0; reader.output_buffer_size()];
+    // png 0.18 returns None here when the buffer size would overflow usize.
+    let buf_size = reader
+        .output_buffer_size()
+        .ok_or("PNG output buffer size overflows usize")?;
+    let mut buf = vec![0; buf_size];
     let info = reader.next_frame(&mut buf)?;
     let width = info.width;
     let height = info.height;

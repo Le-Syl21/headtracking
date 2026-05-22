@@ -12,7 +12,7 @@ publish = false
 # 'lockbar'). On CPU tract serves ~50-80 ms per inference; on the
 # tracker thread we cache the last detection between frames, so the
 # overlay stays responsive.
-tract-onnx = { version = "0.21", default-features = false }
+tract-onnx = { version = "0.22", default-features = false }
 image = { version = "0.25", default-features = false }
 thiserror = "2"
 tracing = "0.1"
