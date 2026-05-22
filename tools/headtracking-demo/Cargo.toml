@@ -1,6 +1,6 @@
 [package]
 name = "headtracking-demo"
-version = "0.0.22"
+version = "0.0.23"
 edition.workspace = true
 license.workspace = true
 description = "Standalone visualization of the Kinect / webcam head-tracker (RGB + face bbox + VPX delta + logs)"
@@ -17,7 +17,18 @@ freenect2 = { path = "../../crates/freenect2" }
 lockbar-onnx = { path = "../../crates/lockbar-onnx" }
 webcam = { path = "../../crates/webcam" }
 headtracking = { path = "../.." }
-eframe = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# Manual egui integration (winit + glutin + glow + egui_glow) instead of
+# eframe, so we can splice egui-rotate into the render loop: it rotates
+# raw_input before egui sees it and the tessellated primitives before the
+# paint — a seam eframe doesn't expose. Needed for the physically-rotated
+# pincab display (270° default, ⟳ button cycles 90°).
+egui = "0.34"
+egui_glow = "0.34"
+egui-winit = { version = "0.34", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui-rotate = "0.1"
+glow = "0.17"
+glutin = "0.32"
+glutin-winit = "0.5"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

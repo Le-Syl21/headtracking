@@ -23,10 +23,14 @@ use std::io::{self, IsTerminal as _, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{
-    self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Pos2, Rect, RichText,
-    ScrollArea, Sense, Stroke, TextureHandle, TopBottomPanel, Vec2,
+use std::num::NonZeroU32;
+
+use egui::{
+    self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, Pos2, Rect, RichText,
+    ScrollArea, Sense, Stroke, TextureHandle, Vec2,
 };
+use egui_rotate::{Rotation, transform_clipped_primitives, transform_raw_input};
+use egui_winit::winit;
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
@@ -45,7 +49,7 @@ const LOG_BUFFER_LINES: usize = 1_000;
 const FACE_COLOR: Color32 = Color32::from_rgb(0xff, 0x60, 0x60);
 const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
 
-fn main() -> eframe::Result {
+fn main() {
     let logs: Arc<Mutex<VecDeque<String>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_LINES)));
     init_tracing(Arc::clone(&logs));
@@ -81,18 +85,289 @@ fn main() -> eframe::Result {
         Ok(None) => {}
     }
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 800.0])
-            .with_title("headtracking-demo"),
-        ..Default::default()
-    };
+    let event_loop = winit::event_loop::EventLoop::new().expect("failed to create event loop");
+    // Poll, not Wait: the camera feed drives continuous repaints, and we
+    // request_redraw at the end of every frame to keep it live.
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    let mut shell = DemoShell::new(App::new(logs));
+    if let Err(e) = event_loop.run_app(&mut shell) {
+        error!(error = %e, "event loop failed");
+        std::process::exit(1);
+    }
+}
 
-    eframe::run_native(
-        "headtracking-demo",
-        options,
-        Box::new(move |_cc| Ok(Box::new(App::new(logs)))),
-    )
+// ===================================================== Window + GL plumbing
+//
+// Manual winit + glutin + glow + egui_glow integration (instead of eframe)
+// so egui-rotate can splice into the render loop: it rotates `raw_input`
+// before egui sees it and the tessellated primitives before the paint —
+// a seam eframe doesn't expose. Window plumbing adapted from egui_glow's
+// `pure_glow` example via `egui-rotate/examples/rotated_demo.rs`.
+
+struct GlutinWindowContext {
+    window: winit::window::Window,
+    gl_context: glutin::context::PossiblyCurrentContext,
+    gl_display: glutin::display::Display,
+    gl_surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
+}
+
+impl GlutinWindowContext {
+    // SAFETY: standard glutin bring-up — the GL context/surface are built
+    // from the freshly created window's raw handle, which outlives them.
+    unsafe fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Self {
+        use glutin::context::NotCurrentGlContext as _;
+        use glutin::display::GetGlDisplay as _;
+        use glutin::display::GlDisplay as _;
+        use glutin::prelude::GlSurface as _;
+        use winit::raw_window_handle::HasWindowHandle as _;
+
+        let winit_window_builder = winit::window::WindowAttributes::default()
+            .with_resizable(true)
+            .with_inner_size(winit::dpi::PhysicalSize {
+                width: 1100u32,
+                height: 800u32,
+            })
+            .with_title("headtracking-demo")
+            .with_visible(false);
+
+        let config_template_builder = glutin::config::ConfigTemplateBuilder::new()
+            .prefer_hardware_accelerated(None)
+            .with_depth_size(0)
+            .with_stencil_size(0)
+            .with_transparency(false);
+
+        let (mut window, gl_config) = glutin_winit::DisplayBuilder::new()
+            .with_preference(glutin_winit::ApiPreference::FallbackEgl)
+            .with_window_attributes(Some(winit_window_builder.clone()))
+            .build(event_loop, config_template_builder, |mut it| {
+                it.next().expect("no GL config")
+            })
+            .expect("failed to create gl_config");
+
+        let gl_display = gl_config.display();
+        let raw_window_handle = window.as_ref().map(|w| w.window_handle().unwrap().as_raw());
+
+        let context_attributes =
+            glutin::context::ContextAttributesBuilder::new().build(raw_window_handle);
+        let fallback_context_attributes = glutin::context::ContextAttributesBuilder::new()
+            .with_context_api(glutin::context::ContextApi::Gles(None))
+            .build(raw_window_handle);
+        // SAFETY: creating a GL context from a valid display + config.
+        let not_current_gl_context = unsafe {
+            gl_display
+                .create_context(&gl_config, &context_attributes)
+                .unwrap_or_else(|_| {
+                    gl_display
+                        .create_context(&gl_config, &fallback_context_attributes)
+                        .expect("failed to create context")
+                })
+        };
+
+        let window = window.take().unwrap_or_else(|| {
+            glutin_winit::finalize_window(event_loop, winit_window_builder.clone(), &gl_config)
+                .expect("failed to finalize window")
+        });
+        let (w, h): (u32, u32) = window.inner_size().into();
+        let surface_attributes =
+            glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
+                .build(
+                    window.window_handle().unwrap().as_raw(),
+                    NonZeroU32::new(w).unwrap_or(NonZeroU32::MIN),
+                    NonZeroU32::new(h).unwrap_or(NonZeroU32::MIN),
+                );
+        // SAFETY: surface attributes derive from the same valid window handle.
+        let gl_surface = unsafe {
+            gl_display
+                .create_window_surface(&gl_config, &surface_attributes)
+                .unwrap()
+        };
+        let gl_context = not_current_gl_context.make_current(&gl_surface).unwrap();
+        gl_surface
+            .set_swap_interval(
+                &gl_context,
+                glutin::surface::SwapInterval::Wait(NonZeroU32::MIN),
+            )
+            .unwrap();
+
+        Self {
+            window,
+            gl_context,
+            gl_display,
+            gl_surface,
+        }
+    }
+
+    fn window(&self) -> &winit::window::Window {
+        &self.window
+    }
+
+    fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
+        use glutin::surface::GlSurface as _;
+        self.gl_surface.resize(
+            &self.gl_context,
+            size.width.try_into().unwrap(),
+            size.height.try_into().unwrap(),
+        );
+    }
+
+    fn swap_buffers(&self) -> glutin::error::Result<()> {
+        use glutin::surface::GlSurface as _;
+        self.gl_surface.swap_buffers(&self.gl_context)
+    }
+
+    fn get_proc_address(&self, addr: &std::ffi::CStr) -> *const std::ffi::c_void {
+        use glutin::display::GlDisplay as _;
+        self.gl_display.get_proc_address(addr)
+    }
+}
+
+/// Owns the GL window + egui integration and drives the `App` model
+/// each frame, wrapping its UI in egui-rotate's input/output transforms.
+struct DemoShell {
+    app: App,
+    gl_window: Option<GlutinWindowContext>,
+    gl: Option<Arc<glow::Context>>,
+    egui_ctx: egui::Context,
+    egui_winit: Option<egui_winit::State>,
+    painter: Option<egui_glow::Painter>,
+}
+
+impl DemoShell {
+    fn new(app: App) -> Self {
+        Self {
+            app,
+            gl_window: None,
+            gl: None,
+            egui_ctx: egui::Context::default(),
+            egui_winit: None,
+            painter: None,
+        }
+    }
+
+    fn redraw(&mut self) {
+        let window = self.gl_window.as_ref().unwrap().window();
+        let physical_dimensions: [u32; 2] = window.inner_size().into();
+        let physical_size =
+            egui::Vec2::new(physical_dimensions[0] as f32, physical_dimensions[1] as f32);
+        let rotation = self.app.rotation;
+
+        // 1. Gather raw winit input, then rotate it into logical space.
+        let mut raw_input = self.egui_winit.as_mut().unwrap().take_egui_input(window);
+        if raw_input.screen_rect.is_none() {
+            raw_input.screen_rect =
+                Some(egui::Rect::from_min_size(egui::Pos2::ZERO, physical_size));
+        }
+        transform_raw_input(&mut raw_input, rotation);
+
+        // 2. Run the UI in the (rotated) logical coordinate space. egui
+        //    0.34's run_ui hands us a root Ui that the panels nest into.
+        let ctx = self.egui_ctx.clone();
+        let app = &mut self.app;
+        let full_output = ctx.run_ui(raw_input, |ui| app.ui(ui));
+
+        self.egui_winit
+            .as_mut()
+            .unwrap()
+            .handle_platform_output(window, full_output.platform_output.clone());
+
+        // 3. Tessellate, then rotate primitives back to physical space.
+        let logical_size = ctx.content_rect().size();
+        let mut clipped = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        transform_clipped_primitives(&mut clipped, rotation, logical_size);
+
+        // 4. Paint.
+        let painter = self.painter.as_mut().unwrap();
+        for (id, image_delta) in &full_output.textures_delta.set {
+            painter.set_texture(*id, image_delta);
+        }
+        // SAFETY: glow calls on the current GL context, on the UI thread.
+        unsafe {
+            use glow::HasContext as _;
+            let gl = self.gl.as_ref().unwrap();
+            gl.clear_color(0.05, 0.06, 0.08, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        painter.paint_primitives(physical_dimensions, full_output.pixels_per_point, &clipped);
+        for id in &full_output.textures_delta.free {
+            painter.free_texture(*id);
+        }
+
+        self.gl_window.as_ref().unwrap().swap_buffers().unwrap();
+        // Keep the camera feed live — drive a continuous repaint.
+        window.request_redraw();
+    }
+}
+
+impl winit::application::ApplicationHandler for DemoShell {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // SAFETY: builds the GL context from a freshly created window on the
+        // event loop's own thread.
+        let gl_window = unsafe { GlutinWindowContext::new(event_loop) };
+        // SAFETY: resolves valid GL symbols via the platform's GL display.
+        let gl = unsafe {
+            glow::Context::from_loader_function(|s| {
+                let s = std::ffi::CString::new(s).unwrap();
+                gl_window.get_proc_address(&s)
+            })
+        };
+        let gl = Arc::new(gl);
+        gl_window.window().set_visible(true);
+
+        let painter = egui_glow::Painter::new(Arc::clone(&gl), "", None, true)
+            .expect("failed to create egui_glow painter");
+        let egui_winit = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            event_loop,
+            None,
+            event_loop.system_theme(),
+            Some(painter.max_texture_side()),
+        );
+
+        self.gl_window = Some(gl_window);
+        self.gl = Some(gl);
+        self.egui_winit = Some(egui_winit);
+        self.painter = Some(painter);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _wid: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        use winit::event::WindowEvent;
+
+        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+            event_loop.exit();
+            return;
+        }
+        if let WindowEvent::Resized(size) = &event
+            && let Some(w) = self.gl_window.as_ref()
+        {
+            w.resize(*size);
+        }
+        if matches!(event, WindowEvent::RedrawRequested) {
+            self.redraw();
+            return;
+        }
+
+        let window = self.gl_window.as_ref().unwrap().window();
+        let response = self
+            .egui_winit
+            .as_mut()
+            .unwrap()
+            .on_window_event(window, &event);
+        if response.repaint {
+            window.request_redraw();
+        }
+    }
+
+    fn exiting(&mut self, _: &winit::event_loop::ActiveEventLoop) {
+        if let Some(painter) = &mut self.painter {
+            painter.destroy();
+        }
+    }
 }
 
 // ============================================================ CLI parsing
@@ -765,6 +1040,10 @@ struct App {
     /// (or backend change) so the user has time to read the saved path.
     /// `Ok` carries the full saved path, `Err` carries the failure reason.
     screenshot_status: Option<Result<std::path::PathBuf, String>>,
+    /// Viewport rotation for a physically-mounted (rotated) pincab display.
+    /// Defaults to 270°; the ⟳ button in the toolbar cycles 90° per click.
+    /// Read by [`DemoShell::redraw`] to drive egui-rotate's transforms.
+    rotation: Rotation,
 }
 
 impl App {
@@ -1263,6 +1542,7 @@ impl App {
             kinect_access_hint,
             kinect_access_result: None,
             screenshot_status: None,
+            rotation: Rotation::CW270,
         }
     }
 
@@ -1488,7 +1768,7 @@ fn smooth_head(
 impl App {
     /// Render the Kinect v1 tilt + LED panel just below the toolbar.
     /// No-op when the active backend is anything else.
-    fn show_v1_controls(&mut self, egui_ctx: &egui::Context) {
+    fn show_v1_controls(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.active.as_mut() else {
             return;
         };
@@ -1507,7 +1787,7 @@ impl App {
             controls.last_refresh = Instant::now();
         }
 
-        TopBottomPanel::top("v1-controls").show(egui_ctx, |ui| {
+        Panel::top("v1-controls").show_inside(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Kinect v1").strong());
@@ -1620,14 +1900,20 @@ fn capture_baseline(slot: &mut Option<Baseline>, head: Option<HeadPixel>) {
     );
 }
 
-impl eframe::App for App {
-    fn update(&mut self, egui_ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl App {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        // egui 0.34 nests panels inside a root Ui; grab a Context handle
+        // for the bits that still need one (texture upload in `poll`).
+        let egui_ctx = ui.ctx().clone();
         self.ensure_active();
-        self.poll(egui_ctx);
+        self.poll(&egui_ctx);
 
-        // ----- Top toolbar
-        TopBottomPanel::top("toolbar").show(egui_ctx, |ui| {
+        // ----- Top toolbar: one button-only row, then an INPUT row
+        // (raw camera measurements) and an OUTPUT row (what VPX consumes).
+        Panel::top("toolbar").show_inside(ui, |ui| {
             ui.add_space(4.0);
+
+            // Row 1 — buttons only.
             ui.horizontal(|ui| {
                 ui.label("Input:");
                 let selected_label = self.label_for(self.selected);
@@ -1636,27 +1922,21 @@ impl eframe::App for App {
                     .show_ui(ui, |ui| {
                         let entries = self.available.clone();
                         for entry in &entries {
-                            ui.selectable_value(
-                                &mut self.selected,
-                                entry.backend,
-                                &entry.label,
-                            );
+                            ui.selectable_value(&mut self.selected, entry.backend, &entry.label);
                         }
                     });
                 if ui.small_button("rescan").clicked() {
                     self.refresh_available();
                 }
-                // Screenshot: writes the latest RGB frame next to the
-                // binary as `<backend-slug>_<YYYYMMDD-HHMMSS>.png`.
-                // Disabled until a frame has been received.
+                // Screenshot: writes the latest RGB frame next to the binary
+                // as `<backend-slug>_<YYYYMMDD-HHMMSS>.png`. Disabled until a
+                // frame has been received.
                 let shot_ready = self
                     .active
                     .as_ref()
                     .is_some_and(|a| a.last_rgb_frame.is_some());
-                let shot_resp = ui.add_enabled(
-                    shot_ready,
-                    egui::Button::new("📷 screenshot").small(),
-                );
+                let shot_resp =
+                    ui.add_enabled(shot_ready, egui::Button::new("📷 screenshot").small());
                 if shot_resp.clicked()
                     && let Some(active) = self.active.as_ref()
                     && let Some((w, h, bytes)) = active.last_rgb_frame.as_ref()
@@ -1676,114 +1956,56 @@ impl eframe::App for App {
                         None => {}
                     }
                 }
+                // ⟳ window rotation — cycles 0° → 90° → 180° → 270° per
+                // click, for a physically rotated pincab display.
+                if ui
+                    .button(format!("⟳ {}", rotation_label(self.rotation)))
+                    .on_hover_text("Rotate the window 90° (physically rotated screen)")
+                    .clicked()
+                {
+                    self.rotation = next_rotation(self.rotation);
+                }
+                // Screenshot result lives on the bar — it's the button's
+                // own feedback. Cleared on the next click / backend change.
                 if let Some(status) = &self.screenshot_status {
                     match status {
-                        Ok(path) => ui.label(
-                            RichText::new(format!(
-                                "saved → {}",
-                                path.file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("(?)")
-                            ))
-                            .color(Color32::from_rgb(0x90, 0xee, 0x90))
-                            .small(),
-                        )
-                        .on_hover_text(path.display().to_string()),
+                        Ok(path) => ui
+                            .label(
+                                RichText::new(format!(
+                                    "saved → {}",
+                                    path.file_name().and_then(|s| s.to_str()).unwrap_or("(?)")
+                                ))
+                                .color(Color32::from_rgb(0x90, 0xee, 0x90))
+                                .small(),
+                            )
+                            .on_hover_text(path.display().to_string()),
                         Err(e) => ui.colored_label(Color32::LIGHT_RED, format!("save failed: {e}")),
                     };
                 }
-                ui.separator();
-                if let Some(active) = self.active.as_ref()
-                    && let Some(bar) = active.last_lockbar
-                {
-                    ui.label(
-                        RichText::new(format!(
-                            "lockbar row {}, w {}px, t {}px, ratio {:.1}, slope {:+.1}°, n={}/{}",
-                            bar.mean_row(),
-                            bar.mean_width_px(),
-                            bar.thickness_px,
-                            bar.mean_width_px() as f32 / bar.thickness_px.max(1) as f32,
-                            bar.slope_deg,
-                            bar.n_inliers_top,
-                            bar.n_inliers_bottom,
-                        ))
-                        .color(LOCKBAR_COLOR)
-                        .monospace()
-                        .size(11.0),
-                    );
-                    ui.separator();
-                }
-                if let Some(active) = self.active.as_ref() {
-                    let label = self.label_for(active.backend);
-                    if !active.inner.has_head_tracker() {
-                        ui.label(
-                            RichText::new(format!(
-                                "{label}  |  capture only — head tracking pending"
-                            ))
-                            .color(Color32::GRAY),
-                        );
-                    } else if let Some(head) = active.last_head {
-                        // Raw head pose, camera-centred frame.
-                        ui.label(
-                            RichText::new(format!(
-                                "{label}  |  distance {:.0} mm  |  pixel ({}, {})  |  3D raw ({:+.0}, {:+.0}, {:+.0}) mm",
-                                head.depth_mm,
-                                head.u,
-                                head.v,
-                                head.x_mm,
-                                head.y_mm,
-                                head.depth_mm
-                            ))
-                            .monospace(),
-                        );
-                        // Lockbar-centred head X — the value VPX wants
-                        // for its Δ-view in cabinet/window mode.
-                        if let Some(quad) = active.last_lockbar.as_ref()
-                            && let Some(lb) = lockbar_3d_center(quad, &active.intrinsics)
-                        {
-                            // Head position expressed in the lockbar's
-                            // frame: dx = left/right (0 = above centre,
-                            // + = right), dy = vertical head↔lockbar gap,
-                            // dz = depth (+ = head further than lockbar).
-                            // Roll/yaw rectification is still TODO — these
-                            // are the raw camera-frame deltas for now.
-                            let dx = head.x_mm - lb.x;
-                            let dy = head.y_mm - lb.y;
-                            let dz = head.depth_mm - lb.z;
-                            let lock_tag = if active.lockbar_locked { "locked" } else { "warmup" };
-                            ui.label(
-                                RichText::new(format!(
-                                    "lockbar {} | center 3D ({:+.0}, {:+.0}, {:+.0}) mm | width {} px | head centred ({:+.0}, {:+.0}, {:+.0}) mm",
-                                    lock_tag,
-                                    lb.x,
-                                    lb.y,
-                                    lb.z,
-                                    quad.mean_width_px(),
-                                    dx,
-                                    dy,
-                                    dz,
-                                ))
-                                .monospace()
-                                .color(if active.lockbar_locked {
-                                    Color32::LIGHT_GREEN
-                                } else {
-                                    Color32::LIGHT_YELLOW
-                                }),
-                            );
-                        }
-                    } else {
-                        ui.label(
-                            RichText::new(format!("{label}  |  waiting for head detection…"))
-                                .color(Color32::GRAY),
-                        );
-                    }
-                } else if let Some(err) = &self.error {
-                    ui.colored_label(Color32::LIGHT_RED, err);
-                } else if self.available.len() <= 1 {
-                    ui.label(RichText::new("no input detected — plug a Kinect and click 'rescan'").color(Color32::GRAY));
-                } else {
-                    ui.label(RichText::new("select an input").color(Color32::GRAY));
-                }
+            });
+
+            ui.add_space(2.0);
+            // Row 2 — camera INPUT (raw, before maths).
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("in  ▸")
+                        .strong()
+                        .color(Color32::GRAY)
+                        .monospace(),
+                );
+                self.input_line(ui);
+            });
+
+            ui.add_space(2.0);
+            // Row 3 — camera OUTPUT (after maths → what VPX consumes).
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("out ▸")
+                        .strong()
+                        .color(Color32::GRAY)
+                        .monospace(),
+                );
+                self.output_line(ui);
             });
             ui.add_space(4.0);
         });
@@ -1793,7 +2015,7 @@ impl eframe::App for App {
         if self.kinect_access_hint || self.kinect_access_result.is_some() {
             let amber = Color32::from_rgb(0xff, 0xc4, 0x40);
             let mut do_fix = false;
-            TopBottomPanel::top("kinect-access").show(egui_ctx, |ui| {
+            Panel::top("kinect-access").show_inside(ui, |ui| {
                 ui.add_space(3.0);
                 match &self.kinect_access_result {
                     None => {
@@ -1842,14 +2064,14 @@ impl eframe::App for App {
         }
 
         // ----- Optional Kinect v1 controls (tilt + LED)
-        self.show_v1_controls(egui_ctx);
+        self.show_v1_controls(ui);
 
         // ----- Bottom split: logs (left) + VPX delta panel (right)
-        TopBottomPanel::bottom("debug-panels")
+        Panel::bottom("debug-panels")
             .resizable(true)
-            .default_height(220.0)
-            .min_height(80.0)
-            .show(egui_ctx, |ui| {
+            .default_size(220.0)
+            .min_size(80.0)
+            .show_inside(ui, |ui| {
                 ui.add_space(4.0);
                 ui.columns(2, |cols| {
                     // Left: tracing event log
@@ -1952,7 +2174,7 @@ impl eframe::App for App {
             });
 
         // ----- Center: image with crosshair
-        CentralPanel::default().show(egui_ctx, |ui| {
+        CentralPanel::default().show_inside(ui, |ui| {
             let avail = ui.available_size();
             let aspect = match self.active.as_ref() {
                 Some(active) => match (&active.inner, active.rgb_texture.as_ref()) {
@@ -2008,8 +2230,115 @@ impl eframe::App for App {
                 centered(ui, rect, msg);
             }
         });
+    }
 
-        egui_ctx.request_repaint();
+    /// Row 2 — camera INPUT: raw camera-frame measurements, before any
+    /// maths. Head pixel/depth/3D-raw plus the raw lockbar pixel detection.
+    fn input_line(&self, ui: &mut egui::Ui) {
+        let Some(active) = self.active.as_ref() else {
+            if let Some(err) = &self.error {
+                ui.colored_label(Color32::LIGHT_RED, err);
+            } else if self.available.len() <= 1 {
+                ui.label(
+                    RichText::new("no input — plug a device and click 'rescan'")
+                        .color(Color32::GRAY),
+                );
+            } else {
+                ui.label(RichText::new("select an input").color(Color32::GRAY));
+            }
+            return;
+        };
+        let label = self.label_for(active.backend);
+        if !active.inner.has_head_tracker() {
+            ui.label(
+                RichText::new(format!("{label} | capture only — head tracking pending"))
+                    .color(Color32::GRAY),
+            );
+        } else if let Some(head) = active.last_head {
+            ui.label(
+                RichText::new(format!(
+                    "{label} | head px ({}, {}) | depth {:.0} mm | 3D raw ({:+.0}, {:+.0}, {:+.0}) mm",
+                    head.u, head.v, head.depth_mm, head.x_mm, head.y_mm, head.depth_mm,
+                ))
+                .monospace(),
+            );
+        } else {
+            ui.label(
+                RichText::new(format!("{label} | waiting for head detection…"))
+                    .color(Color32::GRAY),
+            );
+        }
+        // Raw lockbar pixel detection — shown whenever a quad exists,
+        // independent of head presence.
+        if let Some(bar) = active.last_lockbar {
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "lockbar px: row {}, w {}px, t {}px, slope {:+.1}°",
+                    bar.mean_row(),
+                    bar.mean_width_px(),
+                    bar.thickness_px,
+                    bar.slope_deg,
+                ))
+                .color(LOCKBAR_COLOR)
+                .monospace()
+                .size(12.0),
+            );
+        }
+    }
+
+    /// Row 3 — camera OUTPUT: the head expressed in the lockbar frame, i.e.
+    /// the (ΔX, ΔY, ΔZ) in mm that VPX consumes to shift its POV. (0,0,0) =
+    /// head dead-centre above the lockbar; +X right, +Y down, +Z further.
+    /// Green once the lockbar calibration is locked, yellow during warmup.
+    fn output_line(&self, ui: &mut egui::Ui) {
+        let Some(active) = self.active.as_ref() else {
+            ui.label(RichText::new("—").color(Color32::GRAY));
+            return;
+        };
+        let (Some(head), Some(quad)) = (active.last_head, active.last_lockbar.as_ref()) else {
+            ui.label(RichText::new("waiting for head + lockbar…").color(Color32::GRAY));
+            return;
+        };
+        let Some(lb) = lockbar_3d_center(quad, &active.intrinsics) else {
+            ui.label(RichText::new("lockbar geometry degenerate").color(Color32::GRAY));
+            return;
+        };
+        let dx = head.x_mm - lb.x;
+        let dy = head.y_mm - lb.y;
+        let dz = head.depth_mm - lb.z;
+        let (tag, color) = if active.lockbar_locked {
+            ("locked", Color32::LIGHT_GREEN)
+        } else {
+            ("warmup", Color32::LIGHT_YELLOW)
+        };
+        ui.label(
+            RichText::new(format!(
+                "→ VPX   ΔX {dx:+.0}   ΔY {dy:+.0}   ΔZ {dz:+.0} mm   [{tag}]"
+            ))
+            .monospace()
+            .color(color),
+        );
+    }
+}
+
+/// Short label for the current rotation, shown on the ⟳ toolbar button.
+fn rotation_label(r: Rotation) -> &'static str {
+    match r {
+        Rotation::None => "0°",
+        Rotation::CW90 => "90°",
+        Rotation::CW180 => "180°",
+        Rotation::CW270 => "270°",
+    }
+}
+
+/// Next rotation in the 0 → 90 → 180 → 270 → 0 cycle.
+fn next_rotation(r: Rotation) -> Rotation {
+    match r {
+        Rotation::None => Rotation::CW90,
+        Rotation::CW90 => Rotation::CW180,
+        Rotation::CW180 => Rotation::CW270,
+        Rotation::CW270 => Rotation::None,
     }
 }
 
@@ -2290,28 +2619,15 @@ fn bgrx_to_rgb888(bgrx: &[u8]) -> Vec<u8> {
 
 fn bgrx_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
     debug_assert_eq!(data.len(), (width * height * 4) as usize);
-    let mut pixels = Vec::with_capacity((width * height) as usize);
-    for chunk in data.chunks_exact(4) {
-        // libfreenect2 ships pixels as B, G, R, X.
-        pixels.push(Color32::from_rgb(chunk[2], chunk[1], chunk[0]));
-    }
-    ColorImage {
-        size: [width as usize, height as usize],
-        pixels,
-    }
+    // libfreenect2 ships pixels as B, G, R, X — repack to RGB888 first
+    // (egui 0.34's ColorImage::from_rgb wants tight RGB).
+    let rgb = bgrx_to_rgb888(data);
+    ColorImage::from_rgb([width as usize, height as usize], &rgb)
 }
 
 fn rgb888_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
     debug_assert_eq!(data.len(), (width * height * 3) as usize);
-    let mut pixels = Vec::with_capacity((width * height) as usize);
-    for chunk in data.chunks_exact(3) {
-        // libfreenect ships v1 video as R, G, B.
-        pixels.push(Color32::from_rgb(chunk[0], chunk[1], chunk[2]));
-    }
-    ColorImage {
-        size: [width as usize, height as usize],
-        pixels,
-    }
+    ColorImage::from_rgb([width as usize, height as usize], data)
 }
 
 // ============================================================ Screenshot
