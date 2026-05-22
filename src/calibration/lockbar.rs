@@ -247,7 +247,6 @@ impl LockbarQuadRgb {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

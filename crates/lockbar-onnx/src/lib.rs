@@ -26,10 +26,8 @@ use image::imageops::FilterType;
 use image::{ImageBuffer, Rgb};
 use tract_onnx::prelude::*;
 
-const MODEL_BYTES: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/models/lockbar.onnx"
-));
+const MODEL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/models/lockbar.onnx"));
 
 const MODEL_SIDE: usize = 640;
 const NUM_ANCHORS: usize = 8_400;
@@ -75,10 +73,7 @@ impl LockbarDetector {
         let infered = tract_onnx::onnx()
             .model_for_read(&mut cursor)
             .map_err(|e| Error::ModelLoad(format!("model_for_read: {e}")))?
-            .with_input_fact(
-                0,
-                f32::fact([1, 3, MODEL_SIDE, MODEL_SIDE]).into(),
-            )
+            .with_input_fact(0, f32::fact([1, 3, MODEL_SIDE, MODEL_SIDE]).into())
             .map_err(|e| Error::ModelLoad(format!("with_input_fact: {e}")))?;
         let typed = infered
             .into_optimized()
@@ -114,12 +109,10 @@ impl LockbarDetector {
         }
 
         let (input_tensor, lb) = letterbox_to_chw(rgb888, width, height);
-        let tensor: Tensor = tract_ndarray::Array4::from_shape_vec(
-            (1, 3, MODEL_SIDE, MODEL_SIDE),
-            input_tensor,
-        )
-        .expect("shape matches len")
-        .into();
+        let tensor: Tensor =
+            tract_ndarray::Array4::from_shape_vec((1, 3, MODEL_SIDE, MODEL_SIDE), input_tensor)
+                .expect("shape matches len")
+                .into();
 
         let outputs = match self.model.run(tvec!(tensor.into())) {
             Ok(o) => o,
@@ -168,7 +161,11 @@ impl LockbarDetector {
             return None;
         }
         // Sort by score descending for greedy NMS.
-        kept.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        kept.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let best = nms_pick_best(&kept, self.nms_iou_threshold);
         let corners_model = obb_to_corners(&best);
         let corners_img = corners_model.map(|(x, y)| lb.unmap_xy(x, y));
@@ -250,7 +247,9 @@ fn nms_pick_best(dets: &[Detection], iou_threshold: f32) -> Detection {
     // a competing detection survived.
     let mut survivors: Vec<Detection> = Vec::with_capacity(dets.len());
     for &d in dets {
-        let dropped = survivors.iter().any(|s| aabb_iou(&d.aabb(), &s.aabb()) > iou_threshold);
+        let dropped = survivors
+            .iter()
+            .any(|s| aabb_iou(&d.aabb(), &s.aabb()) > iou_threshold);
         if !dropped {
             survivors.push(d);
         }
@@ -279,12 +278,7 @@ fn obb_to_corners(d: &Detection) -> [(f32, f32); 4] {
     let (sa, ca) = d.angle.sin_cos();
     let hw = d.w * 0.5;
     let hh = d.h * 0.5;
-    let local: [(f32, f32); 4] = [
-        (-hw, -hh),
-        (hw, -hh),
-        (hw, hh),
-        (-hw, hh),
-    ];
+    let local: [(f32, f32); 4] = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
     let mut out = [(0.0, 0.0); 4];
     for (i, (lx, ly)) in local.iter().enumerate() {
         let rx = lx * ca - ly * sa;
@@ -359,5 +353,12 @@ fn letterbox_to_chw(rgb888: &[u8], width: u32, height: u32) -> (Vec<f32>, Letter
             chw[2 * plane + dst_idx] = p[2] as f32 / 255.0;
         }
     }
-    (chw, Letterbox { scale, pad_x, pad_y })
+    (
+        chw,
+        Letterbox {
+            scale,
+            pad_x,
+            pad_y,
+        },
+    )
 }
