@@ -925,7 +925,10 @@ fn update_lockbar(
         && now.duration_since(first) >= LOCKBAR_WARMUP_DURATION
     {
         *locked = true;
-        info!(best_conf = *best_conf, "lockbar: warmup over, calibration locked");
+        info!(
+            best_conf = *best_conf,
+            "lockbar: warmup over, calibration locked"
+        );
     }
 }
 
@@ -959,6 +962,54 @@ fn obb_to_lockbar_quad(
         n_inliers_top: n,
         n_inliers_bottom: n,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Vec3Mm {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+/// Recover the lockbar's 3D centre in the camera frame from its
+/// detected pixel quad. Uses the pinhole inverse on the lockbar's
+/// known physical width (`LOCKBAR_WIDTH_MM`, 61 cm widebody default).
+/// Returns `None` when the quad is degenerate.
+///
+/// Webcam intrinsics are zero at construction time (no per-camera
+/// calibration yet), so we fall back to the same approximation
+/// `face_to_head` uses — fx ≈ 0.85 × frame_width — keyed off the
+/// frame dimensions stored in the quad itself.
+fn lockbar_3d_center(
+    quad: &headtracking::calibration::LockbarQuadRgb,
+    intr: &Intrinsics,
+) -> Option<Vec3Mm> {
+    let mean_w_px = quad.mean_width_px();
+    if mean_w_px < 4 || quad.frame_width == 0 || quad.frame_height == 0 {
+        return None;
+    }
+    let fx = if intr.fx > 0.0 {
+        intr.fx
+    } else {
+        0.85 * quad.frame_width as f32
+    };
+    let fy = if intr.fy > 0.0 { intr.fy } else { fx };
+    let cx = if intr.cx > 0.0 {
+        intr.cx
+    } else {
+        quad.frame_width as f32 * 0.5
+    };
+    let cy = if intr.cy > 0.0 {
+        intr.cy
+    } else {
+        quad.frame_height as f32 * 0.5
+    };
+    let z = headtracking::calibration::LOCKBAR_WIDTH_MM * fx / (mean_w_px as f32);
+    let u_center = (quad.corners[0].0 + quad.corners[1].0) as f32 * 0.5;
+    let v_center = quad.mean_row() as f32;
+    let x = (u_center - cx) * z / fx;
+    let y = (v_center - cy) * z / fy;
+    Some(Vec3Mm { x, y, z })
 }
 
 mod filter_alias {
@@ -1043,14 +1094,36 @@ impl Inner {
     }
 }
 
-/// Pick the largest detected face by bounding-box area. The largest face is
-/// usually the one closest to the camera, which on a pincab is the player.
-fn pick_largest_face(faces: &[face::FaceDetection]) -> Option<&face::FaceDetection> {
+/// Score-based face picker: "closer to the camera AND more centred
+/// on the lockbar wins". Centrality is measured against `preferred_u`
+/// (lockbar pixel-centre when locked, otherwise frame centre); the
+/// score is `area × centrality²` so a face at the very edge is
+/// heavily down-weighted but never zero — the lone face in the frame
+/// is still picked.
+///
+/// Doesn't try to be the long-term solution (a bystander standing
+/// directly between the player and the lockbar would still win); see
+/// the BlazePalm "hands on the lockbar = player" path on the P2
+/// roadmap for the robust version.
+fn pick_player_face(
+    faces: &[face::FaceDetection],
+    frame_w: u32,
+    preferred_u: Option<f32>,
+) -> Option<&face::FaceDetection> {
+    if faces.is_empty() {
+        return None;
+    }
+    let target = preferred_u.unwrap_or(frame_w as f32 * 0.5);
+    let half_w = (frame_w as f32 * 0.5).max(1.0);
+    let score = |f: &face::FaceDetection| -> f32 {
+        let fc = f.x + f.width * 0.5;
+        let dist_norm = ((fc - target).abs() / half_w).clamp(0.0, 1.0);
+        let centrality = (1.0 - dist_norm).max(0.05);
+        f.width * f.height * centrality * centrality
+    };
     faces.iter().max_by(|a, b| {
-        let area_a = a.width * a.height;
-        let area_b = b.width * b.height;
-        area_a
-            .partial_cmp(&area_b)
+        score(a)
+            .partial_cmp(&score(b))
             .unwrap_or(std::cmp::Ordering::Equal)
     })
 }
@@ -1266,16 +1339,16 @@ impl App {
                         active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
                     }
                     update_lockbar(
-                    &mut active.lockbar_detector,
-                    &mut active.lockbar_last_run_at,
-                    &mut active.lockbar_first_detection_at,
-                    &mut active.lockbar_locked,
-                    &mut active.lockbar_best_conf,
-                    &mut active.last_lockbar,
-                    &rgb888,
-                    rgb.width,
-                    rgb.height,
-                );
+                        &mut active.lockbar_detector,
+                        &mut active.lockbar_last_run_at,
+                        &mut active.lockbar_first_detection_at,
+                        &mut active.lockbar_locked,
+                        &mut active.lockbar_best_conf,
+                        &mut active.last_lockbar,
+                        &rgb888,
+                        rgb.width,
+                        rgb.height,
+                    );
                     let img = bgrx_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
@@ -1287,17 +1360,22 @@ impl App {
                     // closest-blob fallback was unreliable enough that
                     // having no pose is more honest than having a wrong
                     // one.
-                    let head = pick_largest_face(&active.last_faces).and_then(|face| {
-                        head_from_face_depth(
-                            face,
-                            1920,
-                            1080,
-                            &depth.data,
-                            depth.width,
-                            depth.height,
-                            &active.intrinsics,
-                        )
-                    });
+                    let preferred = active
+                        .last_lockbar
+                        .as_ref()
+                        .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
+                    let head =
+                        pick_player_face(&active.last_faces, 1920, preferred).and_then(|face| {
+                            head_from_face_depth(
+                                face,
+                                1920,
+                                1080,
+                                &depth.data,
+                                depth.width,
+                                depth.height,
+                                &active.intrinsics,
+                            )
+                        });
                     let smoothed = smooth_head(head, &mut active.pose_filter, active.started_at);
                     capture_baseline(&mut active.baseline, smoothed);
                     active.last_head = smoothed;
@@ -1309,16 +1387,16 @@ impl App {
                         active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
                     }
                     update_lockbar(
-                    &mut active.lockbar_detector,
-                    &mut active.lockbar_last_run_at,
-                    &mut active.lockbar_first_detection_at,
-                    &mut active.lockbar_locked,
-                    &mut active.lockbar_best_conf,
-                    &mut active.last_lockbar,
-                    &rgb.data,
-                    rgb.width,
-                    rgb.height,
-                );
+                        &mut active.lockbar_detector,
+                        &mut active.lockbar_last_run_at,
+                        &mut active.lockbar_first_detection_at,
+                        &mut active.lockbar_locked,
+                        &mut active.lockbar_best_conf,
+                        &mut active.last_lockbar,
+                        &rgb.data,
+                        rgb.width,
+                        rgb.height,
+                    );
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
@@ -1327,17 +1405,22 @@ impl App {
                     // libfreenect ships u16 mm; widen for the shared algo.
                     let f32_data: Vec<f32> = depth.data.iter().map(|&v| f32::from(v)).collect();
                     // Face-anchored depth only — see v2 branch for rationale.
-                    let head = pick_largest_face(&active.last_faces).and_then(|face| {
-                        head_from_face_depth(
-                            face,
-                            640,
-                            480,
-                            &f32_data,
-                            depth.width,
-                            depth.height,
-                            &active.intrinsics,
-                        )
-                    });
+                    let preferred = active
+                        .last_lockbar
+                        .as_ref()
+                        .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
+                    let head =
+                        pick_player_face(&active.last_faces, 640, preferred).and_then(|face| {
+                            head_from_face_depth(
+                                face,
+                                640,
+                                480,
+                                &f32_data,
+                                depth.width,
+                                depth.height,
+                                &active.intrinsics,
+                            )
+                        });
                     let smoothed = smooth_head(head, &mut active.pose_filter, active.started_at);
                     capture_baseline(&mut active.baseline, smoothed);
                     active.last_head = smoothed;
@@ -1349,7 +1432,13 @@ impl App {
                     // ColorImage conversion strips the contiguous bytes).
                     if let Some(detector) = active.face_detector.as_mut() {
                         active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
-                        if let Some(face) = pick_largest_face(&active.last_faces) {
+                        let preferred = active
+                            .last_lockbar
+                            .as_ref()
+                            .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
+                        if let Some(face) =
+                            pick_player_face(&active.last_faces, rgb.width, preferred)
+                        {
                             let head = face_to_head(face, rgb.width, rgb.height);
                             let smoothed =
                                 smooth_head(Some(head), &mut active.pose_filter, active.started_at);
@@ -1360,16 +1449,16 @@ impl App {
                         }
                     }
                     update_lockbar(
-                    &mut active.lockbar_detector,
-                    &mut active.lockbar_last_run_at,
-                    &mut active.lockbar_first_detection_at,
-                    &mut active.lockbar_locked,
-                    &mut active.lockbar_best_conf,
-                    &mut active.last_lockbar,
-                    &rgb.data,
-                    rgb.width,
-                    rgb.height,
-                );
+                        &mut active.lockbar_detector,
+                        &mut active.lockbar_last_run_at,
+                        &mut active.lockbar_first_detection_at,
+                        &mut active.lockbar_locked,
+                        &mut active.lockbar_best_conf,
+                        &mut active.last_lockbar,
+                        &rgb.data,
+                        rgb.width,
+                        rgb.height,
+                    );
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
@@ -1634,9 +1723,10 @@ impl eframe::App for App {
                             .color(Color32::GRAY),
                         );
                     } else if let Some(head) = active.last_head {
+                        // Raw head pose, camera-centred frame.
                         ui.label(
                             RichText::new(format!(
-                                "{label}  |  distance {:.0} mm  |  pixel ({}, {})  |  3D ({:.0}, {:.0}, {:.0}) mm",
+                                "{label}  |  distance {:.0} mm  |  pixel ({}, {})  |  3D raw ({:+.0}, {:+.0}, {:+.0}) mm",
                                 head.depth_mm,
                                 head.u,
                                 head.v,
@@ -1646,6 +1736,41 @@ impl eframe::App for App {
                             ))
                             .monospace(),
                         );
+                        // Lockbar-centred head X — the value VPX wants
+                        // for its Δ-view in cabinet/window mode.
+                        if let Some(quad) = active.last_lockbar.as_ref()
+                            && let Some(lb) = lockbar_3d_center(quad, &active.intrinsics)
+                        {
+                            // Head position expressed in the lockbar's
+                            // frame: dx = left/right (0 = above centre,
+                            // + = right), dy = vertical head↔lockbar gap,
+                            // dz = depth (+ = head further than lockbar).
+                            // Roll/yaw rectification is still TODO — these
+                            // are the raw camera-frame deltas for now.
+                            let dx = head.x_mm - lb.x;
+                            let dy = head.y_mm - lb.y;
+                            let dz = head.depth_mm - lb.z;
+                            let lock_tag = if active.lockbar_locked { "locked" } else { "warmup" };
+                            ui.label(
+                                RichText::new(format!(
+                                    "lockbar {} | center 3D ({:+.0}, {:+.0}, {:+.0}) mm | width {} px | head centred ({:+.0}, {:+.0}, {:+.0}) mm",
+                                    lock_tag,
+                                    lb.x,
+                                    lb.y,
+                                    lb.z,
+                                    quad.mean_width_px(),
+                                    dx,
+                                    dy,
+                                    dz,
+                                ))
+                                .monospace()
+                                .color(if active.lockbar_locked {
+                                    Color32::LIGHT_GREEN
+                                } else {
+                                    Color32::LIGHT_YELLOW
+                                }),
+                            );
+                        }
                     } else {
                         ui.label(
                             RichText::new(format!("{label}  |  waiting for head detection…"))
