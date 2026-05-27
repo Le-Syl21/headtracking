@@ -227,12 +227,25 @@ impl GlutinWindowContext {
     }
 }
 
-/// Offscreen render target for the parallax validation window. Owns an
-/// FBO with a colour texture (registered with egui's painter, so it
-/// shows as a plain image and egui-rotate rotates it for free) plus a
-/// depth renderbuffer ready for the 3D scene. M0 only clears it to a
-/// recognisable colour — the shadow box + target grid land in M1.
-/// See `docs/parallax-validation-window.md`.
+// Virtual screen + scene geometry for the parallax window, in millimetres.
+// The screen is a fixed rectangle centred on the origin in the z=0 plane;
+// the scene recedes to negative z behind it, the eye sits in front (+z).
+const PX_SCREEN_W_MM: f32 = 300.0;
+const PX_SCREEN_H_MM: f32 = 225.0; // 4:3, matches the FBO
+const PX_BOX_DEPTH_MM: f32 = 900.0;
+const PX_NEAR_MM: f32 = 60.0;
+const PX_FAR_MM: f32 = 4000.0;
+/// Nominal viewing distance — the eye's resting Z.
+const PX_DVIEW_MM: f32 = 600.0;
+
+/// Offscreen render target + GL resources for the parallax validation
+/// window (fish-tank VR). Owns an FBO (colour texture registered with
+/// egui's painter so egui-rotate rotates it for free, + depth renderbuffer),
+/// a minimal shader program, and the static scene geometry: a receding
+/// wireframe "shadow box" and three depth layers of target points. Each
+/// frame it renders the scene with an *off-axis* projection derived from
+/// the supplied eye position (Kooima 2008), so moving the eye looks around
+/// the window edges. See `docs/parallax-validation-window.md`.
 struct ParallaxScene {
     fbo: glow::Framebuffer,
     color: glow::Texture,
@@ -242,12 +255,26 @@ struct ParallaxScene {
     /// [`Self::resize`] because that reallocates storage on the *same*
     /// texture name rather than creating a new one.
     tex_id: Option<egui::TextureId>,
+    /// Shader program (vertex applies the MVP + `gl_PointSize`, fragment
+    /// passes the per-vertex colour through) and its uniform locations.
+    program: glow::Program,
+    u_mvp: Option<glow::UniformLocation>,
+    u_point_size: Option<glow::UniformLocation>,
+    /// `true` on a GLES context — gates `PROGRAM_POINT_SIZE` (desktop-only).
+    embedded: bool,
+    /// Wireframe box (`GL_LINES`) and target layers (`GL_POINTS`): a VAO +
+    /// VBO each, plus the vertex count to draw.
+    box_vao: glow::VertexArray,
+    box_vbo: glow::Buffer,
+    box_count: i32,
+    pts_vao: glow::VertexArray,
+    pts_vbo: glow::Buffer,
+    pts_count: i32,
 }
 
 impl ParallaxScene {
-    /// Fixed offscreen resolution. 4:3 matches the typical camera feed so
-    /// the side-by-side columns look balanced; egui scales the texture
-    /// into whatever space the panel gives it. M2+ may make this adaptive.
+    /// Fixed offscreen resolution. 4:3 matches the virtual screen + camera
+    /// feed; egui scales the texture into whatever space the panel gives it.
     const W: i32 = 640;
     const H: i32 = 480;
 
@@ -262,12 +289,28 @@ impl ParallaxScene {
             let depth = gl
                 .create_renderbuffer()
                 .expect("create parallax depth buffer");
+
+            let embedded = gl.version().is_embedded;
+            let (program, u_mvp, u_point_size) = build_parallax_program(gl, embedded);
+            let (box_vao, box_vbo, box_count) = upload_mesh(gl, &parallax_box_mesh());
+            let (pts_vao, pts_vbo, pts_count) = upload_mesh(gl, &parallax_target_mesh());
+
             let mut scene = Self {
                 fbo,
                 color,
                 depth,
                 size: (0, 0),
                 tex_id: None,
+                program,
+                u_mvp,
+                u_point_size,
+                embedded,
+                box_vao,
+                box_vbo,
+                box_count,
+                pts_vao,
+                pts_vbo,
+                pts_count,
             };
             scene.resize(gl, Self::W, Self::H);
             scene
@@ -350,21 +393,46 @@ impl ParallaxScene {
         self.size = (w, h);
     }
 
-    /// Render one frame into the FBO, then restore the default framebuffer
-    /// so the egui paint that follows is unaffected. M0: clear only.
+    /// Render the scene into the FBO with an off-axis projection from `eye`
+    /// (screen-space mm: +x right, +y up, +z toward the viewer), then
+    /// restore the default framebuffer so the egui paint that follows is
+    /// unaffected.
     ///
     /// # Safety
     /// GL thread, context current.
-    unsafe fn render(&mut self, gl: &glow::Context) {
+    unsafe fn render(&mut self, gl: &glow::Context, eye: [f32; 3]) {
         use glow::HasContext as _;
         // SAFETY: caller guarantees the GL context is current.
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
             gl.viewport(0, 0, self.size.0, self.size.1);
             gl.enable(glow::DEPTH_TEST);
-            gl.clear_color(0.04, 0.07, 0.10, 1.0);
+            gl.depth_func(glow::LESS);
+            if !self.embedded {
+                gl.enable(glow::PROGRAM_POINT_SIZE);
+            }
+            gl.clear_color(0.03, 0.05, 0.08, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
-            // M1+: draw the shadow box + target grid with the off-axis MVP here.
+
+            let mvp = parallax_mvp(eye);
+            gl.use_program(Some(self.program));
+            gl.uniform_matrix_4_f32_slice(self.u_mvp.as_ref(), false, &mvp);
+
+            // Wireframe shadow box.
+            gl.uniform_1_f32(self.u_point_size.as_ref(), 2.0);
+            gl.bind_vertex_array(Some(self.box_vao));
+            gl.draw_arrays(glow::LINES, 0, self.box_count);
+
+            // Target layers.
+            gl.uniform_1_f32(self.u_point_size.as_ref(), 7.0);
+            gl.bind_vertex_array(Some(self.pts_vao));
+            gl.draw_arrays(glow::POINTS, 0, self.pts_count);
+
+            gl.bind_vertex_array(None);
+            gl.use_program(None);
+            if !self.embedded {
+                gl.disable(glow::PROGRAM_POINT_SIZE);
+            }
             gl.disable(glow::DEPTH_TEST);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
@@ -384,11 +452,248 @@ impl ParallaxScene {
         use glow::HasContext as _;
         // SAFETY: caller guarantees the GL context is current.
         unsafe {
+            gl.delete_program(self.program);
+            gl.delete_vertex_array(self.box_vao);
+            gl.delete_buffer(self.box_vbo);
+            gl.delete_vertex_array(self.pts_vao);
+            gl.delete_buffer(self.pts_vbo);
             gl.delete_framebuffer(self.fbo);
             gl.delete_texture(self.color);
             gl.delete_renderbuffer(self.depth);
         }
     }
+}
+
+// ===================================== Parallax scene: shaders + geometry + math
+
+const PARALLAX_VERT: &str = r"
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_col;
+uniform mat4 u_mvp;
+uniform float u_point_size;
+out vec3 v_col;
+void main() {
+    gl_Position = u_mvp * vec4(a_pos, 1.0);
+    gl_PointSize = u_point_size;
+    v_col = a_col;
+}
+";
+
+const PARALLAX_FRAG: &str = r"
+in vec3 v_col;
+out vec4 frag_color;
+void main() { frag_color = vec4(v_col, 1.0); }
+";
+
+/// Compile + link the parallax program; returns it with its uniform
+/// locations. The GLSL version header is chosen at runtime to match the
+/// context (desktop `330 core` vs `300 es`). Panics with the GL info log on
+/// failure — a shader bug here is a dev error, not a runtime condition.
+///
+/// # Safety
+/// GL thread, context current.
+unsafe fn build_parallax_program(
+    gl: &glow::Context,
+    embedded: bool,
+) -> (
+    glow::Program,
+    Option<glow::UniformLocation>,
+    Option<glow::UniformLocation>,
+) {
+    use glow::HasContext as _;
+    let header = if embedded {
+        "#version 300 es\nprecision mediump float;\n"
+    } else {
+        "#version 330 core\n"
+    };
+    // SAFETY: GL context current (caller guarantee).
+    unsafe {
+        let vs = compile_shader(gl, glow::VERTEX_SHADER, &format!("{header}{PARALLAX_VERT}"));
+        let fs = compile_shader(
+            gl,
+            glow::FRAGMENT_SHADER,
+            &format!("{header}{PARALLAX_FRAG}"),
+        );
+        let program = gl.create_program().expect("create parallax program");
+        gl.attach_shader(program, vs);
+        gl.attach_shader(program, fs);
+        gl.link_program(program);
+        assert!(
+            gl.get_program_link_status(program),
+            "parallax program link failed: {}",
+            gl.get_program_info_log(program)
+        );
+        gl.detach_shader(program, vs);
+        gl.detach_shader(program, fs);
+        gl.delete_shader(vs);
+        gl.delete_shader(fs);
+        let u_mvp = gl.get_uniform_location(program, "u_mvp");
+        let u_point_size = gl.get_uniform_location(program, "u_point_size");
+        (program, u_mvp, u_point_size)
+    }
+}
+
+/// # Safety
+/// GL thread, context current.
+unsafe fn compile_shader(gl: &glow::Context, kind: u32, src: &str) -> glow::Shader {
+    use glow::HasContext as _;
+    // SAFETY: GL context current (caller guarantee).
+    unsafe {
+        let sh = gl.create_shader(kind).expect("create shader");
+        gl.shader_source(sh, src);
+        gl.compile_shader(sh);
+        assert!(
+            gl.get_shader_compile_status(sh),
+            "parallax shader compile failed: {}",
+            gl.get_shader_info_log(sh)
+        );
+        sh
+    }
+}
+
+/// Upload an interleaved `[x,y,z, r,g,b]` mesh into a fresh VAO+VBO and wire
+/// the two `vec3` attributes. Returns `(vao, vbo, vertex_count)`.
+///
+/// # Safety
+/// GL thread, context current.
+unsafe fn upload_mesh(gl: &glow::Context, verts: &[f32]) -> (glow::VertexArray, glow::Buffer, i32) {
+    use glow::HasContext as _;
+    const STRIDE: i32 = 6 * 4; // 6 f32 per vertex
+    // SAFETY: GL context current (caller guarantee).
+    unsafe {
+        let vao = gl.create_vertex_array().expect("create vao");
+        let vbo = gl.create_buffer().expect("create vbo");
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, f32_as_bytes(verts), glow::STATIC_DRAW);
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, STRIDE, 0);
+        gl.enable_vertex_attrib_array(1);
+        gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, STRIDE, 12);
+        gl.bind_vertex_array(None);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        (vao, vbo, (verts.len() / 6) as i32)
+    }
+}
+
+fn f32_as_bytes(v: &[f32]) -> &[u8] {
+    // SAFETY: f32 is plain-old-data with no invalid bit patterns; the view
+    // spans exactly size_of_val(v) bytes and is read-only, consumed
+    // immediately by an immutable GL upload.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
+/// Receding wireframe "shadow box": rectangle rings at five depths plus the
+/// four corner edges joining front (z=0) to back (z=-depth). Dim teal.
+fn parallax_box_mesh() -> Vec<f32> {
+    let hw = PX_SCREEN_W_MM * 0.5;
+    let hh = PX_SCREEN_H_MM * 0.5;
+    let col = [0.30f32, 0.55, 0.65];
+    let mut v: Vec<f32> = Vec::new();
+    let mut line = |a: [f32; 3], b: [f32; 3]| {
+        v.extend_from_slice(&[a[0], a[1], a[2], col[0], col[1], col[2]]);
+        v.extend_from_slice(&[b[0], b[1], b[2], col[0], col[1], col[2]]);
+    };
+    let depths = [0.0f32, -0.25, -0.5, -0.75, -1.0].map(|f| f * PX_BOX_DEPTH_MM);
+    for &z in &depths {
+        let c = [[-hw, -hh, z], [hw, -hh, z], [hw, hh, z], [-hw, hh, z]];
+        for i in 0..4 {
+            line(c[i], c[(i + 1) % 4]);
+        }
+    }
+    for &(sx, sy) in &[(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)] {
+        line([sx, sy, 0.0], [sx, sy, -PX_BOX_DEPTH_MM]);
+    }
+    v
+}
+
+/// Three 5×5 grids of target points at increasing depth, warm (near) → cool
+/// (far). The differential slide between layers is the parallax cue.
+fn parallax_target_mesh() -> Vec<f32> {
+    let layers = [
+        (-150.0f32, [1.0f32, 0.62, 0.25]), // near, warm
+        (-400.0, [0.45, 0.90, 0.45]),      // mid, green
+        (-800.0, [0.40, 0.62, 1.00]),      // far, cool
+    ];
+    let tx = PX_SCREEN_W_MM * 0.62;
+    let ty = PX_SCREEN_H_MM * 0.62;
+    let n = 5i32;
+    let mut v: Vec<f32> = Vec::new();
+    for (z, c) in layers {
+        for iy in 0..n {
+            for ix in 0..n {
+                let fx = ix as f32 / (n - 1) as f32 * 2.0 - 1.0;
+                let fy = iy as f32 / (n - 1) as f32 * 2.0 - 1.0;
+                v.extend_from_slice(&[fx * tx, fy * ty, z, c[0], c[1], c[2]]);
+            }
+        }
+    }
+    v
+}
+
+/// Off-axis MVP for the parallax scene: a Kooima generalized-perspective
+/// frustum from `eye` (mm) onto the fixed screen rectangle in the z=0 plane,
+/// times the eye translation. Model = identity (static scene), and the
+/// screen axes equal the world axes so the rotation `M` is identity too.
+fn parallax_mvp(eye: [f32; 3]) -> [f32; 16] {
+    let hw = PX_SCREEN_W_MM * 0.5;
+    let hh = PX_SCREEN_H_MM * 0.5;
+    let (ex, ey) = (eye[0], eye[1]);
+    let ez = eye[2].max(PX_NEAR_MM + 1.0); // eye→screen distance, must exceed near
+    let n = PX_NEAR_MM;
+    let s = n / ez;
+    let l = (-hw - ex) * s;
+    let r = (hw - ex) * s;
+    let b = (-hh - ey) * s;
+    let t = (hh - ey) * s;
+    let p = mat4_frustum(l, r, b, t, n, PX_FAR_MM);
+    mat4_mul(p, mat4_translate(-ex, -ey, -ez))
+}
+
+/// `glFrustum`, column-major (ready for `glUniformMatrix4fv` transpose=false).
+fn mat4_frustum(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> [f32; 16] {
+    let rl = r - l;
+    let tb = t - b;
+    let fne = f - n;
+    [
+        2.0 * n / rl,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.0 * n / tb,
+        0.0,
+        0.0,
+        (r + l) / rl,
+        (t + b) / tb,
+        -(f + n) / fne,
+        -1.0,
+        0.0,
+        0.0,
+        -2.0 * f * n / fne,
+        0.0,
+    ]
+}
+
+fn mat4_translate(x: f32, y: f32, z: f32) -> [f32; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0,
+    ]
+}
+
+/// Column-major 4×4 multiply: `a * b`.
+fn mat4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
+    let mut o = [0.0f32; 16];
+    for c in 0..4 {
+        for r in 0..4 {
+            let mut s = 0.0;
+            for k in 0..4 {
+                s += a[k * 4 + r] * b[c * 4 + k];
+            }
+            o[c * 4 + r] = s;
+        }
+    }
+    o
 }
 
 /// Owns the GL window + egui integration and drives the `App` model
@@ -435,7 +740,9 @@ impl DemoShell {
                 // SAFETY: GL context current on this (UI) thread.
                 .get_or_insert_with(|| unsafe { ParallaxScene::new(gl) });
             // SAFETY: same.
-            unsafe { scene.render(gl) };
+            // The eye was computed during the previous frame's UI pass (the
+            // FBO renders before run_ui) — a 1-frame lag, imperceptible here.
+            unsafe { scene.render(gl, self.app.parallax_eye) };
             self.app.parallax_tex = Some(scene.texture_id(painter));
         } else {
             self.app.parallax_tex = None;
@@ -1247,13 +1554,52 @@ struct App {
     /// the player's seat. Read by [`DemoShell::redraw`].
     rotation: Rotation,
     /// Parallax validation window toggle (🪟 button). When on, the central
-    /// panel shows the camera feed and the off-axis 3D scene side by side
-    /// (see `docs/parallax-validation-window.md`). M0: clear colour only.
+    /// panel shows the camera feed with the off-axis 3D scene stacked below
+    /// it (see `docs/parallax-validation-window.md`).
     parallax_enabled: bool,
     /// egui handle to the parallax scene's offscreen colour texture, set
     /// by [`DemoShell::redraw`] each frame the window is on (the FBO lives
     /// with the GL context in `DemoShell`, not here). `None` when off.
     parallax_tex: Option<egui::TextureId>,
+    /// Eye-position source for the parallax scene (Live / Mouse / Auto-orbit).
+    parallax_eye_mode: ParallaxEye,
+    /// Current parallax eye in screen-space mm (+x right, +y up, +z toward
+    /// the viewer), recomputed each frame by [`App::update_parallax_eye`] and
+    /// read by [`DemoShell::redraw`] to build the off-axis projection.
+    parallax_eye: [f32; 3],
+    /// Debug gain + per-axis sign flips for the Live mapping — the bench
+    /// knobs from the spec (used to find the right signs to bake into
+    /// `camera/mapping.rs`, not a product calibration step).
+    parallax_gain: f32,
+    parallax_invert: [bool; 3],
+    /// Last parallax panel rect (egui logical px) so Mouse mode can map the
+    /// pointer. Logical space = post-egui-rotate, so the mouse "rotates" with
+    /// the window for free.
+    parallax_panel_rect: Option<Rect>,
+    /// Eye Z for Mouse mode, nudged by the scroll wheel.
+    parallax_mouse_z: f32,
+}
+
+/// Where the parallax scene's eye position comes from. Three sources so the
+/// scene can be exercised without a camera (dev machine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallaxEye {
+    /// Real head pose (lockbar-relative deltas) — final validation, camera on.
+    Live,
+    /// Pointer over the panel drives X/Y, wheel drives Z — dev machine.
+    Mouse,
+    /// Slow programmed sinusoid — hands-free demo / video capture.
+    AutoOrbit,
+}
+
+impl ParallaxEye {
+    fn label(self) -> &'static str {
+        match self {
+            ParallaxEye::Live => "Live (head)",
+            ParallaxEye::Mouse => "Mouse",
+            ParallaxEye::AutoOrbit => "Auto-orbit",
+        }
+    }
 }
 
 impl App {
@@ -1870,6 +2216,15 @@ impl App {
             rotation: Rotation::CW90,
             parallax_enabled: false,
             parallax_tex: None,
+            // Auto-orbit by default: the parallax illusion shows immediately
+            // with no camera and no need to move — switch to Live on the cab.
+            parallax_eye_mode: ParallaxEye::AutoOrbit,
+            parallax_eye: [0.0, 0.0, PX_DVIEW_MM],
+            parallax_gain: 1.0,
+            // Y flipped by default: Kinect Y points down, the eye's Y is up.
+            parallax_invert: [false, true, false],
+            parallax_panel_rect: None,
+            parallax_mouse_z: PX_DVIEW_MM,
         }
     }
 
@@ -2234,12 +2589,74 @@ fn capture_baseline(slot: &mut Option<Baseline>, head: Option<HeadPixel>) {
 }
 
 impl App {
+    /// Recompute [`Self::parallax_eye`] for this frame from the active
+    /// source. Mouse mode reads egui's *logical* pointer (already rotated by
+    /// egui-rotate) against last frame's panel rect — a 1-frame lag that's
+    /// imperceptible. Live mode maps the lockbar-relative head deltas through
+    /// the debug gain + invert toggles.
+    fn update_parallax_eye(&mut self, ctx: &egui::Context) {
+        const RANGE_X: f32 = 220.0;
+        const RANGE_Y: f32 = 160.0;
+        match self.parallax_eye_mode {
+            ParallaxEye::AutoOrbit => {
+                let t = ctx.input(|i| i.time) as f32;
+                self.parallax_eye = [
+                    130.0 * (t * 0.9).sin(),
+                    70.0 * (t * 0.6 + 1.0).sin(),
+                    PX_DVIEW_MM + 90.0 * (t * 0.5).sin(),
+                ];
+            }
+            ParallaxEye::Mouse => {
+                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    self.parallax_mouse_z = (self.parallax_mouse_z + scroll).clamp(200.0, 1200.0);
+                }
+                if let (Some(rect), Some(pos)) =
+                    (self.parallax_panel_rect, ctx.pointer_latest_pos())
+                    && rect.contains(pos)
+                {
+                    let nx = ((pos.x - rect.left()) / rect.width()) * 2.0 - 1.0;
+                    let ny = ((pos.y - rect.top()) / rect.height()) * 2.0 - 1.0;
+                    self.parallax_eye = [nx * RANGE_X, -ny * RANGE_Y, self.parallax_mouse_z];
+                } else {
+                    self.parallax_eye[2] = self.parallax_mouse_z;
+                }
+            }
+            ParallaxEye::Live => {
+                let pose = self
+                    .active
+                    .as_ref()
+                    .and_then(|a| match (a.baseline, a.last_head) {
+                        (Some(base), Some(head)) => Some((base, head)),
+                        _ => None,
+                    });
+                if let Some((base, head)) = pose {
+                    let g = self.parallax_gain;
+                    let sign = |i: usize| if self.parallax_invert[i] { -1.0 } else { 1.0 };
+                    let dx = head.x_mm - base.x_mm;
+                    let dy = head.y_mm - base.y_mm;
+                    let dz = head.depth_mm - base.z_mm;
+                    self.parallax_eye = [
+                        sign(0) * dx * g,
+                        sign(1) * dy * g,
+                        (PX_DVIEW_MM + sign(2) * dz * g).clamp(150.0, 1500.0),
+                    ];
+                } else {
+                    self.parallax_eye = [0.0, 0.0, PX_DVIEW_MM];
+                }
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui) {
         // egui 0.34 nests panels inside a root Ui; grab a Context handle
         // for the bits that still need one (texture upload in `poll`).
         let egui_ctx = ui.ctx().clone();
         self.ensure_active();
         self.poll(&egui_ctx);
+        if self.parallax_enabled {
+            self.update_parallax_eye(&egui_ctx);
+        }
 
         // ----- Top toolbar: one button-only row, then an INPUT row
         // (raw camera measurements) and an OUTPUT row (what VPX consumes).
@@ -2302,7 +2719,7 @@ impl App {
                 // 🪟 Parallax — toggles the off-axis 3D validation view in
                 // the central panel (camera | parallax, side by side).
                 ui.toggle_value(&mut self.parallax_enabled, "🪟 parallax")
-                    .on_hover_text("Show the off-axis 3D validation scene next to the camera feed");
+                    .on_hover_text("Show the off-axis 3D validation scene below the camera feed");
                 // Screenshot result lives on the bar — it's the button's
                 // own feedback. Cleared on the next click / backend change.
                 if let Some(status) = &self.screenshot_status {
@@ -2511,16 +2928,18 @@ impl App {
                 });
             });
 
-        // ----- Center: camera feed, optionally beside the parallax view
+        // ----- Center: camera feed, with the parallax scene stacked BELOW it
+        // (a resizable bottom panel) when enabled — side-by-side ate too much
+        // width.
         CentralPanel::default().show_inside(ui, |ui| {
             if self.parallax_enabled {
-                ui.columns(2, |cols| {
-                    self.draw_camera_view(&mut cols[0]);
-                    self.draw_parallax_view(&mut cols[1]);
-                });
-            } else {
-                self.draw_camera_view(ui);
+                Panel::bottom("parallax-view")
+                    .resizable(true)
+                    .default_size(280.0)
+                    .min_size(140.0)
+                    .show_inside(ui, |ui| self.draw_parallax_view(ui));
             }
+            self.draw_camera_view(ui);
         });
     }
 
@@ -2597,19 +3016,48 @@ impl App {
         }
     }
 
-    /// Right column when the parallax window is on: the offscreen scene as
-    /// a plain egui image (so egui-rotate rotates it for free). The FBO is
-    /// rendered + registered by [`DemoShell::redraw`]; here we just blit
-    /// `parallax_tex`. M0 is a flat clear colour — 3D arrives in M1.
-    fn draw_parallax_view(&self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
+    /// The parallax scene, stacked below the camera feed: a header row (eye
+    /// source selector + `pe` readout + Live debug knobs) and the offscreen
+    /// scene blitted as a plain egui image (so egui-rotate rotates it for
+    /// free). The FBO is rendered + registered by [`DemoShell::redraw`] from
+    /// [`Self::parallax_eye`]; here we just present it and record the panel
+    /// rect so Mouse mode can map the pointer.
+    fn draw_parallax_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
             ui.label(
-                RichText::new("parallax (validation)")
+                RichText::new("parallax")
                     .strong()
                     .color(Color32::GRAY)
                     .monospace(),
             );
+            ui.separator();
+            ui.label("eye:");
+            for mode in [
+                ParallaxEye::Live,
+                ParallaxEye::Mouse,
+                ParallaxEye::AutoOrbit,
+            ] {
+                ui.selectable_value(&mut self.parallax_eye_mode, mode, mode.label());
+            }
+            ui.separator();
+            let [ex, ey, ez] = self.parallax_eye;
+            ui.label(
+                RichText::new(format!("pe ({ex:+.0}, {ey:+.0}, {ez:.0}) mm"))
+                    .monospace()
+                    .size(12.0)
+                    .color(LOCKBAR_COLOR),
+            );
+            // Bench knobs for the Live mapping (find the signs/gain, then bake
+            // them into camera/mapping.rs — not product calibration).
+            if self.parallax_eye_mode == ParallaxEye::Live {
+                ui.separator();
+                ui.add(egui::Slider::new(&mut self.parallax_gain, 0.5..=6.0).text("gain"));
+                ui.toggle_value(&mut self.parallax_invert[0], "±X");
+                ui.toggle_value(&mut self.parallax_invert[1], "±Y");
+                ui.toggle_value(&mut self.parallax_invert[2], "±Z");
+            }
         });
+
         let avail = ui.available_size();
         let aspect = ParallaxScene::W as f32 / ParallaxScene::H as f32;
         let (w, h) = if avail.x / avail.y > aspect {
@@ -2618,15 +3066,27 @@ impl App {
             (avail.x, avail.x / aspect)
         };
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+        // Record the rect (egui logical space, already rotated by egui-rotate)
+        // for Mouse mode's pointer mapping next frame.
+        self.parallax_panel_rect = Some(rect);
         if let Some(tex) = self.parallax_tex {
             // GL textures are bottom-left origin; flip V so the scene shows
-            // upright once M1 starts drawing into it.
+            // upright.
             ui.painter().image(
                 tex,
                 rect,
                 Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0)),
                 Color32::WHITE,
             );
+            // Fixed screen-space reticle at the window centre — the reference
+            // against which the off-axis slide is read.
+            let c = rect.center();
+            let s = 7.0;
+            let stroke = Stroke::new(1.0, Color32::from_white_alpha(150));
+            ui.painter()
+                .line_segment([Pos2::new(c.x - s, c.y), Pos2::new(c.x + s, c.y)], stroke);
+            ui.painter()
+                .line_segment([Pos2::new(c.x, c.y - s), Pos2::new(c.x, c.y + s)], stroke);
         } else {
             centered(ui, rect, "starting parallax view…");
         }
