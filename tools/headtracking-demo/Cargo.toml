@@ -17,6 +17,9 @@ freenect2 = { path = "../../crates/freenect2" }
 u-onnx = { path = "../../crates/u-onnx" }
 webcam = { path = "../../crates/webcam" }
 headtracking = { path = "../.." }
+# Linear algebra for the parallax off-axis projection (Matrix4: column-major
+# storage → feeds glUniformMatrix4fv directly via as_slice).
+nalgebra = "0.34"
 # Manual egui integration (winit + glutin + glow + egui_glow) instead of
 # eframe, so we can splice egui-rotate into the render loop: it rotates
 # raw_input before egui sees it and the tessellated primitives before the

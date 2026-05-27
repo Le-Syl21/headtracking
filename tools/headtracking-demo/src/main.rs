@@ -29,8 +29,9 @@ use egui::{
     self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, TextureHandle, Vec2,
 };
-use egui_rotate::{Rotation, transform_clipped_primitives, transform_raw_input};
+use egui_rotate::{CursorIconExt, Rotation, transform_clipped_primitives, transform_raw_input};
 use egui_winit::winit;
+use nalgebra::Matrix4;
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
@@ -100,6 +101,13 @@ fn main() {
         error!(error = %e, "event loop failed");
         std::process::exit(1);
     }
+    // Exit without running `shell`'s destructors. Dropping the glutin
+    // surface/context calls `eglDestroySurface`, which segfaults inside the
+    // NVIDIA EGL-Wayland driver at teardown (invisible to the user — the
+    // window has already closed — but it leaves a core dump). GL resources
+    // are reclaimed by the OS on exit; the `exiting()` handler already ran
+    // egui/scene cleanup inside the event loop.
+    std::process::exit(0);
 }
 
 // ===================================================== Window + GL plumbing
@@ -228,10 +236,11 @@ impl GlutinWindowContext {
 }
 
 // Virtual screen + scene geometry for the parallax window, in millimetres.
-// The screen is a fixed rectangle centred on the origin in the z=0 plane;
-// the scene recedes to negative z behind it, the eye sits in front (+z).
-const PX_SCREEN_W_MM: f32 = 300.0;
-const PX_SCREEN_H_MM: f32 = 225.0; // 4:3, matches the FBO
+// The screen is a rectangle centred on the origin in the z=0 plane; the
+// scene recedes to negative z behind it, the eye sits in front (+z). The
+// screen *height* is fixed; its *width* follows the panel aspect so the
+// scene fills the panel edge-to-edge without distortion.
+const PX_SCREEN_H_MM: f32 = 225.0;
 const PX_BOX_DEPTH_MM: f32 = 900.0;
 const PX_NEAR_MM: f32 = 60.0;
 const PX_FAR_MM: f32 = 4000.0;
@@ -255,21 +264,22 @@ struct ParallaxScene {
     /// [`Self::resize`] because that reallocates storage on the *same*
     /// texture name rather than creating a new one.
     tex_id: Option<egui::TextureId>,
-    /// Shader program (vertex applies the MVP + `gl_PointSize`, fragment
-    /// passes the per-vertex colour through) and its uniform locations.
+    /// Shader program (vertex applies the MVP, fragment passes the
+    /// per-vertex colour through) and its `u_mvp` uniform location.
     program: glow::Program,
     u_mvp: Option<glow::UniformLocation>,
-    u_point_size: Option<glow::UniformLocation>,
-    /// `true` on a GLES context — gates `PROGRAM_POINT_SIZE` (desktop-only).
-    embedded: bool,
-    /// Wireframe box (`GL_LINES`) and target layers (`GL_POINTS`): a VAO +
-    /// VBO each, plus the vertex count to draw.
+    /// Wireframe shadow box (`GL_LINES`) and solid 3D cube markers
+    /// (`GL_TRIANGLES`): a VAO + VBO each, plus the vertex count to draw.
     box_vao: glow::VertexArray,
     box_vbo: glow::Buffer,
     box_count: i32,
     pts_vao: glow::VertexArray,
     pts_vbo: glow::Buffer,
     pts_count: i32,
+    /// Panel aspect the box/target geometry was last built for — rebuilt in
+    /// [`Self::render`] when the panel aspect changes, so the scene fills the
+    /// panel edge-to-edge at any shape without distorting the markers.
+    geom_aspect: f32,
 }
 
 impl ParallaxScene {
@@ -291,9 +301,12 @@ impl ParallaxScene {
                 .expect("create parallax depth buffer");
 
             let embedded = gl.version().is_embedded;
-            let (program, u_mvp, u_point_size) = build_parallax_program(gl, embedded);
-            let (box_vao, box_vbo, box_count) = upload_mesh(gl, &parallax_box_mesh());
-            let (pts_vao, pts_vbo, pts_count) = upload_mesh(gl, &parallax_target_mesh());
+            let (program, u_mvp) = build_parallax_program(gl, embedded);
+            // Initial geometry at the placeholder 4:3; render() rebuilds it to
+            // the real panel aspect on the first frame.
+            let aspect0 = Self::W as f32 / Self::H as f32;
+            let (box_vao, box_vbo, box_count) = upload_mesh(gl, &parallax_box_mesh(aspect0));
+            let (pts_vao, pts_vbo, pts_count) = upload_mesh(gl, &parallax_cube_mesh(aspect0));
 
             let mut scene = Self {
                 fbo,
@@ -303,14 +316,13 @@ impl ParallaxScene {
                 tex_id: None,
                 program,
                 u_mvp,
-                u_point_size,
-                embedded,
                 box_vao,
                 box_vbo,
                 box_count,
                 pts_vao,
                 pts_vbo,
                 pts_count,
+                geom_aspect: aspect0,
             };
             scene.resize(gl, Self::W, Self::H);
             scene
@@ -400,39 +412,51 @@ impl ParallaxScene {
     ///
     /// # Safety
     /// GL thread, context current.
-    unsafe fn render(&mut self, gl: &glow::Context, eye: [f32; 3]) {
+    unsafe fn render(&mut self, gl: &glow::Context, eye: [f32; 3], aspect: f32) {
         use glow::HasContext as _;
         // SAFETY: caller guarantees the GL context is current.
         unsafe {
+            // Match the FBO aspect to the panel so the scene fills it with no
+            // distortion; height fixed for a stable resolution.
+            let h = 512;
+            let w = ((h as f32 * aspect).round() as i32).clamp(160, 2048);
+            self.resize(gl, w, h);
+
+            // Rebuild box + target geometry when the panel aspect changes so
+            // the front frame keeps hugging the panel edges (markers stay
+            // square — only their spread and the frame widen).
+            if (aspect - self.geom_aspect).abs() > 0.01 {
+                let bm = parallax_box_mesh(aspect);
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.box_vbo));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, f32_as_bytes(&bm), glow::DYNAMIC_DRAW);
+                self.box_count = (bm.len() / 6) as i32;
+                let tm = parallax_cube_mesh(aspect);
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.pts_vbo));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, f32_as_bytes(&tm), glow::DYNAMIC_DRAW);
+                self.pts_count = (tm.len() / 6) as i32;
+                gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                self.geom_aspect = aspect;
+            }
+
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
             gl.viewport(0, 0, self.size.0, self.size.1);
             gl.enable(glow::DEPTH_TEST);
             gl.depth_func(glow::LESS);
-            if !self.embedded {
-                gl.enable(glow::PROGRAM_POINT_SIZE);
-            }
             gl.clear_color(0.03, 0.05, 0.08, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
 
-            let mvp = parallax_mvp(eye);
+            let mvp = parallax_mvp(eye, aspect);
             gl.use_program(Some(self.program));
-            gl.uniform_matrix_4_f32_slice(self.u_mvp.as_ref(), false, &mvp);
+            gl.uniform_matrix_4_f32_slice(self.u_mvp.as_ref(), false, mvp.as_slice());
 
-            // Wireframe shadow box.
-            gl.uniform_1_f32(self.u_point_size.as_ref(), 2.0);
+            // Wireframe shadow box (lines) + solid 3D cube markers (triangles).
             gl.bind_vertex_array(Some(self.box_vao));
             gl.draw_arrays(glow::LINES, 0, self.box_count);
-
-            // Target layers.
-            gl.uniform_1_f32(self.u_point_size.as_ref(), 7.0);
             gl.bind_vertex_array(Some(self.pts_vao));
-            gl.draw_arrays(glow::POINTS, 0, self.pts_count);
+            gl.draw_arrays(glow::TRIANGLES, 0, self.pts_count);
 
             gl.bind_vertex_array(None);
             gl.use_program(None);
-            if !self.embedded {
-                gl.disable(glow::PROGRAM_POINT_SIZE);
-            }
             gl.disable(glow::DEPTH_TEST);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
@@ -470,11 +494,9 @@ const PARALLAX_VERT: &str = r"
 layout(location = 0) in vec3 a_pos;
 layout(location = 1) in vec3 a_col;
 uniform mat4 u_mvp;
-uniform float u_point_size;
 out vec3 v_col;
 void main() {
     gl_Position = u_mvp * vec4(a_pos, 1.0);
-    gl_PointSize = u_point_size;
     v_col = a_col;
 }
 ";
@@ -495,11 +517,7 @@ void main() { frag_color = vec4(v_col, 1.0); }
 unsafe fn build_parallax_program(
     gl: &glow::Context,
     embedded: bool,
-) -> (
-    glow::Program,
-    Option<glow::UniformLocation>,
-    Option<glow::UniformLocation>,
-) {
+) -> (glow::Program, Option<glow::UniformLocation>) {
     use glow::HasContext as _;
     let header = if embedded {
         "#version 300 es\nprecision mediump float;\n"
@@ -528,8 +546,7 @@ unsafe fn build_parallax_program(
         gl.delete_shader(vs);
         gl.delete_shader(fs);
         let u_mvp = gl.get_uniform_location(program, "u_mvp");
-        let u_point_size = gl.get_uniform_location(program, "u_point_size");
-        (program, u_mvp, u_point_size)
+        (program, u_mvp)
     }
 }
 
@@ -583,11 +600,19 @@ fn f32_as_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
-/// Receding wireframe "shadow box": rectangle rings at five depths plus the
-/// four corner edges joining front (z=0) to back (z=-depth). Dim teal.
-fn parallax_box_mesh() -> Vec<f32> {
-    let hw = PX_SCREEN_W_MM * 0.5;
+/// Half-extents of the virtual screen for a given panel aspect (the screen
+/// height is fixed; its width follows the aspect so the scene fills the
+/// panel without distortion).
+fn parallax_screen_half(aspect: f32) -> (f32, f32) {
     let hh = PX_SCREEN_H_MM * 0.5;
+    (hh * aspect, hh)
+}
+
+/// Receding wireframe "shadow box": rectangle rings at five depths plus the
+/// four corner edges joining front (z=0) to back (z=-depth). The front ring
+/// is the window frame, sized to the panel aspect. Dim teal.
+fn parallax_box_mesh(aspect: f32) -> Vec<f32> {
+    let (hw, hh) = parallax_screen_half(aspect);
     let col = [0.30f32, 0.55, 0.65];
     let mut v: Vec<f32> = Vec::new();
     let mut line = |a: [f32; 3], b: [f32; 3]| {
@@ -607,24 +632,80 @@ fn parallax_box_mesh() -> Vec<f32> {
     v
 }
 
-/// Three 5×5 grids of target points at increasing depth, warm (near) → cool
-/// (far). The differential slide between layers is the parallax cue.
-fn parallax_target_mesh() -> Vec<f32> {
+/// Three 3×3 grids of solid **3D cubes** (`GL_TRIANGLES`) at increasing
+/// depth, warm (near) → cool (far). Each face gets a fixed shade (fake
+/// top-light) baked into its vertex colour, so the cubes read as volumes
+/// without a lighting pass — far clearer than flat points/squares, and the
+/// faces reveal 3D as the eye moves. Positions span the panel aspect; the
+/// cube size is fixed (so perspective scales them near→far). Depth-tested,
+/// no culling needed.
+fn parallax_cube_mesh(aspect: f32) -> Vec<f32> {
     let layers = [
         (-150.0f32, [1.0f32, 0.62, 0.25]), // near, warm
         (-400.0, [0.45, 0.90, 0.45]),      // mid, green
         (-800.0, [0.40, 0.62, 1.00]),      // far, cool
     ];
-    let tx = PX_SCREEN_W_MM * 0.62;
-    let ty = PX_SCREEN_H_MM * 0.62;
-    let n = 5i32;
+    let (hw, hh) = parallax_screen_half(aspect);
+    let (tx, ty) = (hw * 0.66, hh * 0.66);
+    let hsz = 30.0f32; // cube half-size, mm (fixed)
+    let n = 3i32;
     let mut v: Vec<f32> = Vec::new();
-    for (z, c) in layers {
+    // Two triangles (a,b,c)+(a,c,d) for a quad face, all in one colour.
+    let mut quad = |a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], col: [f32; 3]| {
+        for p in [a, b, c, a, c, d] {
+            v.extend_from_slice(&[p[0], p[1], p[2], col[0], col[1], col[2]]);
+        }
+    };
+    for (z, base) in layers {
         for iy in 0..n {
             for ix in 0..n {
-                let fx = ix as f32 / (n - 1) as f32 * 2.0 - 1.0;
-                let fy = iy as f32 / (n - 1) as f32 * 2.0 - 1.0;
-                v.extend_from_slice(&[fx * tx, fy * ty, z, c[0], c[1], c[2]]);
+                let cx = (ix as f32 / (n - 1) as f32 * 2.0 - 1.0) * tx;
+                let cy = (iy as f32 / (n - 1) as f32 * 2.0 - 1.0) * ty;
+                let p = |sx: f32, sy: f32, sz: f32| [cx + sx * hsz, cy + sy * hsz, z + sz * hsz];
+                let shade = |s: f32| [base[0] * s, base[1] * s, base[2] * s];
+                // Fake top-light: brightest top, darkest bottom.
+                quad(
+                    p(-1., -1., 1.),
+                    p(1., -1., 1.),
+                    p(1., 1., 1.),
+                    p(-1., 1., 1.),
+                    shade(0.88),
+                ); // +Z front
+                quad(
+                    p(1., -1., -1.),
+                    p(-1., -1., -1.),
+                    p(-1., 1., -1.),
+                    p(1., 1., -1.),
+                    shade(0.50),
+                ); // -Z back
+                quad(
+                    p(-1., 1., 1.),
+                    p(1., 1., 1.),
+                    p(1., 1., -1.),
+                    p(-1., 1., -1.),
+                    shade(1.0),
+                ); // +Y top
+                quad(
+                    p(-1., -1., -1.),
+                    p(1., -1., -1.),
+                    p(1., -1., 1.),
+                    p(-1., -1., 1.),
+                    shade(0.40),
+                ); // -Y bottom
+                quad(
+                    p(1., -1., 1.),
+                    p(1., -1., -1.),
+                    p(1., 1., -1.),
+                    p(1., 1., 1.),
+                    shade(0.70),
+                ); // +X right
+                quad(
+                    p(-1., -1., -1.),
+                    p(-1., -1., 1.),
+                    p(-1., 1., 1.),
+                    p(-1., 1., -1.),
+                    shade(0.60),
+                ); // -X left
             }
         }
     }
@@ -632,68 +713,38 @@ fn parallax_target_mesh() -> Vec<f32> {
 }
 
 /// Off-axis MVP for the parallax scene: a Kooima generalized-perspective
-/// frustum from `eye` (mm) onto the fixed screen rectangle in the z=0 plane,
-/// times the eye translation. Model = identity (static scene), and the
-/// screen axes equal the world axes so the rotation `M` is identity too.
-fn parallax_mvp(eye: [f32; 3]) -> [f32; 16] {
-    let hw = PX_SCREEN_W_MM * 0.5;
-    let hh = PX_SCREEN_H_MM * 0.5;
+/// frustum from `eye` (mm) onto the screen rectangle (sized to `aspect`) in
+/// the z=0 plane, times the eye translation. Model = identity (static
+/// scene), and the screen axes equal the world axes so the rotation `M` is
+/// identity too.
+///
+/// Built with `nalgebra`: `Matrix4::new` takes row-major arguments (as the
+/// matrix reads on paper) and stores them column-major, so `as_slice()`
+/// hands `glUniformMatrix4fv(transpose=false)` exactly what it wants.
+fn parallax_mvp(eye: [f32; 3], aspect: f32) -> Matrix4<f32> {
+    let (hw, hh) = parallax_screen_half(aspect);
     let (ex, ey) = (eye[0], eye[1]);
     let ez = eye[2].max(PX_NEAR_MM + 1.0); // eye→screen distance, must exceed near
-    let n = PX_NEAR_MM;
+    let (n, f) = (PX_NEAR_MM, PX_FAR_MM);
     let s = n / ez;
-    let l = (-hw - ex) * s;
-    let r = (hw - ex) * s;
-    let b = (-hh - ey) * s;
-    let t = (hh - ey) * s;
-    let p = mat4_frustum(l, r, b, t, n, PX_FAR_MM);
-    mat4_mul(p, mat4_translate(-ex, -ey, -ez))
-}
+    let (l, r, b, t) = ((-hw - ex) * s, (hw - ex) * s, (-hh - ey) * s, (hh - ey) * s);
 
-/// `glFrustum`, column-major (ready for `glUniformMatrix4fv` transpose=false).
-fn mat4_frustum(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> [f32; 16] {
-    let rl = r - l;
-    let tb = t - b;
-    let fne = f - n;
-    [
-        2.0 * n / rl,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        2.0 * n / tb,
-        0.0,
-        0.0,
-        (r + l) / rl,
-        (t + b) / tb,
-        -(f + n) / fne,
-        -1.0,
-        0.0,
-        0.0,
-        -2.0 * f * n / fne,
-        0.0,
-    ]
-}
-
-fn mat4_translate(x: f32, y: f32, z: f32) -> [f32; 16] {
-    [
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0,
-    ]
-}
-
-/// Column-major 4×4 multiply: `a * b`.
-fn mat4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
-    let mut o = [0.0f32; 16];
-    for c in 0..4 {
-        for r in 0..4 {
-            let mut s = 0.0;
-            for k in 0..4 {
-                s += a[k * 4 + r] * b[c * 4 + k];
-            }
-            o[c * 4 + r] = s;
-        }
-    }
-    o
+    // Asymmetric `glFrustum`, then the eye translation (eye → origin).
+    #[rustfmt::skip]
+    let frustum = Matrix4::new(
+        2.0 * n / (r - l), 0.0,               (r + l) / (r - l),  0.0,
+        0.0,               2.0 * n / (t - b), (t + b) / (t - b),  0.0,
+        0.0,               0.0,              -(f + n) / (f - n), -2.0 * f * n / (f - n),
+        0.0,               0.0,              -1.0,                0.0,
+    );
+    #[rustfmt::skip]
+    let translate = Matrix4::new(
+        1.0, 0.0, 0.0, -ex,
+        0.0, 1.0, 0.0, -ey,
+        0.0, 0.0, 1.0, -ez,
+        0.0, 0.0, 0.0,  1.0,
+    );
+    frustum * translate
 }
 
 /// Owns the GL window + egui integration and drives the `App` model
@@ -742,7 +793,7 @@ impl DemoShell {
             // SAFETY: same.
             // The eye was computed during the previous frame's UI pass (the
             // FBO renders before run_ui) — a 1-frame lag, imperceptible here.
-            unsafe { scene.render(gl, self.app.parallax_eye) };
+            unsafe { scene.render(gl, self.app.parallax_eye, self.app.parallax_aspect) };
             self.app.parallax_tex = Some(scene.texture_id(painter));
         } else {
             self.app.parallax_tex = None;
@@ -762,10 +813,16 @@ impl DemoShell {
         let app = &mut self.app;
         let full_output = ctx.run_ui(raw_input, |ui| app.ui(ui));
 
+        // Rotate the cursor icon to match the display: egui-rotate handles
+        // pointer *positions* via transform_raw_input, but directional icons
+        // (resize arrows, text caret) must be remapped here so they point the
+        // right way on the physically-rotated screen.
+        let mut platform_output = full_output.platform_output.clone();
+        platform_output.cursor_icon = platform_output.cursor_icon.rotate(rotation);
         self.egui_winit
             .as_mut()
             .unwrap()
-            .handle_platform_output(window, full_output.platform_output.clone());
+            .handle_platform_output(window, platform_output);
 
         // 3. Tessellate, then rotate primitives back to physical space.
         let logical_size = ctx.content_rect().size();
@@ -1578,6 +1635,10 @@ struct App {
     parallax_panel_rect: Option<Rect>,
     /// Eye Z for Mouse mode, nudged by the scroll wheel.
     parallax_mouse_z: f32,
+    /// Parallax panel aspect (width/height), set in [`App::draw_parallax_view`]
+    /// and read by [`DemoShell::redraw`] to size the FBO + projection so the
+    /// scene fills the panel without distortion. 1-frame lag, imperceptible.
+    parallax_aspect: f32,
 }
 
 /// Where the parallax scene's eye position comes from. Three sources so the
@@ -2225,6 +2286,7 @@ impl App {
             parallax_invert: [false, true, false],
             parallax_panel_rect: None,
             parallax_mouse_z: PX_DVIEW_MM,
+            parallax_aspect: 16.0 / 9.0,
         }
     }
 
@@ -3023,6 +3085,7 @@ impl App {
     /// [`Self::parallax_eye`]; here we just present it and record the panel
     /// rect so Mouse mode can map the pointer.
     fn draw_parallax_view(&mut self, ui: &mut egui::Ui) {
+        // Row 1: mode selector + current eye readout.
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("parallax")
@@ -3047,28 +3110,30 @@ impl App {
                     .size(12.0)
                     .color(LOCKBAR_COLOR),
             );
-            // Bench knobs for the Live mapping (find the signs/gain, then bake
-            // them into camera/mapping.rs — not product calibration).
-            if self.parallax_eye_mode == ParallaxEye::Live {
-                ui.separator();
+        });
+        // Row 2 (Live only): the bench knobs — gain on the same line as the
+        // per-axis sign flips. Find the right signs/gain here, then bake them
+        // into camera/mapping.rs (not a product calibration step).
+        if self.parallax_eye_mode == ParallaxEye::Live {
+            ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut self.parallax_gain, 0.5..=6.0).text("gain"));
+                ui.separator();
                 ui.toggle_value(&mut self.parallax_invert[0], "±X");
                 ui.toggle_value(&mut self.parallax_invert[1], "±Y");
                 ui.toggle_value(&mut self.parallax_invert[2], "±Z");
-            }
-        });
+            });
+        }
 
-        let avail = ui.available_size();
-        let aspect = ParallaxScene::W as f32 / ParallaxScene::H as f32;
-        let (w, h) = if avail.x / avail.y > aspect {
-            (avail.y * aspect, avail.y)
-        } else {
-            (avail.x, avail.x / aspect)
-        };
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+        // Fill the whole panel (no 4:3 letterbox) so the scene reaches the
+        // edges; the FBO + projection adopt this aspect → no distortion.
+        let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
         // Record the rect (egui logical space, already rotated by egui-rotate)
-        // for Mouse mode's pointer mapping next frame.
+        // for Mouse mode's pointer mapping next frame, plus its aspect for the
+        // FBO/projection (read by redraw).
         self.parallax_panel_rect = Some(rect);
+        if rect.height() > 1.0 {
+            self.parallax_aspect = (rect.width() / rect.height()).clamp(0.4, 4.0);
+        }
         if let Some(tex) = self.parallax_tex {
             // GL textures are bottom-left origin; flip V so the scene shows
             // upright.
