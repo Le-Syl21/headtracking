@@ -43,11 +43,17 @@ const DEPTH_MAX_MM: f32 = 2_500.0;
 const LOG_BUFFER_LINES: usize = 1_000;
 
 // Overlay colours, kept here so the toolbar status text and the canvas
-// drawing stay in sync. Face → soft red; lockbar → bright cyan
-// (high contrast against red, visible on both bright playfield reflections
-// and dark cabinet interiors).
+// drawing stay in sync. Face → soft red; the U segmentation mask → a
+// translucent cyan fill, with the lockbar quad derived from its closed
+// edge drawn in solid cyan (high contrast against red, visible on both
+// bright playfield reflections and dark cabinet interiors).
 const FACE_COLOR: Color32 = Color32::from_rgb(0xff, 0x60, 0x60);
 const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
+/// Straight-alpha RGBA for the U mask overlay fill (cyan, ~43 % opacity).
+const U_MASK_RGBA: [u8; 4] = [0x00, 0xe5, 0xff, 110];
+/// Probability cut for "this pixel is inside the U" — matches the
+/// detector's default mask threshold.
+const U_MASK_THR: f32 = 0.5;
 
 fn main() {
     let logs: Arc<Mutex<VecDeque<String>>> =
@@ -221,6 +227,170 @@ impl GlutinWindowContext {
     }
 }
 
+/// Offscreen render target for the parallax validation window. Owns an
+/// FBO with a colour texture (registered with egui's painter, so it
+/// shows as a plain image and egui-rotate rotates it for free) plus a
+/// depth renderbuffer ready for the 3D scene. M0 only clears it to a
+/// recognisable colour — the shadow box + target grid land in M1.
+/// See `docs/parallax-validation-window.md`.
+struct ParallaxScene {
+    fbo: glow::Framebuffer,
+    color: glow::Texture,
+    depth: glow::Renderbuffer,
+    size: (i32, i32),
+    /// egui handle to `color`, registered once. Stays valid across
+    /// [`Self::resize`] because that reallocates storage on the *same*
+    /// texture name rather than creating a new one.
+    tex_id: Option<egui::TextureId>,
+}
+
+impl ParallaxScene {
+    /// Fixed offscreen resolution. 4:3 matches the typical camera feed so
+    /// the side-by-side columns look balanced; egui scales the texture
+    /// into whatever space the panel gives it. M2+ may make this adaptive.
+    const W: i32 = 640;
+    const H: i32 = 480;
+
+    /// # Safety
+    /// All glow calls run on the GL/UI thread with the context current.
+    unsafe fn new(gl: &glow::Context) -> Self {
+        use glow::HasContext as _;
+        // SAFETY: caller guarantees the GL context is current.
+        unsafe {
+            let fbo = gl.create_framebuffer().expect("create parallax FBO");
+            let color = gl.create_texture().expect("create parallax colour texture");
+            let depth = gl
+                .create_renderbuffer()
+                .expect("create parallax depth buffer");
+            let mut scene = Self {
+                fbo,
+                color,
+                depth,
+                size: (0, 0),
+                tex_id: None,
+            };
+            scene.resize(gl, Self::W, Self::H);
+            scene
+        }
+    }
+
+    /// (Re)allocate the colour texture + depth buffer at `w`×`h` and
+    /// reattach them to the FBO. No-op when the size is unchanged.
+    ///
+    /// # Safety
+    /// GL thread, context current.
+    unsafe fn resize(&mut self, gl: &glow::Context, w: i32, h: i32) {
+        use glow::HasContext as _;
+        if self.size == (w, h) {
+            return;
+        }
+        // SAFETY: caller guarantees the GL context is current; all the
+        // object names were created by `new` on this same context.
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.color));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                w,
+                h,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(self.depth));
+            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::DEPTH_COMPONENT24, w, h);
+
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.color),
+                0,
+            );
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::DEPTH_ATTACHMENT,
+                glow::RENDERBUFFER,
+                Some(self.depth),
+            );
+            debug_assert_eq!(
+                gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                glow::FRAMEBUFFER_COMPLETE,
+                "parallax FBO incomplete",
+            );
+
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+        }
+        self.size = (w, h);
+    }
+
+    /// Render one frame into the FBO, then restore the default framebuffer
+    /// so the egui paint that follows is unaffected. M0: clear only.
+    ///
+    /// # Safety
+    /// GL thread, context current.
+    unsafe fn render(&mut self, gl: &glow::Context) {
+        use glow::HasContext as _;
+        // SAFETY: caller guarantees the GL context is current.
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+            gl.viewport(0, 0, self.size.0, self.size.1);
+            gl.enable(glow::DEPTH_TEST);
+            gl.clear_color(0.04, 0.07, 0.10, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            // M1+: draw the shadow box + target grid with the off-axis MVP here.
+            gl.disable(glow::DEPTH_TEST);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+    }
+
+    /// Register the colour texture with egui's painter (once) and return
+    /// its stable `TextureId`.
+    fn texture_id(&mut self, painter: &mut egui_glow::Painter) -> egui::TextureId {
+        *self
+            .tex_id
+            .get_or_insert_with(|| painter.register_native_texture(self.color))
+    }
+
+    /// # Safety
+    /// GL thread, context current.
+    unsafe fn destroy(&mut self, gl: &glow::Context) {
+        use glow::HasContext as _;
+        // SAFETY: caller guarantees the GL context is current.
+        unsafe {
+            gl.delete_framebuffer(self.fbo);
+            gl.delete_texture(self.color);
+            gl.delete_renderbuffer(self.depth);
+        }
+    }
+}
+
 /// Owns the GL window + egui integration and drives the `App` model
 /// each frame, wrapping its UI in egui-rotate's input/output transforms.
 struct DemoShell {
@@ -230,6 +400,8 @@ struct DemoShell {
     egui_ctx: egui::Context,
     egui_winit: Option<egui_winit::State>,
     painter: Option<egui_glow::Painter>,
+    /// Lazily created the first frame the parallax window is enabled.
+    parallax: Option<ParallaxScene>,
 }
 
 impl DemoShell {
@@ -241,6 +413,7 @@ impl DemoShell {
             egui_ctx: egui::Context::default(),
             egui_winit: None,
             painter: None,
+            parallax: None,
         }
     }
 
@@ -250,6 +423,23 @@ impl DemoShell {
         let physical_size =
             egui::Vec2::new(physical_dimensions[0] as f32, physical_dimensions[1] as f32);
         let rotation = self.app.rotation;
+
+        // 0. Parallax window: render the offscreen scene into its FBO
+        //    *before* the UI runs, so `App::ui` can show this frame's
+        //    texture. egui-rotate then rotates that image like any other.
+        if self.app.parallax_enabled {
+            let gl = self.gl.as_ref().unwrap();
+            let painter = self.painter.as_mut().unwrap();
+            let scene = self
+                .parallax
+                // SAFETY: GL context current on this (UI) thread.
+                .get_or_insert_with(|| unsafe { ParallaxScene::new(gl) });
+            // SAFETY: same.
+            unsafe { scene.render(gl) };
+            self.app.parallax_tex = Some(scene.texture_id(painter));
+        } else {
+            self.app.parallax_tex = None;
+        }
 
         // 1. Gather raw winit input, then rotate it into logical space.
         let mut raw_input = self.egui_winit.as_mut().unwrap().take_egui_input(window);
@@ -364,6 +554,10 @@ impl winit::application::ApplicationHandler for DemoShell {
     }
 
     fn exiting(&mut self, _: &winit::event_loop::ActiveEventLoop) {
+        if let (Some(scene), Some(gl)) = (self.parallax.as_mut(), self.gl.as_ref()) {
+            // SAFETY: GL context current on the UI thread at shutdown.
+            unsafe { scene.destroy(gl) };
+        }
         if let Some(painter) = &mut self.painter {
             painter.destroy();
         }
@@ -481,6 +675,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             rgb,
             &active.last_faces,
             active.last_lockbar.as_ref(),
+            active.last_u.as_ref(),
         )?;
         p
     } else {
@@ -492,6 +687,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             rgb,
             &active.last_faces,
             active.last_lockbar.as_ref(),
+            active.last_u.as_ref(),
         )?
     };
 
@@ -515,13 +711,14 @@ fn poll_active_headless(active: &mut Active) {
                 if let Some(detector) = active.face_detector.as_ref() {
                     active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
                 }
-                update_lockbar(
-                    &mut active.lockbar_detector,
-                    &mut active.lockbar_last_run_at,
-                    &mut active.lockbar_first_detection_at,
-                    &mut active.lockbar_locked,
-                    &mut active.lockbar_best_conf,
+                update_u(
+                    &mut active.u_detector,
+                    &mut active.u_last_run_at,
+                    &mut active.u_first_detection_at,
+                    &mut active.u_locked,
+                    &mut active.u_best_conf,
                     &mut active.last_lockbar,
+                    &mut active.last_u,
                     &rgb888,
                     rgb.width,
                     rgb.height,
@@ -534,13 +731,14 @@ fn poll_active_headless(active: &mut Active) {
                 if let Some(detector) = active.face_detector.as_ref() {
                     active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
                 }
-                update_lockbar(
-                    &mut active.lockbar_detector,
-                    &mut active.lockbar_last_run_at,
-                    &mut active.lockbar_first_detection_at,
-                    &mut active.lockbar_locked,
-                    &mut active.lockbar_best_conf,
+                update_u(
+                    &mut active.u_detector,
+                    &mut active.u_last_run_at,
+                    &mut active.u_first_detection_at,
+                    &mut active.u_locked,
+                    &mut active.u_best_conf,
                     &mut active.last_lockbar,
+                    &mut active.last_u,
                     &rgb.data,
                     rgb.width,
                     rgb.height,
@@ -553,13 +751,14 @@ fn poll_active_headless(active: &mut Active) {
                 if let Some(detector) = active.face_detector.as_mut() {
                     active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
                 }
-                update_lockbar(
-                    &mut active.lockbar_detector,
-                    &mut active.lockbar_last_run_at,
-                    &mut active.lockbar_first_detection_at,
-                    &mut active.lockbar_locked,
-                    &mut active.lockbar_best_conf,
+                update_u(
+                    &mut active.u_detector,
+                    &mut active.u_last_run_at,
+                    &mut active.u_first_detection_at,
+                    &mut active.u_locked,
+                    &mut active.u_best_conf,
                     &mut active.last_lockbar,
+                    &mut active.last_u,
                     &rgb.data,
                     rgb.width,
                     rgb.height,
@@ -1041,9 +1240,20 @@ struct App {
     /// `Ok` carries the full saved path, `Err` carries the failure reason.
     screenshot_status: Option<Result<std::path::PathBuf, String>>,
     /// Viewport rotation for a physically-mounted (rotated) pincab display.
-    /// Defaults to 270°; the ⟳ button in the toolbar cycles 90° per click.
-    /// Read by [`DemoShell::redraw`] to drive egui-rotate's transforms.
+    /// Defaults to the player-facing "270°", which once applied is
+    /// egui-rotate's `CW90`: the rotated screen inverts the apparent
+    /// handedness, so our toolbar degrees run opposite to the egui enum
+    /// (see [`rotation_label`]). The ⟳ button cycles +90° clockwise from
+    /// the player's seat. Read by [`DemoShell::redraw`].
     rotation: Rotation,
+    /// Parallax validation window toggle (🪟 button). When on, the central
+    /// panel shows the camera feed and the off-axis 3D scene side by side
+    /// (see `docs/parallax-validation-window.md`). M0: clear colour only.
+    parallax_enabled: bool,
+    /// egui handle to the parallax scene's offscreen colour texture, set
+    /// by [`DemoShell::redraw`] each frame the window is on (the FBO lives
+    /// with the GL context in `DemoShell`, not here). `None` when off.
+    parallax_tex: Option<egui::TextureId>,
 }
 
 impl App {
@@ -1075,34 +1285,34 @@ struct Active {
     v1_controls: Option<V1Controls>,
     pose_filter: filter_alias::OneEuroPose3D,
     started_at: Instant,
-    /// Latest RGB-based lockbar detection — refreshed by
-    /// [`update_lockbar`] on a throttled cadence (see
-    /// [`LOCKBAR_RECOMPUTE_INTERVAL`]) so the 300 ms tract inference
-    /// doesn't pace the UI thread on every frame.
+    /// Lockbar quad consumed by the overlay + 3D-centre maths. No longer
+    /// detected directly: it's *derived* from the closed edge of the U
+    /// segmentation (see [`u_to_lockbar_quad`]) — the closed bar of the U
+    /// is the lockbar, of known physical width.
     last_lockbar: Option<headtracking::calibration::LockbarQuadRgb>,
-    /// YOLOv11n-OBB detector backing [`last_lockbar`]. Lazy-init: stays
-    /// `None` until the first successful `LockbarDetector::new()`. If
-    /// init fails (corrupt model file etc.) we leave it `None` and log
-    /// — the demo still runs minus the lockbar overlay.
-    lockbar_detector: Option<lockbar_onnx::LockbarDetector>,
-    /// `Some(Instant)` when [`update_lockbar`] last ran. Used to skip
-    /// the inference call when the cache is still fresh during the
-    /// warmup window.
-    lockbar_last_run_at: Option<Instant>,
-    /// `Some(Instant)` of the first frame where the detector returned
-    /// a quad. The warmup window (during which we keep refining the
-    /// detection) is timed from this instant; on its expiry the
-    /// best-conf detection seen so far gets frozen.
-    lockbar_first_detection_at: Option<Instant>,
-    /// `true` once the warmup window completed and `last_lockbar` was
-    /// frozen to the highest-confidence detection seen during warmup.
-    /// While locked, [`update_lockbar`] is a no-op — no more
-    /// inference, CPU goes to the head-tracking thread.
-    lockbar_locked: bool,
-    /// Highest YOLO confidence observed since the backend opened.
-    /// During warmup, a new detection overwrites [`last_lockbar`]
-    /// only when its confidence beats this — best-of-N averaging.
-    lockbar_best_conf: f32,
+    /// Latest raw U-seg detection (mask + box) — backs the translucent
+    /// mask overlay and the derived [`last_lockbar`]. Refreshed by
+    /// [`update_u`] on a throttled cadence (see [`U_RECOMPUTE_INTERVAL`]).
+    last_u: Option<u_onnx::UDetection>,
+    /// YOLOv11n-seg "U" detector. Lazy-init: stays `None` until the first
+    /// successful `UDetector::new()`. If init fails (corrupt model etc.)
+    /// we leave it `None` and log — the demo still runs minus the overlay.
+    u_detector: Option<u_onnx::UDetector>,
+    /// `Some(Instant)` when [`update_u`] last ran — throttles inference.
+    u_last_run_at: Option<Instant>,
+    /// `Some(Instant)` of the first successful U detection. The warmup
+    /// window is timed from here; on expiry the best one gets frozen.
+    u_first_detection_at: Option<Instant>,
+    /// `true` once warmup completed and the U was frozen to its
+    /// highest-confidence detection. While locked, [`update_u`] is a
+    /// no-op — CPU goes to the head-tracking thread.
+    u_locked: bool,
+    /// Highest U-seg confidence seen since the backend opened. A new
+    /// detection overwrites the frozen one only when it beats this.
+    u_best_conf: f32,
+    /// egui texture holding the translucent U mask overlay (160×160 proto
+    /// grid), rebuilt by [`refresh_u_overlay`] each frame a U exists.
+    u_mask_texture: Option<TextureHandle>,
     /// `Some` when face detection is enabled (currently auto-enabled for
     /// the webcam backend). Cheap to keep around — YuNet runs in <10 ms
     /// at 320×320 on CPU.
@@ -1114,53 +1324,52 @@ struct Active {
     last_rgb_frame: Option<(u32, u32, Vec<u8>)>,
 }
 
-/// How long a lockbar detection stays valid before [`update_lockbar`]
-/// re-runs inference. The lockbar doesn't move while the camera is
-/// mounted, so refreshing every ~1.5 s gives the overlay a live feel
-/// without paying the ~300 ms tract cost on every frame.
-const LOCKBAR_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(1500);
+/// How long a U detection stays valid before [`update_u`] re-runs
+/// inference. The playfield doesn't move while the camera is mounted, so
+/// refreshing every ~1.5 s gives the overlay a live feel without paying
+/// the ~300 ms tract cost on every frame.
+const U_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(1500);
 
-/// Window between the first successful lockbar detection and freezing
-/// the best one — at ~1.5 s cadence we collect 3-4 candidate quads
-/// and keep the highest-confidence one. After this elapses,
-/// [`update_lockbar`] stops running until a backend switch reopens
-/// `Active`.
-const LOCKBAR_WARMUP_DURATION: Duration = Duration::from_secs(5);
+/// Window between the first successful U detection and freezing the best
+/// one — at ~1.5 s cadence we collect 3-4 candidate masks and keep the
+/// highest-confidence one. After this elapses, [`update_u`] stops running
+/// until a backend switch reopens `Active`.
+const U_WARMUP_DURATION: Duration = Duration::from_secs(5);
 
-/// Run the YOLOv11n-OBB lockbar detector on the latest RGB frame and
-/// update `last_lockbar` using a best-of-warmup auto-lock strategy:
+/// Run the YOLOv11n-seg "U" detector on the latest RGB frame and update
+/// the raw `last_u` mask plus the `last_lockbar` quad derived from it,
+/// using a best-of-warmup auto-lock strategy:
 ///
 ///  1. Skip entirely when `*locked` is true (calibration frozen).
-///  2. Otherwise throttle to [`LOCKBAR_RECOMPUTE_INTERVAL`] so the
-///     ~300 ms tract inference doesn't pace the UI thread.
-///  3. Run inference. If a detection comes back, update
-///     `*last_lockbar` only if its confidence beats `*best_conf` —
-///     this keeps the best quad seen so far.
+///  2. Otherwise throttle to [`U_RECOMPUTE_INTERVAL`] so the ~300 ms
+///     tract inference doesn't pace the UI thread.
+///  3. Run inference. If the best U beats `*best_conf`, store it in
+///     `*last_u` and re-derive `*last_lockbar` from its closed edge
+///     (see [`u_to_lockbar_quad`]) — keeps the cleanest U seen so far.
 ///  4. The warmup clock starts at the *first* successful detection
-///     (`*first_detection_at`). When [`LOCKBAR_WARMUP_DURATION`]
-///     elapses past that instant, flip `*locked = true` so the
-///     detector goes silent.
+///     (`*first_detection_at`). When [`U_WARMUP_DURATION`] elapses past
+///     that instant, flip `*locked = true` so the detector goes silent.
 ///
-/// The lockbar doesn't physically move once the camera is mounted,
-/// so this gives us 3-4 inference rounds to pick the cleanest quad,
-/// then frees the CPU for head tracking. No user button — pure auto.
+/// The playfield doesn't move once the camera is mounted, so this gives
+/// us 3-4 inference rounds to pick the cleanest U, then frees the CPU for
+/// head tracking. No user button — pure auto.
 ///
 /// Takes the relevant `Active` fields by `&mut` (rather than
-/// `&mut Active`) so the call site can keep `&mut active.inner`
-/// alive simultaneously — the borrow checker can split disjoint
-/// fields, but not from inside a `match &mut active.inner` arm.
-/// Eight `&mut` params triggers clippy's `too_many_arguments`;
-/// wrapping them in a struct would force every `active.last_lockbar`
-/// read site (12 of them in the overlay code) to indirect, which is
-/// more churn than the lint avoids — narrow `#[allow]` instead.
+/// `&mut Active`) so the call site can keep `&mut active.inner` alive
+/// simultaneously — the borrow checker can split disjoint fields, but not
+/// from inside a `match &mut active.inner` arm. The param count trips
+/// clippy's `too_many_arguments`; wrapping them in a struct would force
+/// every read site to indirect, more churn than the lint avoids — narrow
+/// `#[allow]` instead.
 #[allow(clippy::too_many_arguments)]
-fn update_lockbar(
-    detector: &mut Option<lockbar_onnx::LockbarDetector>,
+fn update_u(
+    detector: &mut Option<u_onnx::UDetector>,
     last_run_at: &mut Option<Instant>,
     first_detection_at: &mut Option<Instant>,
     locked: &mut bool,
     best_conf: &mut f32,
     last_lockbar: &mut Option<headtracking::calibration::LockbarQuadRgb>,
+    last_u: &mut Option<u_onnx::UDetection>,
     rgb888: &[u8],
     w: u32,
     h: u32,
@@ -1170,18 +1379,18 @@ fn update_lockbar(
     }
     let now = Instant::now();
     if let Some(last) = *last_run_at
-        && now.duration_since(last) < LOCKBAR_RECOMPUTE_INTERVAL
+        && now.duration_since(last) < U_RECOMPUTE_INTERVAL
     {
         return;
     }
     if detector.is_none() {
-        match lockbar_onnx::LockbarDetector::new() {
+        match u_onnx::UDetector::new() {
             Ok(d) => {
-                info!("lockbar YOLO detector initialised");
+                info!("U-seg detector initialised");
                 *detector = Some(d);
             }
             Err(e) => {
-                warn!(?e, "lockbar YOLO detector init failed");
+                warn!(?e, "U-seg detector init failed");
                 *last_run_at = Some(now);
                 return;
             }
@@ -1189,11 +1398,18 @@ fn update_lockbar(
     }
     let det = detector.as_ref().expect("init checked above");
     *last_run_at = Some(now);
-    if let Some(o) = det.detect(rgb888, w, h) {
-        if o.confidence > *best_conf {
-            *best_conf = o.confidence;
-            *last_lockbar = Some(obb_to_lockbar_quad(&o, w, h));
-            info!(conf = o.confidence, "lockbar: new best detection");
+    // `detect` returns survivors highest-confidence first; on a single
+    // cabinet there's at most one, so take the best.
+    if let Some(best) = det.detect(rgb888, w, h).into_iter().next() {
+        if best.confidence > *best_conf {
+            *best_conf = best.confidence;
+            // Derive the lockbar (closed edge of the U) for the existing
+            // 3D-centre maths; keep the old quad if extraction degenerates.
+            if let Some(quad) = u_to_lockbar_quad(&best, det.mask_threshold(), w, h) {
+                *last_lockbar = Some(quad);
+            }
+            *last_u = Some(best);
+            info!(conf = *best_conf, "U: new best detection");
         }
         if first_detection_at.is_none() {
             *first_detection_at = Some(now);
@@ -1201,46 +1417,151 @@ fn update_lockbar(
     }
     // Warmup expired? Freeze the current best.
     if let Some(first) = *first_detection_at
-        && now.duration_since(first) >= LOCKBAR_WARMUP_DURATION
+        && now.duration_since(first) >= U_WARMUP_DURATION
     {
         *locked = true;
-        info!(
-            best_conf = *best_conf,
-            "lockbar: warmup over, calibration locked"
-        );
+        info!(best_conf = *best_conf, "U: warmup over, calibration locked");
     }
 }
 
-/// Bridge [`lockbar_onnx::LockbarObb`] (f32 corners, confidence as
-/// float) into the legacy [`LockbarQuadRgb`] shape consumed by the
-/// existing overlay rendering. Confidence is exposed via the
-/// `n_inliers_*` fields scaled ×100 so the UI's "lockbar conf" hint
-/// stays meaningful (1.00 → 100, 0.20 → 20).
-fn obb_to_lockbar_quad(
-    obb: &lockbar_onnx::LockbarObb,
+/// Derive the lockbar quad — the *closed* bar of the U, of known physical
+/// width — from a U-seg detection. We don't assume it sits at a fixed
+/// image edge: with the camera mounted above the backglass the U reads as
+/// an inverted ∩, closed end near the top. So we scan the proto mask row
+/// by row; the closed bar is the band of rows that are *filled across*,
+/// sitting at one vertical extremity, while the open rails are the rows
+/// where only two thin runs survive (low fill). We pick that band and box
+/// its top + bottom edges into a (perspective) trapezoid, mapped back to
+/// original-image pixels. Returns `None` when the mask is empty or the
+/// derived bar collapses to a sliver.
+fn u_to_lockbar_quad(
+    det: &u_onnx::UDetection,
+    thr: f32,
     w: u32,
     h: u32,
-) -> headtracking::calibration::LockbarQuadRgb {
-    let clamp_xy = |(x, y): (f32, f32)| -> (u32, u32) {
-        let x = x.round().clamp(0.0, (w.saturating_sub(1)) as f32) as u32;
-        let y = y.round().clamp(0.0, (h.saturating_sub(1)) as f32) as u32;
-        (x, y)
+) -> Option<headtracking::calibration::LockbarQuadRgb> {
+    let n = u_onnx::PROTO_SIDE;
+    let mask = &det.proto_mask;
+    // Per proto row: leftmost / rightmost "on" column + filled-cell count.
+    let mut row_left = vec![0usize; n];
+    let mut row_right = vec![0usize; n];
+    let mut row_count = vec![0u32; n];
+    let (mut py_min, mut py_max) = (usize::MAX, 0usize);
+    for py in 0..n {
+        let base = py * n;
+        let (mut l, mut r, mut cnt) = (usize::MAX, 0usize, 0u32);
+        for px in 0..n {
+            if mask[base + px] >= thr {
+                if px < l {
+                    l = px;
+                }
+                r = px;
+                cnt += 1;
+            }
+        }
+        row_count[py] = cnt;
+        if cnt > 0 {
+            row_left[py] = l;
+            row_right[py] = r;
+            py_min = py_min.min(py);
+            py_max = py;
+        }
+    }
+    if py_min > py_max {
+        return None; // empty mask
+    }
+    let cmax = row_count.iter().copied().max().unwrap_or(0);
+    if cmax == 0 {
+        return None;
+    }
+    // "Filled across" cut — separates the closed bar (≈full width) from
+    // the two-rail region (two thin runs with a gap).
+    let fill_t = (cmax as f32 * 0.6).ceil() as u32;
+    let is_bar = |py: usize| row_count[py] >= fill_t;
+    // How many contiguous filled rows hang off the top extremity…
+    let mut top_end = py_min;
+    while top_end <= py_max && is_bar(top_end) {
+        top_end += 1;
+    }
+    let top_rows = top_end - py_min; // band = [py_min, top_end)
+    // …and off the bottom extremity.
+    let mut bot_start = py_max + 1;
+    while bot_start > py_min && is_bar(bot_start - 1) {
+        bot_start -= 1;
+    }
+    let bot_rows = (py_max + 1) - bot_start; // band = [bot_start, py_max]
+    // The lockbar is the thicker filled band; a clean U fills only one end.
+    let (bar_y0, bar_y1) = if top_rows >= bot_rows && top_rows > 0 {
+        (py_min, top_end - 1)
+    } else if bot_rows > 0 {
+        (bot_start, py_max)
+    } else {
+        // No filled band at all (degenerate) — fall back to the single
+        // widest row so we still emit a usable quad.
+        let py = (0..n).max_by_key(|&py| row_count[py]).unwrap_or(py_min);
+        (py, py)
     };
-    let n = (obb.confidence * 100.0).clamp(0.0, 1_000.0) as u32;
-    headtracking::calibration::LockbarQuadRgb {
+    let edge = |py: usize| -> Option<(usize, usize)> {
+        (row_count[py] > 0).then_some((row_left[py], row_right[py]))
+    };
+    let (tl_px, tr_px) = edge(bar_y0)?;
+    let (bl_px, br_px) = edge(bar_y1)?;
+    let clamp = |(x, y): (f32, f32)| -> (u32, u32) {
+        (
+            x.round().clamp(0.0, (w.saturating_sub(1)) as f32) as u32,
+            y.round().clamp(0.0, (h.saturating_sub(1)) as f32) as u32,
+        )
+    };
+    let tl = clamp(det.proto_to_image(tl_px, bar_y0));
+    let tr = clamp(det.proto_to_image(tr_px, bar_y0));
+    let br = clamp(det.proto_to_image(br_px, bar_y1));
+    let bl = clamp(det.proto_to_image(bl_px, bar_y1));
+    let mean_w = (tr.0.saturating_sub(tl.0) + br.0.saturating_sub(bl.0)) / 2;
+    if mean_w < 4 {
+        return None;
+    }
+    let slope_deg = (tr.1 as f32 - tl.1 as f32)
+        .atan2(tr.0 as f32 - tl.0 as f32)
+        .to_degrees();
+    let thickness_px = (((bl.1 + br.1) as f32 - (tl.1 + tr.1) as f32) * 0.5).abs() as u32;
+    let n_inliers = (det.confidence * 100.0).clamp(0.0, 1_000.0) as u32;
+    Some(headtracking::calibration::LockbarQuadRgb {
         frame_width: w,
         frame_height: h,
-        corners: [
-            clamp_xy(obb.corners[0]),
-            clamp_xy(obb.corners[1]),
-            clamp_xy(obb.corners[2]),
-            clamp_xy(obb.corners[3]),
-        ],
-        slope_deg: obb.slope_deg,
-        thickness_px: obb.thickness_px.round().max(0.0) as u32,
-        n_inliers_top: n,
-        n_inliers_bottom: n,
+        corners: [tl, tr, br, bl],
+        slope_deg,
+        thickness_px,
+        n_inliers_top: n_inliers,
+        n_inliers_bottom: n_inliers,
+    })
+}
+
+/// Build the translucent U mask overlay as a 160×160 RGBA image on the
+/// proto grid (model space). Painted over the camera feed through
+/// [`u_mask_uv`], which skips the letterbox padding so the tint lands on
+/// the playfield. Cyan straight-alpha where the mask probability clears
+/// `thr`, fully transparent elsewhere.
+fn build_u_overlay(det: &u_onnx::UDetection, thr: f32) -> ColorImage {
+    let n = u_onnx::PROTO_SIDE;
+    let mut rgba = vec![0u8; n * n * 4];
+    for (cell, px) in det.proto_mask.iter().enumerate() {
+        if *px >= thr {
+            let i = cell * 4;
+            rgba[i..i + 4].copy_from_slice(&U_MASK_RGBA);
+        }
     }
+    ColorImage::from_rgba_unmultiplied([n, n], &rgba)
+}
+
+/// Rebuild + upload the U mask overlay texture for the current detection.
+/// Cheap (160×160) so we just redo it each frame a U exists rather than
+/// track a dirty flag. Disjoint field borrows let this take `&mut Active`.
+fn refresh_u_overlay(active: &mut Active, ctx: &egui::Context) {
+    let Some(det) = active.last_u.as_ref() else {
+        return;
+    };
+    let img = build_u_overlay(det, U_MASK_THR);
+    upload_texture(ctx, &mut active.u_mask_texture, img);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1542,7 +1863,13 @@ impl App {
             kinect_access_hint,
             kinect_access_result: None,
             screenshot_status: None,
-            rotation: Rotation::CW270,
+            // "270°" in the player's frame = egui-rotate CW90 once applied
+            // (the rotated pincab screen inverts the apparent direction;
+            // see `rotation_label`). This is the orientation that reads
+            // upright on the cab.
+            rotation: Rotation::CW90,
+            parallax_enabled: false,
+            parallax_tex: None,
         }
     }
 
@@ -1618,13 +1945,14 @@ impl App {
                     if let Some(detector) = active.face_detector.as_ref() {
                         active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
                     }
-                    update_lockbar(
-                        &mut active.lockbar_detector,
-                        &mut active.lockbar_last_run_at,
-                        &mut active.lockbar_first_detection_at,
-                        &mut active.lockbar_locked,
-                        &mut active.lockbar_best_conf,
+                    update_u(
+                        &mut active.u_detector,
+                        &mut active.u_last_run_at,
+                        &mut active.u_first_detection_at,
+                        &mut active.u_locked,
+                        &mut active.u_best_conf,
                         &mut active.last_lockbar,
+                        &mut active.last_u,
                         &rgb888,
                         rgb.width,
                         rgb.height,
@@ -1666,13 +1994,14 @@ impl App {
                     if let Some(detector) = active.face_detector.as_ref() {
                         active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
                     }
-                    update_lockbar(
-                        &mut active.lockbar_detector,
-                        &mut active.lockbar_last_run_at,
-                        &mut active.lockbar_first_detection_at,
-                        &mut active.lockbar_locked,
-                        &mut active.lockbar_best_conf,
+                    update_u(
+                        &mut active.u_detector,
+                        &mut active.u_last_run_at,
+                        &mut active.u_first_detection_at,
+                        &mut active.u_locked,
+                        &mut active.u_best_conf,
                         &mut active.last_lockbar,
+                        &mut active.last_u,
                         &rgb.data,
                         rgb.width,
                         rgb.height,
@@ -1728,13 +2057,14 @@ impl App {
                             active.last_head = None;
                         }
                     }
-                    update_lockbar(
-                        &mut active.lockbar_detector,
-                        &mut active.lockbar_last_run_at,
-                        &mut active.lockbar_first_detection_at,
-                        &mut active.lockbar_locked,
-                        &mut active.lockbar_best_conf,
+                    update_u(
+                        &mut active.u_detector,
+                        &mut active.u_last_run_at,
+                        &mut active.u_first_detection_at,
+                        &mut active.u_locked,
+                        &mut active.u_best_conf,
                         &mut active.last_lockbar,
+                        &mut active.last_u,
                         &rgb.data,
                         rgb.width,
                         rgb.height,
@@ -1745,6 +2075,9 @@ impl App {
                 }
             }
         }
+        // Inner borrow released — rebuild the U mask overlay texture for
+        // whatever the poll above stored (one place, not per-arm).
+        refresh_u_overlay(active, egui_ctx);
     }
 }
 
@@ -1949,6 +2282,7 @@ impl App {
                         bytes,
                         &active.last_faces,
                         active.last_lockbar.as_ref(),
+                        active.last_u.as_ref(),
                     ));
                     match &self.screenshot_status {
                         Some(Ok(p)) => info!(path = %p.display(), "screenshot saved"),
@@ -1965,6 +2299,10 @@ impl App {
                 {
                     self.rotation = next_rotation(self.rotation);
                 }
+                // 🪟 Parallax — toggles the off-axis 3D validation view in
+                // the central panel (camera | parallax, side by side).
+                ui.toggle_value(&mut self.parallax_enabled, "🪟 parallax")
+                    .on_hover_text("Show the off-axis 3D validation scene next to the camera feed");
                 // Screenshot result lives on the bar — it's the button's
                 // own feedback. Cleared on the next click / backend change.
                 if let Some(status) = &self.screenshot_status {
@@ -2173,63 +2511,125 @@ impl App {
                 });
             });
 
-        // ----- Center: image with crosshair
+        // ----- Center: camera feed, optionally beside the parallax view
         CentralPanel::default().show_inside(ui, |ui| {
-            let avail = ui.available_size();
-            let aspect = match self.active.as_ref() {
-                Some(active) => match (&active.inner, active.rgb_texture.as_ref()) {
-                    (_, Some(tex)) => {
-                        let s = tex.size_vec2();
-                        if s.y > 0.0 { s.x / s.y } else { 16.0 / 9.0 }
-                    }
-                    (Inner::KinectV2 { .. }, None) => 1920.0 / 1080.0,
-                    (Inner::KinectV1 { .. }, None) => 640.0 / 480.0,
-                    (Inner::Webcam { .. }, None) => 640.0 / 480.0,
-                },
-                None => 16.0 / 9.0,
-            };
-            let (img_w, img_h) = if avail.x / avail.y > aspect {
-                (avail.y * aspect, avail.y)
+            if self.parallax_enabled {
+                ui.columns(2, |cols| {
+                    self.draw_camera_view(&mut cols[0]);
+                    self.draw_parallax_view(&mut cols[1]);
+                });
             } else {
-                (avail.x, avail.x / aspect)
-            };
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(img_w, img_h), Sense::hover());
-
-            if let Some(active) = self.active.as_ref() {
-                if let Some(tex) = &active.rgb_texture {
-                    ui.painter().image(
-                        tex.id(),
-                        rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                    if let Some(bar) = active.last_lockbar {
-                        draw_lockbar(ui.painter(), rect, bar);
-                    }
-                    // Source dimensions for bbox normalisation come from
-                    // the texture itself, NOT from the backend's spec.
-                    // On macOS AVFoundation the camera often delivers
-                    // frames at a size different from what
-                    // `SDL_GetCameraFormat` reported at open time —
-                    // using the spec here mapped boxes to the wrong
-                    // place (or off-screen). The texture was built from
-                    // the same buffer the detector saw, so its size is
-                    // authoritative.
-                    let src_size = tex.size_vec2();
-                    for face in &active.last_faces {
-                        draw_face_bbox(ui.painter(), rect, face, src_size);
-                    }
-                } else {
-                    centered(ui, rect, "waiting for first RGB frame…");
-                }
-            } else {
-                let msg = self
-                    .error
-                    .as_deref()
-                    .unwrap_or("select an input device above to start streaming");
-                centered(ui, rect, msg);
+                self.draw_camera_view(ui);
             }
         });
+    }
+
+    /// Camera feed with the lockbar + face overlays, scaled to fit while
+    /// keeping the source aspect ratio.
+    fn draw_camera_view(&self, ui: &mut egui::Ui) {
+        let avail = ui.available_size();
+        let aspect = match self.active.as_ref() {
+            Some(active) => match (&active.inner, active.rgb_texture.as_ref()) {
+                (_, Some(tex)) => {
+                    let s = tex.size_vec2();
+                    if s.y > 0.0 { s.x / s.y } else { 16.0 / 9.0 }
+                }
+                (Inner::KinectV2 { .. }, None) => 1920.0 / 1080.0,
+                (Inner::KinectV1 { .. }, None) => 640.0 / 480.0,
+                (Inner::Webcam { .. }, None) => 640.0 / 480.0,
+            },
+            None => 16.0 / 9.0,
+        };
+        let (img_w, img_h) = if avail.x / avail.y > aspect {
+            (avail.y * aspect, avail.y)
+        } else {
+            (avail.x, avail.x / aspect)
+        };
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(img_w, img_h), Sense::hover());
+
+        if let Some(active) = self.active.as_ref() {
+            if let Some(tex) = &active.rgb_texture {
+                ui.painter().image(
+                    tex.id(),
+                    rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                // Translucent U segmentation mask on top of the feed. The
+                // proto grid lives in letterboxed model space, so the UV
+                // sub-rect skips the padding to land it on the playfield.
+                if let (Some(det), Some(mask)) =
+                    (active.last_u.as_ref(), active.u_mask_texture.as_ref())
+                {
+                    ui.painter().image(
+                        mask.id(),
+                        rect,
+                        u_mask_uv(det, tex.size_vec2()),
+                        Color32::WHITE,
+                    );
+                }
+                // Lockbar quad derived from the U's closed edge, on top.
+                if let Some(bar) = active.last_lockbar {
+                    draw_lockbar(ui.painter(), rect, bar);
+                }
+                // Source dimensions for bbox normalisation come from
+                // the texture itself, NOT from the backend's spec.
+                // On macOS AVFoundation the camera often delivers
+                // frames at a size different from what
+                // `SDL_GetCameraFormat` reported at open time —
+                // using the spec here mapped boxes to the wrong
+                // place (or off-screen). The texture was built from
+                // the same buffer the detector saw, so its size is
+                // authoritative.
+                let src_size = tex.size_vec2();
+                for face in &active.last_faces {
+                    draw_face_bbox(ui.painter(), rect, face, src_size);
+                }
+            } else {
+                centered(ui, rect, "waiting for first RGB frame…");
+            }
+        } else {
+            let msg = self
+                .error
+                .as_deref()
+                .unwrap_or("select an input device above to start streaming");
+            centered(ui, rect, msg);
+        }
+    }
+
+    /// Right column when the parallax window is on: the offscreen scene as
+    /// a plain egui image (so egui-rotate rotates it for free). The FBO is
+    /// rendered + registered by [`DemoShell::redraw`]; here we just blit
+    /// `parallax_tex`. M0 is a flat clear colour — 3D arrives in M1.
+    fn draw_parallax_view(&self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("parallax (validation)")
+                    .strong()
+                    .color(Color32::GRAY)
+                    .monospace(),
+            );
+        });
+        let avail = ui.available_size();
+        let aspect = ParallaxScene::W as f32 / ParallaxScene::H as f32;
+        let (w, h) = if avail.x / avail.y > aspect {
+            (avail.y * aspect, avail.y)
+        } else {
+            (avail.x, avail.x / aspect)
+        };
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+        if let Some(tex) = self.parallax_tex {
+            // GL textures are bottom-left origin; flip V so the scene shows
+            // upright once M1 starts drawing into it.
+            ui.painter().image(
+                tex,
+                rect,
+                Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0)),
+                Color32::WHITE,
+            );
+        } else {
+            centered(ui, rect, "starting parallax view…");
+        }
     }
 
     /// Row 2 — camera INPUT: raw camera-frame measurements, before any
@@ -2268,13 +2668,22 @@ impl App {
                     .color(Color32::GRAY),
             );
         }
-        // Raw lockbar pixel detection — shown whenever a quad exists,
-        // independent of head presence.
+        // Raw U-seg confidence + the lockbar quad derived from its closed
+        // edge — shown whenever a U exists, independent of head presence.
+        if let Some(u) = &active.last_u {
+            ui.separator();
+            ui.label(
+                RichText::new(format!("U seg {:.0}%", u.confidence * 100.0))
+                    .color(LOCKBAR_COLOR)
+                    .monospace()
+                    .size(12.0),
+            );
+        }
         if let Some(bar) = active.last_lockbar {
             ui.separator();
             ui.label(
                 RichText::new(format!(
-                    "lockbar px: row {}, w {}px, t {}px, slope {:+.1}°",
+                    "lockbar (U base) px: row {}, w {}px, t {}px, slope {:+.1}°",
                     bar.mean_row(),
                     bar.mean_width_px(),
                     bar.thickness_px,
@@ -2307,7 +2716,7 @@ impl App {
         let dx = head.x_mm - lb.x;
         let dy = head.y_mm - lb.y;
         let dz = head.depth_mm - lb.z;
-        let (tag, color) = if active.lockbar_locked {
+        let (tag, color) = if active.u_locked {
             ("locked", Color32::LIGHT_GREEN)
         } else {
             ("warmup", Color32::LIGHT_YELLOW)
@@ -2322,23 +2731,29 @@ impl App {
     }
 }
 
-/// Short label for the current rotation, shown on the ⟳ toolbar button.
+/// Player-facing rotation label shown on the ⟳ toolbar button. Inverted on
+/// purpose w.r.t. egui-rotate's clockwise enum: the physically-rotated pincab
+/// display flips the apparent handedness, so the value the player reads as
+/// "270°" is the one that, once applied, looks upright — egui-rotate's `CW90`.
+/// Keeps the toolbar number matching how the user thinks of their screen.
 fn rotation_label(r: Rotation) -> &'static str {
     match r {
         Rotation::None => "0°",
-        Rotation::CW90 => "90°",
+        Rotation::CW270 => "90°",
         Rotation::CW180 => "180°",
-        Rotation::CW270 => "270°",
+        Rotation::CW90 => "270°",
     }
 }
 
-/// Next rotation in the 0 → 90 → 180 → 270 → 0 cycle.
+/// One ⟳ click = +90° clockwise *from the player's seat*. Because our labels
+/// run opposite to the egui enum (see [`rotation_label`]), a user-clockwise
+/// step walks the enum the other way: 270° → 0° → 90° → 180° → 270°.
 fn next_rotation(r: Rotation) -> Rotation {
     match r {
-        Rotation::None => Rotation::CW90,
-        Rotation::CW90 => Rotation::CW180,
-        Rotation::CW180 => Rotation::CW270,
-        Rotation::CW270 => Rotation::None,
+        Rotation::CW90 => Rotation::None,   // 270° → 0°
+        Rotation::None => Rotation::CW270,  // 0°   → 90°
+        Rotation::CW270 => Rotation::CW180, // 90°  → 180°
+        Rotation::CW180 => Rotation::CW90,  // 180° → 270°
     }
 }
 
@@ -2386,6 +2801,20 @@ fn draw_face_bbox(painter: &egui::Painter, rect: Rect, face: &face::FaceDetectio
         egui::FontId::monospace(11.0),
         FACE_COLOR,
     );
+}
+
+/// UV sub-rect that maps the 640-space proto mask texture onto the
+/// displayed camera image, skipping the letterbox padding so the mask
+/// aligns with the playfield. `src` = the source frame's pixel size (the
+/// camera texture's own size, which is what the detector saw).
+fn u_mask_uv(det: &u_onnx::UDetection, src: Vec2) -> Rect {
+    let lb = det.letterbox;
+    let inv = 1.0 / u_onnx::MODEL_SIDE as f32;
+    let (new_w, new_h) = (src.x * lb.scale, src.y * lb.scale);
+    Rect::from_min_max(
+        Pos2::new(lb.pad_x * inv, lb.pad_y * inv),
+        Pos2::new((lb.pad_x + new_w) * inv, (lb.pad_y + new_h) * inv),
+    )
 }
 
 fn draw_lockbar(
@@ -2470,11 +2899,13 @@ fn open_kinect_v2() -> Result<Active, String> {
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
         last_lockbar: None,
-        lockbar_detector: None,
-        lockbar_last_run_at: None,
-        lockbar_first_detection_at: None,
-        lockbar_locked: false,
-        lockbar_best_conf: 0.0,
+        last_u: None,
+        u_detector: None,
+        u_last_run_at: None,
+        u_first_detection_at: None,
+        u_locked: false,
+        u_best_conf: 0.0,
+        u_mask_texture: None,
         face_detector: detector,
         last_faces: Vec::new(),
         last_rgb_frame: None,
@@ -2537,11 +2968,13 @@ fn open_kinect_v1() -> Result<Active, String> {
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
         last_lockbar: None,
-        lockbar_detector: None,
-        lockbar_last_run_at: None,
-        lockbar_first_detection_at: None,
-        lockbar_locked: false,
-        lockbar_best_conf: 0.0,
+        last_u: None,
+        u_detector: None,
+        u_last_run_at: None,
+        u_first_detection_at: None,
+        u_locked: false,
+        u_best_conf: 0.0,
+        u_mask_texture: None,
         face_detector: detector,
         last_faces: Vec::new(),
         last_rgb_frame: None,
@@ -2590,11 +3023,13 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         pose_filter: make_pose_filter(),
         started_at: Instant::now(),
         last_lockbar: None,
-        lockbar_detector: None,
-        lockbar_last_run_at: None,
-        lockbar_first_detection_at: None,
-        lockbar_locked: false,
-        lockbar_best_conf: 0.0,
+        last_u: None,
+        u_detector: None,
+        u_last_run_at: None,
+        u_first_detection_at: None,
+        u_locked: false,
+        u_best_conf: 0.0,
+        u_mask_texture: None,
         face_detector: detector,
         last_faces: Vec::new(),
         last_rgb_frame: None,
@@ -2731,20 +3166,35 @@ fn draw_rect_outline(
     draw_line(buf, width, height, (x0, y1), (x0, y0), color, radius);
 }
 
-/// Bake the same overlays the GUI draws (face bbox in red, lockbar
-/// quad in cyan) directly into a copy of the RGB888 buffer. Used by
-/// the screenshot path so users can read back what the algorithms
-/// saw, not just the raw frame.
+/// Bake the same overlays the GUI draws (U mask tint, face bbox in red,
+/// derived lockbar quad in cyan) directly into a copy of the RGB888
+/// buffer. Used by the screenshot path so users can read back what the
+/// algorithms saw, not just the raw frame.
 fn bake_overlays(
     width: u32,
     height: u32,
     rgb888: &[u8],
     faces: &[face::FaceDetection],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    u: Option<&u_onnx::UDetection>,
 ) -> Vec<u8> {
     const FACE_RGB: [u8; 3] = [0xff, 0x60, 0x60];
     const LOCKBAR_RGB: [u8; 3] = [0x00, 0xe5, 0xff];
     let mut out = rgb888.to_vec();
+    // U segmentation mask first, so the face boxes + lockbar quad stay
+    // crisp on top of the tint (same cyan blend as the live overlay).
+    if let Some(det) = u {
+        for y in 0..height {
+            for x in 0..width {
+                if det.mask_prob_at(x as f32, y as f32) >= U_MASK_THR {
+                    let i = ((y * width + x) as usize) * 3;
+                    out[i] = (u16::from(out[i]) * 2 / 5) as u8;
+                    out[i + 1] = (u16::from(out[i + 1]) * 3 / 5 + 80) as u8;
+                    out[i + 2] = (u16::from(out[i + 2]) * 3 / 5 + 100) as u8;
+                }
+            }
+        }
+    }
     for face in faces {
         let x0 = face.x.round() as i32;
         let y0 = face.y.round() as i32;
@@ -2779,8 +3229,9 @@ fn save_rgb_screenshot_at(
     rgb888: &[u8],
     faces: &[face::FaceDetection],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    u: Option<&u_onnx::UDetection>,
 ) -> Result<(), String> {
-    let painted = bake_overlays(width, height, rgb888, faces, lockbar);
+    let painted = bake_overlays(width, height, rgb888, faces, lockbar, u);
     let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
     let writer = std::io::BufWriter::new(file);
     let mut encoder = png::Encoder::new(writer, width, height);
@@ -2805,6 +3256,7 @@ fn save_rgb_screenshot(
     rgb888: &[u8],
     faces: &[face::FaceDetection],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    u: Option<&u_onnx::UDetection>,
 ) -> Result<std::path::PathBuf, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -2817,7 +3269,7 @@ fn save_rgb_screenshot(
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = dir.join(format!("{slug}_{stamp}.png"));
-    save_rgb_screenshot_at(&path, width, height, rgb888, faces, lockbar)?;
+    save_rgb_screenshot_at(&path, width, height, rgb888, faces, lockbar, u)?;
     Ok(path)
 }
 

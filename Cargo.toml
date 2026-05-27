@@ -8,6 +8,7 @@ members = [
     "crates/freenect2",
     "crates/libusb-sys",
     "crates/lockbar-onnx",
+    "crates/u-onnx",
     "crates/webcam",
     "tools/headtracking-demo",
     "tools/lockbar-replay",

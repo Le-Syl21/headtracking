@@ -14,7 +14,7 @@ path = "src/main.rs"
 face = { path = "../../crates/face" }
 freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
-lockbar-onnx = { path = "../../crates/lockbar-onnx" }
+u-onnx = { path = "../../crates/u-onnx" }
 webcam = { path = "../../crates/webcam" }
 headtracking = { path = "../.." }
 # Manual egui integration (winit + glutin + glow + egui_glow) instead of
