@@ -123,6 +123,7 @@ jobs:
       # Le commentaire garde la version lisible pour les mises à jour.
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       # Garde-fou tag ↔ Cargo.toml. Un tag `vX.Y.Z` doit correspondre à la
@@ -517,6 +518,8 @@ jobs:
     environment: signing
     steps:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: stable
 
       - name: Install ssign
         run: cargo install ssign
