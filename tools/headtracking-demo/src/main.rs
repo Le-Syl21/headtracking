@@ -3147,7 +3147,7 @@ impl App {
             // against which the off-axis slide is read.
             let c = rect.center();
             let s = 7.0;
-            let stroke = Stroke::new(1.0, Color32::from_white_alpha(150));
+            let stroke = Stroke::new(1.0_f32, Color32::from_white_alpha(150));
             ui.painter()
                 .line_segment([Pos2::new(c.x - s, c.y), Pos2::new(c.x + s, c.y)], stroke);
             ui.painter()
@@ -3315,10 +3315,10 @@ fn draw_face_bbox(painter: &egui::Painter, rect: Rect, face: &face::FaceDetectio
     let p2 = to_screen(face.x + face.width, face.y);
     let p3 = to_screen(face.x + face.width, face.y + face.height);
     let p4 = to_screen(face.x, face.y + face.height);
-    painter.line_segment([p1, p2], Stroke::new(2.0, FACE_COLOR));
-    painter.line_segment([p2, p3], Stroke::new(2.0, FACE_COLOR));
-    painter.line_segment([p3, p4], Stroke::new(2.0, FACE_COLOR));
-    painter.line_segment([p4, p1], Stroke::new(2.0, FACE_COLOR));
+    painter.line_segment([p1, p2], Stroke::new(2.0_f32, FACE_COLOR));
+    painter.line_segment([p2, p3], Stroke::new(2.0_f32, FACE_COLOR));
+    painter.line_segment([p3, p4], Stroke::new(2.0_f32, FACE_COLOR));
+    painter.line_segment([p4, p1], Stroke::new(2.0_f32, FACE_COLOR));
     painter.text(
         p1 + Vec2::new(2.0, -14.0),
         egui::Align2::LEFT_BOTTOM,
@@ -3365,7 +3365,7 @@ fn draw_lockbar(
         to_screen(bar.corners[2].0, bar.corners[2].1),
         to_screen(bar.corners[3].0, bar.corners[3].1),
     ];
-    let stroke = Stroke::new(3.0, LOCKBAR_COLOR);
+    let stroke = Stroke::new(3.0_f32, LOCKBAR_COLOR);
     painter.line_segment([pts[0], pts[1]], stroke);
     painter.line_segment([pts[1], pts[2]], stroke);
     painter.line_segment([pts[2], pts[3]], stroke);
