@@ -442,14 +442,16 @@ jobs:
             # binaires (plus le reste du dossier staged, qu'Apple ignore).
             NOTARIZE_ZIP="$RUNNER_TEMP/notarize-$art.zip"
             /usr/bin/ditto -c -k --keepParent "$work" "$NOTARIZE_ZIP"
-            # Soft-fail conservé du build d'origine : l'auth de la notary
-            # Apple est capricieuse (rate-limits, verrous de compte sur des
-            # 401 fantômes). Les binaires restent signés avec runtime durci ;
-            # l'utilisateur voit au pire un « impossible à ouvrir » une seule
-            # fois (clic droit → Ouvrir). Mieux que de bloquer toute la
-            # release sur l'infra d'Apple.
+            # Échec bloquant. Le soft-fail d'origine se justifiait par
+            # l'instabilité de la notary Apple, mais il n'y avait alors aucune
+            # reprise : le premier 401 fantôme suffisait à publier des binaires
+            # non notarisés, sans que rien ne devienne rouge. Les 3 tentatives
+            # avec backoff (5/15/45 min) couvrent désormais ces cas, et un CI
+            # vert doit vouloir dire « notarisé » — sinon on ne l'apprend que
+            # par un utilisateur bloqué par Gatekeeper.
             if ! notarize "$NOTARIZE_ZIP"; then
-              echo "::warning::$art : notarisation échouée. Binaires signés mais non notarisés — Gatekeeper demandera une confirmation au premier lancement."
+              echo "::error::$art : notarisation échouée après 3 tentatives — release interrompue plutôt que de publier des binaires que Gatekeeper refusera."
+              exit 1
             fi
             rm -f "$NOTARIZE_ZIP"
             echo "::endgroup::"
