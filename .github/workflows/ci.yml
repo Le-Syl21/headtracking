@@ -25,7 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Actions tierces épinglées au SHA du commit, pas au tag (même raison que
+      # dans `release.yml` : un tag est mutable, un SHA non).
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -37,10 +39,10 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: Install build deps
         run: |
