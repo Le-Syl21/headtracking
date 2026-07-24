@@ -17,6 +17,12 @@ cross-platform (Linux, Windows, macOS).
 > install/configure flow described below is the *intended* one and may still
 > be wrong in places. Bug reports very welcome.
 
+## Community & support
+
+Questions, bug reports, beta testing, or just want to chat? Join the Discord:
+
+[![Discord](https://img.shields.io/badge/Discord-Le--Syl21%20Tools-5865F2?logo=discord&logoColor=white)](https://discord.gg/T37DYHmt2j)
+
 ---
 
 ## English
