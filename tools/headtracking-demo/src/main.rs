@@ -29,7 +29,9 @@ use egui::{
     self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, TextureHandle, Vec2,
 };
-use egui_rotate::{CursorIconExt, Rotation, transform_clipped_primitives, transform_raw_input};
+use egui_rotate::{
+    CursorIconExt, Rotation, SoftwareCursor, transform_clipped_primitives, transform_raw_input,
+};
 use egui_winit::winit;
 use nalgebra::Matrix4;
 use parking_lot::Mutex;
@@ -805,7 +807,34 @@ impl DemoShell {
             raw_input.screen_rect =
                 Some(egui::Rect::from_min_size(egui::Pos2::ZERO, physical_size));
         }
-        transform_raw_input(&mut raw_input, rotation);
+        // On a rotated viewport, drive a virtual cursor from raw mouse deltas
+        // (so it moves the way the *viewer* expects) and hide the OS cursor —
+        // `process_input` does the same rotation as `transform_raw_input` plus
+        // the capture/track logic. Off (Esc) or at 0° we keep the OS cursor.
+        let use_sw_cursor = self.app.sw_cursor_on && !rotation.is_none();
+        if use_sw_cursor {
+            if self.app.mouse_delta_accum != egui::Vec2::ZERO {
+                raw_input
+                    .events
+                    .push(egui::Event::MouseMoved(self.app.mouse_delta_accum));
+                self.app.mouse_delta_accum = egui::Vec2::ZERO;
+            }
+            // Seed the virtual position (window centre) so the cursor shows
+            // before the first motion event.
+            if self.app.software_cursor.virtual_pos().is_none() {
+                let logical = rotation.transform_screen_rect(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    physical_size,
+                ));
+                self.app.software_cursor.set_virtual_pos(logical.center());
+            }
+            let _ = self
+                .app
+                .software_cursor
+                .process_input(&mut raw_input, rotation, physical_size);
+        } else {
+            transform_raw_input(&mut raw_input, rotation);
+        }
 
         // 2. Run the UI in the (rotated) logical coordinate space. egui
         //    0.34's run_ui hands us a root Ui that the panels nest into.
@@ -818,7 +847,13 @@ impl DemoShell {
         // (resize arrows, text caret) must be remapped here so they point the
         // right way on the physically-rotated screen.
         let mut platform_output = full_output.platform_output.clone();
-        platform_output.cursor_icon = platform_output.cursor_icon.rotate(rotation);
+        platform_output.cursor_icon = if use_sw_cursor {
+            // Hide the OS cursor — we draw our own, which also sidesteps the
+            // rotated-icon "VerticalText" set-cursor error winit logs.
+            egui::CursorIcon::None
+        } else {
+            platform_output.cursor_icon.rotate(rotation)
+        };
         self.egui_winit
             .as_mut()
             .unwrap()
@@ -905,6 +940,16 @@ impl winit::application::ApplicationHandler for DemoShell {
             self.redraw();
             return;
         }
+        // Esc toggles the software cursor — the escape hatch back to the plain
+        // OS cursor if the virtual one ever misbehaves. (egui still receives
+        // the key below, so it also closes any open popup.)
+        if let WindowEvent::KeyboardInput { event: key, .. } = &event
+            && key.state == winit::event::ElementState::Pressed
+            && key.physical_key
+                == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape)
+        {
+            self.app.sw_cursor_on = !self.app.sw_cursor_on;
+        }
 
         let window = self.gl_window.as_ref().unwrap().window();
         let response = self
@@ -914,6 +959,26 @@ impl winit::application::ApplicationHandler for DemoShell {
             .on_window_event(window, &event);
         if response.repaint {
             window.request_redraw();
+        }
+    }
+
+    /// Raw pointer motion (relative deltas) drives the software cursor — the
+    /// window-event `CursorMoved` gives absolute positions that move the wrong
+    /// way once the viewport is rotated, so we accumulate `MouseMotion` and
+    /// feed it as `Event::MouseMoved` in `redraw`.
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event
+            && self.app.sw_cursor_on
+        {
+            self.app.mouse_delta_accum += egui::vec2(delta.0 as f32, delta.1 as f32);
+            if let Some(w) = self.gl_window.as_ref() {
+                w.window().request_redraw();
+            }
         }
     }
 
@@ -1613,6 +1678,19 @@ struct App {
     /// (see [`rotation_label`]). The ⟳ button cycles +90° clockwise from
     /// the player's seat. Read by [`DemoShell::redraw`].
     rotation: Rotation,
+    /// Virtual cursor for the rotated display: the OS cursor moves in
+    /// physical space, so on a rotated screen it drifts sideways and its
+    /// icon rotation trips winit's "VerticalText" set-cursor error. When
+    /// `sw_cursor_on` we hide the OS cursor and drive this one from raw
+    /// mouse deltas instead (see [`DemoShell::redraw`]). Esc toggles it.
+    software_cursor: SoftwareCursor,
+    /// Accumulated raw mouse motion (winit `DeviceEvent::MouseMotion`)
+    /// since the last frame, fed to the software cursor as `MouseMoved`.
+    mouse_delta_accum: egui::Vec2,
+    /// `false` reverts to the plain OS cursor (Esc). Off automatically when
+    /// the display isn't rotated — the software cursor only earns its keep
+    /// on a rotated viewport.
+    sw_cursor_on: bool,
     /// Parallax validation window toggle (🪟 button). When on, the central
     /// panel shows the camera feed with the off-axis 3D scene stacked below
     /// it (see `docs/parallax-validation-window.md`).
@@ -2402,6 +2480,11 @@ impl App {
             // see `rotation_label`). This is the orientation that reads
             // upright on the cab.
             rotation: Rotation::CW90,
+            // Locked (kiosk) so the virtual cursor stays inside the window;
+            // scaled up a touch for a cabinet viewed from a distance.
+            software_cursor: SoftwareCursor::new().with_lock(true).with_scale(1.4),
+            mouse_delta_accum: egui::Vec2::ZERO,
+            sw_cursor_on: true,
             parallax_enabled: false,
             parallax_tex: None,
             // Auto-orbit by default: the parallax illusion shows immediately
@@ -3174,6 +3257,17 @@ impl App {
             }
             self.draw_camera_view(ui);
         });
+
+        // Draw the virtual cursor last, on the foreground layer, in logical
+        // space — it rotates back to physical with the rest of the frame.
+        if self.sw_cursor_on && !self.rotation.is_none() {
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("sw_cursor"),
+            ));
+            self.software_cursor
+                .draw(&painter, egui::CursorIcon::Default);
+        }
     }
 
     /// Camera feed with the lockbar + head overlays, scaled to fit while
