@@ -22,7 +22,9 @@ use sdl3_sys::camera as sdl_cam;
 use sdl3_sys::camera::SDL_CameraID;
 use sdl3_sys::error::SDL_GetError;
 use sdl3_sys::events::SDL_PumpEvents;
-use sdl3_sys::init::{SDL_INIT_CAMERA, SDL_Init, SDL_InitSubSystem, SDL_QuitSubSystem};
+use sdl3_sys::init::{SDL_INIT_CAMERA, SDL_Init};
+#[cfg(windows)]
+use sdl3_sys::init::{SDL_InitSubSystem, SDL_QuitSubSystem};
 use sdl3_sys::pixels::{SDL_Colorspace, SDL_PIXELFORMAT_RGB24};
 use sdl3_sys::surface::{SDL_ConvertSurface, SDL_DestroySurface, SDL_Surface};
 
@@ -71,17 +73,35 @@ fn read_sdl_error() -> String {
 /// `Camera` would be a use-after-free waiting to happen.
 pub fn force_refresh() -> Result<(), Error> {
     ensure_subsystem()?;
-    // SAFETY: ref count is ≥ 1 after `ensure_subsystem`. SDL3 docs (init.h)
-    // state both calls are thread-safe and ref-counted; quit→init at the
-    // same call site cycles the subsystem (re-running DetectDevices) without
-    // racing other in-flight inits.
-    unsafe {
-        SDL_QuitSubSystem(SDL_INIT_CAMERA);
-        if !SDL_InitSubSystem(SDL_INIT_CAMERA) {
-            return Err(Error::Init(read_sdl_error()));
+    #[cfg(windows)]
+    {
+        // SAFETY: ref count is ≥ 1 after `ensure_subsystem`. SDL3 docs (init.h)
+        // state both calls are thread-safe and ref-counted; quit→init at the
+        // same call site cycles the subsystem (re-running DetectDevices)
+        // without racing other in-flight inits.
+        unsafe {
+            SDL_QuitSubSystem(SDL_INIT_CAMERA);
+            if !SDL_InitSubSystem(SDL_INIT_CAMERA) {
+                return Err(Error::Init(read_sdl_error()));
+            }
         }
+        info!("SDL3 camera subsystem cycled (Windows hot-plug workaround)");
     }
-    info!("SDL3 camera subsystem cycled (forced rescan — Windows hot-plug workaround)");
+    #[cfg(not(windows))]
+    {
+        // Linux (V4L2) and macOS (AVFoundation) track camera hot-plug through
+        // SDL's event queue, so a pump is enough to fold in additions/removals.
+        // We deliberately do NOT cycle the subsystem here: quit→init re-opens
+        // the backend and SDL hands out a *fresh, incrementing* instance id for
+        // the same physical camera on every call (observed creeping 1→9 across
+        // successive rescans), which then breaks `Camera::open(id)` for the
+        // stored dropdown entry.
+        // SAFETY: SDL_PumpEvents is callable from any thread after SDL_Init.
+        unsafe {
+            SDL_PumpEvents();
+        }
+        info!("SDL3 camera event queue pumped (hot-plug rescan)");
+    }
     Ok(())
 }
 
