@@ -1076,6 +1076,7 @@ fn poll_active_headless(active: &mut Active) {
                     active.last_heads = detector.detect(&rgb888, rgb.width, rgb.height);
                 }
                 update_u(
+                    &mut active.metrics,
                     &mut active.u_detector,
                     &mut active.u_last_run_at,
                     &mut active.u_first_detection_at,
@@ -1096,6 +1097,7 @@ fn poll_active_headless(active: &mut Active) {
                     active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
                 }
                 update_u(
+                    &mut active.metrics,
                     &mut active.u_detector,
                     &mut active.u_last_run_at,
                     &mut active.u_first_detection_at,
@@ -1116,6 +1118,7 @@ fn poll_active_headless(active: &mut Active) {
                     active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
                 }
                 update_u(
+                    &mut active.metrics,
                     &mut active.u_detector,
                     &mut active.u_last_run_at,
                     &mut active.u_first_detection_at,
@@ -1730,6 +1733,9 @@ struct Active {
     /// "Screenshot" button can write it to disk without re-grabbing
     /// from the device. `None` until the first frame arrives.
     last_rgb_frame: Option<(u32, u32, Vec<u8>)>,
+    /// Live perf counters (inference times, CPU%, in/out FPS). Reset per
+    /// backend open — each device gets a fresh measurement window.
+    metrics: Metrics,
 }
 
 /// How long a U detection stays valid before [`update_u`] re-runs
@@ -1771,6 +1777,7 @@ const U_WARMUP_DURATION: Duration = Duration::from_secs(5);
 /// `#[allow]` instead.
 #[allow(clippy::too_many_arguments)]
 fn update_u(
+    metrics: &mut Metrics,
     detector: &mut Option<u_onnx::UDetector>,
     last_run_at: &mut Option<Instant>,
     first_detection_at: &mut Option<Instant>,
@@ -1814,8 +1821,12 @@ fn update_u(
     let det = detector.as_ref().expect("init checked above");
     *last_run_at = Some(now);
     // `detect` returns survivors highest-confidence first; on a single
-    // cabinet there's at most one, so take the best.
-    if let Some(best) = det.detect(rgb888, w, h).into_iter().next() {
+    // cabinet there's at most one, so take the best. Time the inference for
+    // the perf readout (only reached when not throttled/locked).
+    let u_t0 = Instant::now();
+    let u_dets = det.detect(rgb888, w, h);
+    metrics.note_u_ms(u_t0.elapsed().as_secs_f32() * 1000.0);
+    if let Some(best) = u_dets.into_iter().next() {
         if best.confidence > *best_conf {
             *best_conf = best.confidence;
             // Derive the lockbar (closed edge of the U) for the existing
@@ -2267,6 +2278,112 @@ struct Baseline {
     z_mm: f32,
 }
 
+/// Read this process's accumulated CPU time (user + system) in clock ticks
+/// from `/proc/self/stat`. `None` on any parse failure (non-Linux, etc.).
+fn read_cpu_jiffies() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The `comm` field is parenthesised and may itself contain spaces; every
+    // field after the last ')' is plain space-separated. utime/stime are the
+    // 12th/13th of those (0-based 11/12).
+    let after = &s[s.rfind(')')? + 1..];
+    let t: Vec<&str> = after.split_whitespace().collect();
+    let utime: u64 = t.get(11)?.parse().ok()?;
+    let stime: u64 = t.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// Live performance counters, shown in the toolbar and logged every ~2 s:
+/// per-model inference time (EWMA), process CPU%, and the input (camera) vs
+/// output (filtered-pose) frame rates. Detection runs inline on the UI
+/// thread, so `out_fps` is exactly the tracking rate the player feels.
+struct Metrics {
+    head_ms: f32,
+    u_ms: f32,
+    in_fps: f32,
+    out_fps: f32,
+    cpu_pct: f32,
+    in_frames: u32,
+    out_poses: u32,
+    window_start: Instant,
+    last_jiffies: u64,
+    last_log: Instant,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            head_ms: 0.0,
+            u_ms: 0.0,
+            in_fps: 0.0,
+            out_fps: 0.0,
+            cpu_pct: 0.0,
+            in_frames: 0,
+            out_poses: 0,
+            window_start: now,
+            last_jiffies: read_cpu_jiffies().unwrap_or(0),
+            last_log: now,
+        }
+    }
+
+    // EWMAs so a single slow frame doesn't dominate the reading.
+    fn note_head_ms(&mut self, ms: f32) {
+        self.head_ms = if self.head_ms == 0.0 {
+            ms
+        } else {
+            self.head_ms * 0.8 + ms * 0.2
+        };
+    }
+    fn note_u_ms(&mut self, ms: f32) {
+        self.u_ms = if self.u_ms == 0.0 {
+            ms
+        } else {
+            self.u_ms * 0.8 + ms * 0.2
+        };
+    }
+    fn note_input_frame(&mut self) {
+        self.in_frames += 1;
+    }
+    fn note_output_pose(&mut self) {
+        self.out_poses += 1;
+    }
+
+    /// Called once per poll: roll the 1 s window (recompute FPS + CPU%) and
+    /// log a line every ~2 s so the downloadable log carries the same numbers
+    /// as the toolbar.
+    fn tick(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.window_start).as_secs_f32();
+        if elapsed >= 1.0 {
+            self.in_fps = self.in_frames as f32 / elapsed;
+            self.out_fps = self.out_poses as f32 / elapsed;
+            let jiffies = read_cpu_jiffies().unwrap_or(self.last_jiffies);
+            // USER_HZ is 100 on Linux x86_64; ticks → seconds = / 100.
+            let cpu_secs = jiffies.saturating_sub(self.last_jiffies) as f32 / 100.0;
+            self.cpu_pct = cpu_secs / elapsed * 100.0;
+            self.last_jiffies = jiffies;
+            self.in_frames = 0;
+            self.out_poses = 0;
+            self.window_start = now;
+        }
+        if now.duration_since(self.last_log).as_secs_f32() >= 2.0 {
+            info!(
+                "perf: head {:.1}ms | U {:.1}ms | cpu {:.0}% | in {:.1} fps | out {:.1} fps",
+                self.head_ms, self.u_ms, self.cpu_pct, self.in_fps, self.out_fps
+            );
+            self.last_log = now;
+        }
+    }
+
+    /// One-line summary for the toolbar.
+    fn summary(&self) -> String {
+        format!(
+            "head {:.0}ms · U {:.0}ms · cpu {:.0}% · in {:.0} / out {:.0} fps",
+            self.head_ms, self.u_ms, self.cpu_pct, self.in_fps, self.out_fps
+        )
+    }
+}
+
 impl App {
     fn new(logs: Arc<Mutex<VecDeque<String>>>) -> Self {
         let available = detect_backends();
@@ -2362,17 +2479,25 @@ impl App {
         let Some(active) = self.active.as_mut() else {
             return;
         };
+        active.metrics.tick();
         match &mut active.inner {
             Inner::KinectV2 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
+                    active.metrics.note_input_frame();
                     // Convert BGRX → RGB888 once; head detector, lockbar
                     // detector and screenshot button all consume the
                     // packed-RGB buffer.
                     let rgb888 = bgrx_to_rgb888(&rgb.data);
                     if let Some(detector) = active.head_detector.as_ref() {
-                        active.last_heads = detector.detect(&rgb888, rgb.width, rgb.height);
+                        let t0 = Instant::now();
+                        let heads = detector.detect(&rgb888, rgb.width, rgb.height);
+                        active
+                            .metrics
+                            .note_head_ms(t0.elapsed().as_secs_f32() * 1000.0);
+                        active.last_heads = heads;
                     }
                     update_u(
+                        &mut active.metrics,
                         &mut active.u_detector,
                         &mut active.u_last_run_at,
                         &mut active.u_first_detection_at,
@@ -2414,14 +2539,24 @@ impl App {
                     let smoothed = smooth_head(head, &mut active.pose_filter, active.started_at);
                     capture_baseline(&mut active.baseline, smoothed);
                     active.last_head = smoothed;
+                    if smoothed.is_some() {
+                        active.metrics.note_output_pose();
+                    }
                 }
             }
             Inner::KinectV1 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
+                    active.metrics.note_input_frame();
                     if let Some(detector) = active.head_detector.as_ref() {
-                        active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
+                        let t0 = Instant::now();
+                        let heads = detector.detect(&rgb.data, rgb.width, rgb.height);
+                        active
+                            .metrics
+                            .note_head_ms(t0.elapsed().as_secs_f32() * 1000.0);
+                        active.last_heads = heads;
                     }
                     update_u(
+                        &mut active.metrics,
                         &mut active.u_detector,
                         &mut active.u_last_run_at,
                         &mut active.u_first_detection_at,
@@ -2460,14 +2595,23 @@ impl App {
                     let smoothed = smooth_head(head, &mut active.pose_filter, active.started_at);
                     capture_baseline(&mut active.baseline, smoothed);
                     active.last_head = smoothed;
+                    if smoothed.is_some() {
+                        active.metrics.note_output_pose();
+                    }
                 }
             }
             Inner::Webcam { camera } => {
                 if let Some(rgb) = camera.poll_rgb() {
+                    active.metrics.note_input_frame();
                     // Head detection on the raw camera frame (before the
                     // ColorImage conversion strips the contiguous bytes).
                     if let Some(detector) = active.head_detector.as_ref() {
-                        active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
+                        let t0 = Instant::now();
+                        let heads = detector.detect(&rgb.data, rgb.width, rgb.height);
+                        active
+                            .metrics
+                            .note_head_ms(t0.elapsed().as_secs_f32() * 1000.0);
+                        active.last_heads = heads;
                         let preferred = active
                             .last_lockbar
                             .as_ref()
@@ -2480,11 +2624,15 @@ impl App {
                                 smooth_head(Some(head), &mut active.pose_filter, active.started_at);
                             capture_baseline(&mut active.baseline, smoothed);
                             active.last_head = smoothed;
+                            if smoothed.is_some() {
+                                active.metrics.note_output_pose();
+                            }
                         } else {
                             active.last_head = None;
                         }
                     }
                     update_u(
+                        &mut active.metrics,
                         &mut active.u_detector,
                         &mut active.u_last_run_at,
                         &mut active.u_first_detection_at,
@@ -2828,6 +2976,25 @@ impl App {
                 );
                 self.output_line(ui);
             });
+
+            ui.add_space(2.0);
+            // Row 4 — live perf counters: per-model inference (ms), process
+            // CPU%, and input (camera) vs output (filtered-pose) frame rates.
+            if let Some(active) = self.active.as_ref() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("perf ▸")
+                            .strong()
+                            .color(Color32::GRAY)
+                            .monospace(),
+                    );
+                    ui.label(
+                        RichText::new(active.metrics.summary())
+                            .monospace()
+                            .color(Color32::LIGHT_BLUE),
+                    );
+                });
+            }
             ui.add_space(4.0);
         });
 
@@ -3461,6 +3628,7 @@ fn open_kinect_v2() -> Result<Active, String> {
         head_detector: detector,
         last_heads: Vec::new(),
         last_rgb_frame: None,
+        metrics: Metrics::new(),
     })
 }
 
@@ -3530,6 +3698,7 @@ fn open_kinect_v1() -> Result<Active, String> {
         head_detector: detector,
         last_heads: Vec::new(),
         last_rgb_frame: None,
+        metrics: Metrics::new(),
     })
 }
 
@@ -3585,6 +3754,7 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         head_detector: detector,
         last_heads: Vec::new(),
         last_rgb_frame: None,
+        metrics: Metrics::new(),
     })
 }
 
