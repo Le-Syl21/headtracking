@@ -3,7 +3,7 @@
 //!
 //! Detects connected Kinect v1 / v2 sensors and webcams, exposes a dropdown
 //! to pick the active input. The centre pane shows the live RGB feed with
-//! the YuNet face bbox overlaid; the bottom panel splits into a tracing
+//! the head bbox (SCUT-HEAD nano) overlaid; the bottom panel splits into a tracing
 //! log on the left and the VPX-style view delta on the right.
 //!
 //! Run with `cargo run --release -p headtracking-demo`.
@@ -44,11 +44,11 @@ const DEPTH_MAX_MM: f32 = 2_500.0;
 const LOG_BUFFER_LINES: usize = 1_000;
 
 // Overlay colours, kept here so the toolbar status text and the canvas
-// drawing stay in sync. Face → soft red; the U segmentation mask → a
+// drawing stay in sync. Head → soft red; the U segmentation mask → a
 // translucent cyan fill, with the lockbar quad derived from its closed
 // edge drawn in solid cyan (high contrast against red, visible on both
 // bright playfield reflections and dark cabinet interiors).
-const FACE_COLOR: Color32 = Color32::from_rgb(0xff, 0x60, 0x60);
+const HEAD_COLOR: Color32 = Color32::from_rgb(0xff, 0x60, 0x60);
 const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
 /// Straight-alpha RGBA for the U mask overlay fill (cyan, ~43 % opacity).
 const U_MASK_RGBA: [u8; 4] = [0x00, 0xe5, 0xff, 110];
@@ -938,7 +938,7 @@ Usage: headtracking-demo [--capture <backend> [--out <path>] [--wait <secs>]]
                         backend = kinect-v2 | kinect-v1 | webcam | webcam-<N>
   --out <path>          Output PNG path. Default: next to the binary,
                         named `<backend>_<UTC-timestamp>.png`.
-  --wait <secs>         Seconds to let the device warm up + face/lockbar
+  --wait <secs>         Seconds to let the device warm up + head/lockbar
                         detectors lock on before the capture (default 3).
   -h, --help            Print this message.
 
@@ -1037,7 +1037,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             *w,
             *h,
             rgb,
-            &active.last_faces,
+            &active.last_heads,
             active.last_lockbar.as_ref(),
             active.last_u.as_ref(),
         )?;
@@ -1049,7 +1049,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             *w,
             *h,
             rgb,
-            &active.last_faces,
+            &active.last_heads,
             active.last_lockbar.as_ref(),
             active.last_u.as_ref(),
         )?
@@ -1057,7 +1057,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
 
     info!(
         path = %path.display(),
-        n_faces = active.last_faces.len(),
+        n_heads = active.last_heads.len(),
         lockbar_found = active.last_lockbar.is_some(),
         "headless capture saved"
     );
@@ -1066,14 +1066,14 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
 
 /// Same as `App::poll` minus the egui texture upload (we don't render
 /// anything in headless mode) and the depth → head-pose path (the
-/// screenshot only cares about RGB + face boxes + lockbar quad).
+/// screenshot only cares about RGB + head boxes + lockbar quad).
 fn poll_active_headless(active: &mut Active) {
     match &mut active.inner {
         Inner::KinectV2 { device, .. } => {
             if let Some(rgb) = device.poll_rgb() {
                 let rgb888 = bgrx_to_rgb888(&rgb.data);
-                if let Some(detector) = active.face_detector.as_ref() {
-                    active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
+                if let Some(detector) = active.head_detector.as_ref() {
+                    active.last_heads = detector.detect(&rgb888, rgb.width, rgb.height);
                 }
                 update_u(
                     &mut active.u_detector,
@@ -1092,8 +1092,8 @@ fn poll_active_headless(active: &mut Active) {
         }
         Inner::KinectV1 { device, .. } => {
             if let Some(rgb) = device.poll_rgb() {
-                if let Some(detector) = active.face_detector.as_ref() {
-                    active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
+                if let Some(detector) = active.head_detector.as_ref() {
+                    active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
                 }
                 update_u(
                     &mut active.u_detector,
@@ -1112,8 +1112,8 @@ fn poll_active_headless(active: &mut Active) {
         }
         Inner::Webcam { camera } => {
             if let Some(rgb) = camera.poll_rgb() {
-                if let Some(detector) = active.face_detector.as_mut() {
-                    active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
+                if let Some(detector) = active.head_detector.as_ref() {
+                    active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
                 }
                 update_u(
                     &mut active.u_detector,
@@ -1720,11 +1720,12 @@ struct Active {
     /// egui texture holding the translucent U mask overlay (160×160 proto
     /// grid), rebuilt by [`refresh_u_overlay`] each frame a U exists.
     u_mask_texture: Option<TextureHandle>,
-    /// `Some` when face detection is enabled (currently auto-enabled for
-    /// the webcam backend). Cheap to keep around — YuNet runs in <10 ms
-    /// at 320×320 on CPU.
-    face_detector: Option<face::Detector>,
-    last_faces: Vec<face::FaceDetection>,
+    /// `Some` once the head detector (SCUT-HEAD nano) is initialised —
+    /// mirrors the plugin: the Kinect/webcam paths track the head as a
+    /// shape, not a frontal face, so tracking holds when the player leans
+    /// over the playfield. Cheap to keep around (nano runs in a few ms on CPU).
+    head_detector: Option<head::Detector>,
+    last_heads: Vec<head::HeadAnchor>,
     /// Latest RGB888 frame (width, height, bytes) — kept so the
     /// "Screenshot" button can write it to disk without re-grabbing
     /// from the device. `None` until the first frame arrives.
@@ -1985,7 +1986,7 @@ struct Vec3Mm {
 ///
 /// Webcam intrinsics are zero at construction time (no per-camera
 /// calibration yet), so we fall back to the same approximation
-/// `face_to_head` uses — fx ≈ 0.85 × frame_width — keyed off the
+/// `head_to_pixel_webcam` uses — fx ≈ 0.85 × frame_width — keyed off the
 /// frame dimensions stored in the quad itself.
 fn lockbar_3d_center(
     quad: &headtracking::calibration::LockbarQuadRgb,
@@ -2030,7 +2031,7 @@ mod filter_alias {
 /// Build the 3-axis 1€ filter for the head pose. X/Y get the library
 /// defaults; Z gets a tighter `min_cutoff` because depth-camera readings
 /// are inherently noisier (the median over a small pixel window
-/// fluctuates as the face bbox shifts a pixel or two between frames).
+/// fluctuates as the head bbox shifts a pixel or two between frames).
 fn make_pose_filter() -> filter_alias::OneEuroPose3D {
     let xy = filter_alias::OneEuroParams::default();
     let z = filter_alias::OneEuroParams {
@@ -2091,8 +2092,8 @@ enum Inner {
 }
 
 impl Inner {
-    /// `true` when this input pipeline produces 3D head poses (depth blob
-    /// for Kinect, face landmarks + IOD triangulation for webcam).
+    /// `true` when this input pipeline produces 3D head poses (head-box +
+    /// depth for Kinect, head-box width triangulation for webcam).
     fn has_head_tracker(&self) -> bool {
         matches!(
             self,
@@ -2101,53 +2102,55 @@ impl Inner {
     }
 }
 
-/// Score-based face picker: "closer to the camera AND more centred
+/// Score-based head picker: "closer to the camera AND more centred
 /// on the lockbar wins". Centrality is measured against `preferred_u`
 /// (lockbar pixel-centre when locked, otherwise frame centre); the
-/// score is `area × centrality²` so a face at the very edge is
-/// heavily down-weighted but never zero — the lone face in the frame
+/// score is `area × centrality²` so a head at the very edge is
+/// heavily down-weighted but never zero — the lone head in the frame
 /// is still picked.
 ///
 /// Doesn't try to be the long-term solution (a bystander standing
 /// directly between the player and the lockbar would still win); see
 /// the BlazePalm "hands on the lockbar = player" path on the P2
 /// roadmap for the robust version.
-fn pick_player_face(
-    faces: &[face::FaceDetection],
+fn pick_player_head(
+    heads: &[head::HeadAnchor],
     frame_w: u32,
     preferred_u: Option<f32>,
-) -> Option<&face::FaceDetection> {
-    if faces.is_empty() {
+) -> Option<&head::HeadAnchor> {
+    if heads.is_empty() {
         return None;
     }
     let target = preferred_u.unwrap_or(frame_w as f32 * 0.5);
     let half_w = (frame_w as f32 * 0.5).max(1.0);
-    let score = |f: &face::FaceDetection| -> f32 {
-        let fc = f.x + f.width * 0.5;
-        let dist_norm = ((fc - target).abs() / half_w).clamp(0.0, 1.0);
+    // `HeadAnchor` is centre-based, so the box centre is `cx` directly.
+    let score = |h: &head::HeadAnchor| -> f32 {
+        let dist_norm = ((h.cx - target).abs() / half_w).clamp(0.0, 1.0);
         let centrality = (1.0 - dist_norm).max(0.05);
-        f.width * f.height * centrality * centrality
+        h.width * h.height * centrality * centrality
     };
-    faces.iter().max_by(|a, b| {
+    heads.iter().max_by(|a, b| {
         score(a)
             .partial_cmp(&score(b))
             .unwrap_or(std::cmp::Ordering::Equal)
     })
 }
 
-/// Anchor the head pose to the face detector's bbox: scale the face center
-/// from the RGB pixel grid into the depth pixel grid, sample a window of
-/// valid depth values there, take the median (robust to outliers), then
-/// deproject through the IR intrinsics. Returns `None` when not enough
-/// valid depth pixels land inside the face window.
+/// Anchor the head pose to the head detector's bbox: scale the head-box
+/// centre from the RGB pixel grid into the depth pixel grid, sample a
+/// window of valid depth values there, take the median (robust to
+/// outliers), then deproject through the IR intrinsics. Returns `None`
+/// when not enough valid depth pixels land inside the head window.
 ///
-/// Naive linear rescale between the two pixel grids — on the Kinect v2 the
-/// IR and RGB sensors are physically offset, so the sampled window can
-/// drift a few pixels off the face for very close subjects. Good enough
-/// to land on the head; libfreenect2's Registration is the proper fix and
-/// gets wired up later.
-fn head_from_face_depth(
-    face: &face::FaceDetection,
+/// Mirrors the plugin's `head_from_region` (see `src/tracker/face_depth.rs`)
+/// — the demo keeps its own copy because it also needs the pixel `(u, v)`
+/// for the status label. Naive linear rescale between the two pixel grids —
+/// on the Kinect v2 the IR and RGB sensors are physically offset, so the
+/// sampled window can drift a few pixels off the head for very close
+/// subjects. Good enough to land on the skull; libfreenect2's Registration
+/// is the proper fix and gets wired up later.
+fn head_pixel_from_depth(
+    head: &head::HeadAnchor,
     rgb_w: u32,
     rgb_h: u32,
     depth_data: &[f32],
@@ -2160,12 +2163,11 @@ fn head_from_face_depth(
     }
     let scale_x = depth_w as f32 / rgb_w as f32;
     let scale_y = depth_h as f32 / rgb_h as f32;
-    let face_cx = face.x + face.width * 0.5;
-    let face_cy = face.y + face.height * 0.5;
-    let depth_cx = face_cx * scale_x;
-    let depth_cy = face_cy * scale_y;
-    let half_w = ((face.width * 0.4 * scale_x) as i32).clamp(4, 24);
-    let half_h = ((face.height * 0.4 * scale_y) as i32).clamp(4, 24);
+    // `HeadAnchor` is already centre-based.
+    let depth_cx = head.cx * scale_x;
+    let depth_cy = head.cy * scale_y;
+    let half_w = ((head.width * 0.4 * scale_x) as i32).clamp(4, 24);
+    let half_h = ((head.height * 0.4 * scale_y) as i32).clamp(4, 24);
     let cx = depth_cx as i32;
     let cy = depth_cy as i32;
     let mut samples: Vec<f32> = Vec::with_capacity(((2 * half_w + 1) * (2 * half_h + 1)) as usize);
@@ -2205,26 +2207,27 @@ fn head_from_face_depth(
     })
 }
 
-/// Build a [`HeadPixel`] from a face detection. Z is triangulated from the
-/// interpupillary pixel distance assuming a 63 mm physical IOD and a
-/// nominal `fx ≈ 0.85 × frame_width` (typical 60° HFOV webcam). These
-/// numbers are placeholders until `ht-calibrate` measures the real focal
-/// length via the lockbar fiducial.
-fn face_to_head(face: &face::FaceDetection, frame_w: u32, frame_h: u32) -> HeadPixel {
-    const IOD_MM: f32 = 63.0;
+/// Build a [`HeadPixel`] from a head detection on a depth-less webcam frame.
+/// Z is triangulated from the head-box *width* in pixels against a nominal
+/// 155 mm physical head width (bitragion breadth) and `fx ≈ 0.85 × frame_w`
+/// (typical 60° HFOV webcam). This is the webcam counterpart to the Kinect
+/// depth path and matches the intended design: with no depth sensor, head
+/// width takes the role the lockbar width plays elsewhere. `ht-calibrate`
+/// will replace the nominal `fx` with the lockbar-measured focal length so
+/// the absolute scale becomes real.
+fn head_to_pixel_webcam(head: &head::HeadAnchor, frame_w: u32, frame_h: u32) -> HeadPixel {
+    const HEAD_WIDTH_MM: f32 = 155.0;
     let fx = 0.85 * frame_w as f32;
     let fy = fx;
     let cx = (frame_w as f32) / 2.0;
     let cy = (frame_h as f32) / 2.0;
 
-    let dx = face.left_eye_x - face.right_eye_x;
-    let dy = face.left_eye_y - face.right_eye_y;
-    let pixel_iod = (dx * dx + dy * dy).sqrt().max(1.0);
-    let depth_mm = IOD_MM * fx / pixel_iod;
+    let pixel_w = head.width.max(1.0);
+    let depth_mm = HEAD_WIDTH_MM * fx / pixel_w;
 
-    // Eye-midpoint as the head pixel.
-    let u = (face.left_eye_x + face.right_eye_x) * 0.5;
-    let v = (face.left_eye_y + face.right_eye_y) * 0.5;
+    // Head-box centre as the head pixel.
+    let u = head.cx;
+    let v = head.cy;
 
     let x_mm = (u - cx) * depth_mm / fx;
     let y_mm = (v - cy) * depth_mm / fy;
@@ -2355,12 +2358,12 @@ impl App {
         match &mut active.inner {
             Inner::KinectV2 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
-                    // Convert BGRX → RGB888 once; face detector, lockbar
+                    // Convert BGRX → RGB888 once; head detector, lockbar
                     // detector and screenshot button all consume the
                     // packed-RGB buffer.
                     let rgb888 = bgrx_to_rgb888(&rgb.data);
-                    if let Some(detector) = active.face_detector.as_ref() {
-                        active.last_faces = detector.detect(&rgb888, rgb.width, rgb.height);
+                    if let Some(detector) = active.head_detector.as_ref() {
+                        active.last_heads = detector.detect(&rgb888, rgb.width, rgb.height);
                     }
                     update_u(
                         &mut active.u_detector,
@@ -2379,9 +2382,9 @@ impl App {
                     active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
                 }
                 if let Some(depth) = device.poll_depth() {
-                    // Prefer face-anchored depth sampling: the face detector
+                    // Prefer head-anchored depth sampling: the head detector
                     // tells us *where* the head is on RGB; we just read the
-                    // depth there. No face → no pose this frame. The old
+                    // depth there. No head → no pose this frame. The old
                     // closest-blob fallback was unreliable enough that
                     // having no pose is more honest than having a wrong
                     // one.
@@ -2390,9 +2393,9 @@ impl App {
                         .as_ref()
                         .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
                     let head =
-                        pick_player_face(&active.last_faces, 1920, preferred).and_then(|face| {
-                            head_from_face_depth(
-                                face,
+                        pick_player_head(&active.last_heads, 1920, preferred).and_then(|anchor| {
+                            head_pixel_from_depth(
+                                anchor,
                                 1920,
                                 1080,
                                 &depth.data,
@@ -2408,8 +2411,8 @@ impl App {
             }
             Inner::KinectV1 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
-                    if let Some(detector) = active.face_detector.as_ref() {
-                        active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
+                    if let Some(detector) = active.head_detector.as_ref() {
+                        active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
                     }
                     update_u(
                         &mut active.u_detector,
@@ -2430,15 +2433,15 @@ impl App {
                 if let Some(depth) = device.poll_depth() {
                     // libfreenect ships u16 mm; widen for the shared algo.
                     let f32_data: Vec<f32> = depth.data.iter().map(|&v| f32::from(v)).collect();
-                    // Face-anchored depth only — see v2 branch for rationale.
+                    // Head-anchored depth only — see v2 branch for rationale.
                     let preferred = active
                         .last_lockbar
                         .as_ref()
                         .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
                     let head =
-                        pick_player_face(&active.last_faces, 640, preferred).and_then(|face| {
-                            head_from_face_depth(
-                                face,
+                        pick_player_head(&active.last_heads, 640, preferred).and_then(|anchor| {
+                            head_pixel_from_depth(
+                                anchor,
                                 640,
                                 480,
                                 &f32_data,
@@ -2454,18 +2457,18 @@ impl App {
             }
             Inner::Webcam { camera } => {
                 if let Some(rgb) = camera.poll_rgb() {
-                    // Face detection on the raw camera frame (before the
+                    // Head detection on the raw camera frame (before the
                     // ColorImage conversion strips the contiguous bytes).
-                    if let Some(detector) = active.face_detector.as_mut() {
-                        active.last_faces = detector.detect(&rgb.data, rgb.width, rgb.height);
+                    if let Some(detector) = active.head_detector.as_ref() {
+                        active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
                         let preferred = active
                             .last_lockbar
                             .as_ref()
                             .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
-                        if let Some(face) =
-                            pick_player_face(&active.last_faces, rgb.width, preferred)
+                        if let Some(anchor) =
+                            pick_player_head(&active.last_heads, rgb.width, preferred)
                         {
-                            let head = face_to_head(face, rgb.width, rgb.height);
+                            let head = head_to_pixel_webcam(anchor, rgb.width, rgb.height);
                             let smoothed =
                                 smooth_head(Some(head), &mut active.pose_filter, active.started_at);
                             capture_baseline(&mut active.baseline, smoothed);
@@ -2759,7 +2762,7 @@ impl App {
                         *w,
                         *h,
                         bytes,
-                        &active.last_faces,
+                        &active.last_heads,
                         active.last_lockbar.as_ref(),
                         active.last_u.as_ref(),
                     ));
@@ -2928,7 +2931,7 @@ impl App {
                             cols[1].label(
                                 RichText::new(
                                     "this input has no head tracker yet\n\
-                                     (face detection / monocular depth comes\n\
+                                     (head detection / monocular depth comes\n\
                                      with the webcam tracker — P3 roadmap)",
                                 )
                                 .color(Color32::GRAY)
@@ -3005,7 +3008,7 @@ impl App {
         });
     }
 
-    /// Camera feed with the lockbar + face overlays, scaled to fit while
+    /// Camera feed with the lockbar + head overlays, scaled to fit while
     /// keeping the source aspect ratio.
     fn draw_camera_view(&self, ui: &mut egui::Ui) {
         let avail = ui.available_size();
@@ -3063,8 +3066,8 @@ impl App {
                 // the same buffer the detector saw, so its size is
                 // authoritative.
                 let src_size = tex.size_vec2();
-                for face in &active.last_faces {
-                    draw_face_bbox(ui.painter(), rect, face, src_size);
+                for head in &active.last_heads {
+                    draw_head_bbox(ui.painter(), rect, head, src_size);
                 }
             } else {
                 centered(ui, rect, "waiting for first RGB frame…");
@@ -3293,7 +3296,7 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
     );
 }
 
-/// Draw a face bbox on top of the displayed image. The bbox is in the
+/// Draw a head bbox on top of the displayed image. The bbox is in the
 /// frame's pixel coordinates, scaled by the source frame size for the
 /// active backend (RGB sensor resolution: 1920×1080 for v2, 640×480 for
 /// v1, native cam res for webcam — the texture in `rect` already encodes
@@ -3302,7 +3305,7 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
 /// processed (= the texture's size, not the camera spec). Passing the
 /// wrong source size mis-projects the bbox; cf. the macOS AVFoundation
 /// vs SDL3 camera-format mismatch the demo hit on the FaceTime cam.
-fn draw_face_bbox(painter: &egui::Painter, rect: Rect, face: &face::FaceDetection, src_size: Vec2) {
+fn draw_head_bbox(painter: &egui::Painter, rect: Rect, head: &head::HeadAnchor, src_size: Vec2) {
     let frame_w = src_size.x;
     let frame_h = src_size.y;
     if frame_w <= 0.0 || frame_h <= 0.0 {
@@ -3311,20 +3314,25 @@ fn draw_face_bbox(painter: &egui::Painter, rect: Rect, face: &face::FaceDetectio
     let to_screen = |x: f32, y: f32| -> Pos2 {
         rect.left_top() + Vec2::new((x / frame_w) * rect.width(), (y / frame_h) * rect.height())
     };
-    let p1 = to_screen(face.x, face.y);
-    let p2 = to_screen(face.x + face.width, face.y);
-    let p3 = to_screen(face.x + face.width, face.y + face.height);
-    let p4 = to_screen(face.x, face.y + face.height);
-    painter.line_segment([p1, p2], Stroke::new(2.0_f32, FACE_COLOR));
-    painter.line_segment([p2, p3], Stroke::new(2.0_f32, FACE_COLOR));
-    painter.line_segment([p3, p4], Stroke::new(2.0_f32, FACE_COLOR));
-    painter.line_segment([p4, p1], Stroke::new(2.0_f32, FACE_COLOR));
+    // HeadAnchor is centre-based: derive the four corners from cx/cy ± half.
+    let x0 = head.cx - head.width * 0.5;
+    let y0 = head.cy - head.height * 0.5;
+    let x1 = head.cx + head.width * 0.5;
+    let y1 = head.cy + head.height * 0.5;
+    let p1 = to_screen(x0, y0);
+    let p2 = to_screen(x1, y0);
+    let p3 = to_screen(x1, y1);
+    let p4 = to_screen(x0, y1);
+    painter.line_segment([p1, p2], Stroke::new(2.0_f32, HEAD_COLOR));
+    painter.line_segment([p2, p3], Stroke::new(2.0_f32, HEAD_COLOR));
+    painter.line_segment([p3, p4], Stroke::new(2.0_f32, HEAD_COLOR));
+    painter.line_segment([p4, p1], Stroke::new(2.0_f32, HEAD_COLOR));
     painter.text(
         p1 + Vec2::new(2.0, -14.0),
         egui::Align2::LEFT_BOTTOM,
-        format!("{:.0}%", face.confidence * 100.0),
+        format!("{:.0}%", head.confidence * 100.0),
         egui::FontId::monospace(11.0),
-        FACE_COLOR,
+        HEAD_COLOR,
     );
 }
 
@@ -3407,7 +3415,7 @@ fn open_kinect_v2() -> Result<Active, String> {
         .start_streams(true, true)
         .map_err(|e| format!("freenect2 start_streams: {e}"))?;
     let p = device.ir_params();
-    let detector = init_face_detector("kinect-v2");
+    let detector = init_head_detector("kinect-v2");
     Ok(Active {
         backend: Backend::KinectV2,
         intrinsics: Intrinsics {
@@ -3431,8 +3439,8 @@ fn open_kinect_v2() -> Result<Active, String> {
         u_locked: false,
         u_best_conf: 0.0,
         u_mask_texture: None,
-        face_detector: detector,
-        last_faces: Vec::new(),
+        head_detector: detector,
+        last_heads: Vec::new(),
         last_rgb_frame: None,
     })
 }
@@ -3476,7 +3484,7 @@ fn open_kinect_v1() -> Result<Active, String> {
         warn!(?e, "kinect v1: initial set_led failed");
     }
 
-    let detector = init_face_detector("kinect-v1");
+    let detector = init_head_detector("kinect-v1");
     Ok(Active {
         backend: Backend::KinectV1,
         intrinsics: Intrinsics {
@@ -3500,18 +3508,18 @@ fn open_kinect_v1() -> Result<Active, String> {
         u_locked: false,
         u_best_conf: 0.0,
         u_mask_texture: None,
-        face_detector: detector,
-        last_faces: Vec::new(),
+        head_detector: detector,
+        last_heads: Vec::new(),
         last_rgb_frame: None,
     })
 }
 
-fn init_face_detector(backend_name: &'static str) -> Option<face::Detector> {
-    match face::Detector::new() {
+fn init_head_detector(backend_name: &'static str) -> Option<head::Detector> {
+    match head::Detector::new() {
         Ok(d) => {
             info!(
                 backend = backend_name,
-                "face detector initialised (Ultraface)"
+                "head detector initialised (SCUT-HEAD nano)"
             );
             Some(d)
         }
@@ -3519,7 +3527,7 @@ fn init_face_detector(backend_name: &'static str) -> Option<face::Detector> {
             warn!(
                 backend = backend_name,
                 ?e,
-                "face detector failed to initialise; running without it"
+                "head detector failed to initialise; running without it"
             );
             None
         }
@@ -3528,7 +3536,7 @@ fn init_face_detector(backend_name: &'static str) -> Option<face::Detector> {
 
 fn open_webcam(index: u32) -> Result<Active, String> {
     let camera = webcam::Camera::open(index).map_err(|e| format!("webcam open: {e}"))?;
-    let detector = init_face_detector("webcam");
+    let detector = init_head_detector("webcam");
     Ok(Active {
         backend: Backend::Webcam(index),
         // Without lockbar/disc calibration, fx ≈ 0.85 × frame_width is a
@@ -3555,8 +3563,8 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         u_locked: false,
         u_best_conf: 0.0,
         u_mask_texture: None,
-        face_detector: detector,
-        last_faces: Vec::new(),
+        head_detector: detector,
+        last_heads: Vec::new(),
         last_rgb_frame: None,
     })
 }
@@ -3564,7 +3572,7 @@ fn open_webcam(index: u32) -> Result<Active, String> {
 // ============================================================ Image conversion
 
 /// Convert a BGRX (Kinect v2) buffer to packed RGB888 — needed because the
-/// face detector takes RGB888 frames. Allocates a fresh `Vec` of size
+/// head detector takes RGB888 frames. Allocates a fresh `Vec` of size
 /// `width * height * 3`. ~6 MB for 1920×1080; copy cost is negligible
 /// compared to the detector's ~10 ms inference.
 fn bgrx_to_rgb888(bgrx: &[u8]) -> Vec<u8> {
@@ -3675,7 +3683,7 @@ fn draw_line(
     }
 }
 
-/// Draw the outline of an axis-aligned rectangle (face bbox).
+/// Draw the outline of an axis-aligned rectangle (head bbox).
 fn draw_rect_outline(
     buf: &mut [u8],
     width: u32,
@@ -3691,7 +3699,7 @@ fn draw_rect_outline(
     draw_line(buf, width, height, (x0, y1), (x0, y0), color, radius);
 }
 
-/// Bake the same overlays the GUI draws (U mask tint, face bbox in red,
+/// Bake the same overlays the GUI draws (U mask tint, head bbox in red,
 /// derived lockbar quad in cyan) directly into a copy of the RGB888
 /// buffer. Used by the screenshot path so users can read back what the
 /// algorithms saw, not just the raw frame.
@@ -3699,14 +3707,14 @@ fn bake_overlays(
     width: u32,
     height: u32,
     rgb888: &[u8],
-    faces: &[face::FaceDetection],
+    heads: &[head::HeadAnchor],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
     u: Option<&u_onnx::UDetection>,
 ) -> Vec<u8> {
-    const FACE_RGB: [u8; 3] = [0xff, 0x60, 0x60];
+    const HEAD_RGB: [u8; 3] = [0xff, 0x60, 0x60];
     const LOCKBAR_RGB: [u8; 3] = [0x00, 0xe5, 0xff];
     let mut out = rgb888.to_vec();
-    // U segmentation mask first, so the face boxes + lockbar quad stay
+    // U segmentation mask first, so the head boxes + lockbar quad stay
     // crisp on top of the tint (same cyan blend as the live overlay).
     if let Some(det) = u {
         for y in 0..height {
@@ -3720,12 +3728,13 @@ fn bake_overlays(
             }
         }
     }
-    for face in faces {
-        let x0 = face.x.round() as i32;
-        let y0 = face.y.round() as i32;
-        let x1 = (face.x + face.width).round() as i32;
-        let y1 = (face.y + face.height).round() as i32;
-        draw_rect_outline(&mut out, width, height, (x0, y0), (x1, y1), FACE_RGB, 1);
+    for head in heads {
+        // HeadAnchor is centre-based; expand to corners.
+        let x0 = (head.cx - head.width * 0.5).round() as i32;
+        let y0 = (head.cy - head.height * 0.5).round() as i32;
+        let x1 = (head.cx + head.width * 0.5).round() as i32;
+        let y1 = (head.cy + head.height * 0.5).round() as i32;
+        draw_rect_outline(&mut out, width, height, (x0, y0), (x1, y1), HEAD_RGB, 1);
     }
     if let Some(bar) = lockbar {
         for w in 0..4 {
@@ -3752,11 +3761,11 @@ fn save_rgb_screenshot_at(
     width: u32,
     height: u32,
     rgb888: &[u8],
-    faces: &[face::FaceDetection],
+    heads: &[head::HeadAnchor],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
     u: Option<&u_onnx::UDetection>,
 ) -> Result<(), String> {
-    let painted = bake_overlays(width, height, rgb888, faces, lockbar, u);
+    let painted = bake_overlays(width, height, rgb888, heads, lockbar, u);
     let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
     let writer = std::io::BufWriter::new(file);
     let mut encoder = png::Encoder::new(writer, width, height);
@@ -3779,7 +3788,7 @@ fn save_rgb_screenshot(
     width: u32,
     height: u32,
     rgb888: &[u8],
-    faces: &[face::FaceDetection],
+    heads: &[head::HeadAnchor],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
     u: Option<&u_onnx::UDetection>,
 ) -> Result<std::path::PathBuf, String> {
@@ -3794,7 +3803,7 @@ fn save_rgb_screenshot(
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = dir.join(format!("{slug}_{stamp}.png"));
-    save_rgb_screenshot_at(&path, width, height, rgb888, faces, lockbar, u)?;
+    save_rgb_screenshot_at(&path, width, height, rgb888, heads, lockbar, u)?;
     Ok(path)
 }
 

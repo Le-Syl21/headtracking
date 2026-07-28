@@ -11,7 +11,7 @@ name = "headtracking-demo"
 path = "src/main.rs"
 
 [dependencies]
-face = { path = "../../crates/face" }
+head = { path = "../../crates/head" }
 freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
 u-onnx = { path = "../../crates/u-onnx" }
