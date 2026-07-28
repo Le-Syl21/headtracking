@@ -5,7 +5,7 @@
 //! returned `LoggingPluginAPI*` in an `AtomicPtr`. Every `tracing`
 //! event we emit then runs through [`VpxLogLayer`], which reads the
 //! pointer, formats the event into a UTF-8 C string and calls
-//! `api.Log(level, msg)`.
+//! `api.Log(source, func, line, level, msg)`.
 //!
 //! The bridge is **purely additive**: the existing `tracing_subscriber::fmt`
 //! layer to stderr stays installed, so logs still surface for headless
@@ -13,7 +13,7 @@
 //! lose anything if VPX's logging API is unavailable.
 //!
 //! Threading: VPX's general API contract is "main-thread only", but
-//! the logging callback is plain `Log(level, message)` with no shared
+//! the logging callback is plain `Log(source, func, line, level, message)` with no shared
 //! state we touch — every concrete `LoggingPlugin` impl in upstream
 //! VPX writes to a Mutex-guarded buffer. We treat it as MT-safe and
 //! call it from whichever thread emits the tracing event (tracker
@@ -22,7 +22,7 @@
 //! — but that would gate every log call behind a deferred call and is
 //! a heavy hammer for a debug aid.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fmt::Write;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -32,6 +32,9 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::plugin::vpx_sys::LoggingPluginAPI;
+
+/// Plugin identity handed to VPX as the log line's `source` field.
+const LOG_SOURCE: &CStr = c"HeadTracking";
 
 // LPI_LVL_* — verbatim from `LoggingPlugin.h`.
 const LPI_LVL_DEBUG: u32 = 0x00;
@@ -80,10 +83,6 @@ where
         let level = level_to_lpi(*meta.level());
 
         let mut buf = String::with_capacity(128);
-        // Prefix with the target module so VPX's console shows where
-        // the message came from — the alternative is unreadable in
-        // a busy plugin host.
-        let _ = write!(&mut buf, "[{}] ", meta.target());
         let mut visitor = MessageVisitor(&mut buf);
         event.record(&mut visitor);
 
@@ -93,9 +92,28 @@ where
         if buf.contains('\0') {
             buf = buf.replace('\0', " ");
         }
-        let Ok(c) = CString::new(buf) else { return };
-        // SAFETY: contract per LoggingPlugin.h — `Log(level, NUL-terminated UTF-8)`.
-        unsafe { log_fn(level, c.as_ptr()) };
+        let Ok(message) = CString::new(buf) else {
+            return;
+        };
+
+        // VPX ≥ 2026-06 tags each line with source/func/line itself, so we
+        // hand the tracing target over as `func` (its module path — the
+        // closest thing to a call site we have here) rather than prefixing
+        // the message text.
+        let func = CString::new(meta.target()).unwrap_or_default();
+        let line = meta.line().unwrap_or(0) as i32;
+
+        // SAFETY: contract per LoggingPlugin.h —
+        // Log(source, func, line, level, NUL-terminated UTF-8 message).
+        unsafe {
+            log_fn(
+                LOG_SOURCE.as_ptr(),
+                func.as_ptr(),
+                line,
+                level,
+                message.as_ptr(),
+            );
+        }
     }
 }
 

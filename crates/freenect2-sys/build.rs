@@ -64,6 +64,12 @@ fn main() {
     }
     config
         .profile("Release")
+        // libfreenect2's top-level `cmake_minimum_required` predates 3.5,
+        // which CMake ≥ 4 refuses outright. Vendored source we don't want
+        // to patch, so tell CMake to apply ≥3.5 policies to the old
+        // project. (Env var `CMAKE_POLICY_VERSION_MINIMUM` works too, but
+        // baking it in keeps CI and local builds reproducible.)
+        .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("BUILD_EXAMPLES", "OFF")
         .define("BUILD_OPENNI2_DRIVER", "OFF")
