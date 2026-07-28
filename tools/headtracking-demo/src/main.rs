@@ -2695,7 +2695,7 @@ impl App {
             controls.last_refresh = Instant::now();
         }
 
-        Panel::top("v1-controls").show_inside(ui, |ui| {
+        Panel::top("v1-controls").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Kinect v1").strong());
@@ -2880,7 +2880,7 @@ impl App {
 
         // ----- Top toolbar: one button-only row, then an INPUT row
         // (raw camera measurements) and an OUTPUT row (what VPX consumes).
-        Panel::top("toolbar").show_inside(ui, |ui| {
+        Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
 
             // Row 1 — buttons only.
@@ -3003,7 +3003,7 @@ impl App {
         if self.kinect_access_hint || self.kinect_access_result.is_some() {
             let amber = Color32::from_rgb(0xff, 0xc4, 0x40);
             let mut do_fix = false;
-            Panel::top("kinect-access").show_inside(ui, |ui| {
+            Panel::top("kinect-access").show(ui, |ui| {
                 ui.add_space(3.0);
                 match &self.kinect_access_result {
                     None => {
@@ -3059,7 +3059,7 @@ impl App {
             .resizable(true)
             .default_size(220.0)
             .min_size(80.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.columns(2, |cols| {
                     // Left: tracing event log
@@ -3164,13 +3164,13 @@ impl App {
         // ----- Center: camera feed, with the parallax scene stacked BELOW it
         // (a resizable bottom panel) when enabled — side-by-side ate too much
         // width.
-        CentralPanel::default().show_inside(ui, |ui| {
+        CentralPanel::default().show(ui, |ui| {
             if self.parallax_enabled {
                 Panel::bottom("parallax-view")
                     .resizable(true)
                     .default_size(280.0)
                     .min_size(140.0)
-                    .show_inside(ui, |ui| self.draw_parallax_view(ui));
+                    .show(ui, |ui| self.draw_parallax_view(ui));
             }
             self.draw_camera_view(ui);
         });

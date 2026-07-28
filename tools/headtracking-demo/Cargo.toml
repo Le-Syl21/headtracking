@@ -25,10 +25,10 @@ nalgebra = "0.34"
 # raw_input before egui sees it and the tessellated primitives before the
 # paint — a seam eframe doesn't expose. Needed for the physically-rotated
 # pincab display (270° default, ⟳ button cycles 90°).
-egui = "0.34"
-egui_glow = "0.34"
-egui-winit = { version = "0.34", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
-egui-rotate = "0.1"
+egui = "0.35"
+egui_glow = "0.35"
+egui-winit = { version = "0.35", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui-rotate = "0.1.6"
 glow = "0.17"
 glutin = "0.32"
 glutin-winit = "0.5"
