@@ -835,6 +835,18 @@ impl DemoShell {
         } else {
             transform_raw_input(&mut raw_input, rotation);
         }
+        // Confine the OS pointer to the window while the software cursor is
+        // active, so the hidden OS cursor never escapes and the raw deltas
+        // keep flowing. Applied on state change only (re-armed on focus loss).
+        if use_sw_cursor && !self.app.cursor_grab_applied {
+            self.app.cursor_grab_applied = window
+                .set_cursor_grab(winit::window::CursorGrabMode::Confined)
+                .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Locked))
+                .is_ok();
+        } else if !use_sw_cursor && self.app.cursor_grab_applied {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+            self.app.cursor_grab_applied = false;
+        }
 
         // 2. Run the UI in the (rotated) logical coordinate space. egui
         //    0.34's run_ui hands us a root Ui that the panels nest into.
@@ -901,6 +913,11 @@ impl winit::application::ApplicationHandler for DemoShell {
         };
         let gl = Arc::new(gl);
         gl_window.window().set_visible(true);
+        // Borderless fullscreen on the current monitor — the demo runs on a
+        // dedicated (rotated) pincab screen, so it should own it.
+        gl_window
+            .window()
+            .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
 
         let painter = egui_glow::Painter::new(Arc::clone(&gl), "", None, true)
             .expect("failed to create egui_glow painter");
@@ -938,7 +955,15 @@ impl winit::application::ApplicationHandler for DemoShell {
         }
         if matches!(event, WindowEvent::RedrawRequested) {
             self.redraw();
+            if self.app.should_quit {
+                event_loop.exit();
+            }
             return;
+        }
+        // Losing focus drops any OS cursor grab — re-arm so `redraw` reapplies
+        // it when focus returns.
+        if let WindowEvent::Focused(false) = &event {
+            self.app.cursor_grab_applied = false;
         }
         // Esc toggles the software cursor — the escape hatch back to the plain
         // OS cursor if the virtual one ever misbehaves. (egui still receives
@@ -1691,6 +1716,12 @@ struct App {
     /// the display isn't rotated — the software cursor only earns its keep
     /// on a rotated viewport.
     sw_cursor_on: bool,
+    /// Tracks whether the OS pointer is currently grabbed (confined to the
+    /// window) so we only call `set_cursor_grab` on a state change, not every
+    /// frame. Reset when the window loses focus (the OS drops the grab).
+    cursor_grab_applied: bool,
+    /// Set by the Quit button; [`DemoShell`] exits the event loop next frame.
+    should_quit: bool,
     /// Parallax validation window toggle (🪟 button). When on, the central
     /// panel shows the camera feed with the off-axis 3D scene stacked below
     /// it (see `docs/parallax-validation-window.md`).
@@ -2485,6 +2516,8 @@ impl App {
             software_cursor: SoftwareCursor::new().with_lock(true).with_scale(1.4),
             mouse_delta_accum: egui::Vec2::ZERO,
             sw_cursor_on: true,
+            cursor_grab_applied: false,
+            should_quit: false,
             parallax_enabled: false,
             parallax_tex: None,
             // Auto-orbit by default: the parallax illusion shows immediately
@@ -3023,6 +3056,13 @@ impl App {
                 // the central panel (camera | parallax, side by side).
                 ui.toggle_value(&mut self.parallax_enabled, "🪟 parallax")
                     .on_hover_text("Show the off-axis 3D validation scene below the camera feed");
+                if ui
+                    .button("⏻ quit")
+                    .on_hover_text("Close the demo (fullscreen has no window buttons)")
+                    .clicked()
+                {
+                    self.should_quit = true;
+                }
                 // Screenshot result lives on the bar — it's the button's
                 // own feedback. Cleared on the next click / backend change.
                 if let Some(status) = &self.screenshot_status {
