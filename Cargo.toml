@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/face",
+    "crates/head",
     "crates/freenect-sys",
     "crates/freenect",
     "crates/freenect2-sys",
@@ -39,8 +40,8 @@ default = ["all-trackers"]
 # Each backend pulls the face-detection crate alongside its capture library
 # — every path uses YuNet bbox + face-anchored depth (Kinect) or IOD
 # triangulation (webcam).
-kinect-v1 = ["dep:freenect", "dep:face"]
-kinect-v2 = ["dep:freenect2", "dep:face"]
+kinect-v1 = ["dep:freenect", "dep:face", "dep:head"]
+kinect-v2 = ["dep:freenect2", "dep:face", "dep:head"]
 webcam = ["dep:libloading", "dep:face"]
 all-trackers = ["kinect-v1", "kinect-v2", "webcam"]
 
@@ -58,6 +59,7 @@ thiserror = "2"
 freenect = { path = "crates/freenect", optional = true }
 freenect2 = { path = "crates/freenect2", optional = true }
 face = { path = "crates/face", optional = true }
+head = { path = "crates/head", optional = true }
 # libloading powers the runtime SDL3 lookup for the webcam backend: we
 # resolve symbols against `libSDL3.so` already loaded by VPX, instead of
 # linking SDL3 statically into the plugin and ending up with two SDL3

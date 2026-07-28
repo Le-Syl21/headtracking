@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use freenect2::{Context, DepthFrame, Device};
 
-use super::face_depth::{Intrinsics, bgrx_to_rgb888, head_from_face_depth, pick_largest_face};
+use super::face_depth::{Intrinsics, bgrx_to_rgb888, head_from_region, pick_largest_head};
 use super::{HeadTracker, Pose};
 
 /// Kinect v2 RGB sensor resolution. The colour stream we receive from
@@ -36,15 +36,15 @@ pub struct KinectV2Backend {
     device: Device,
     _ctx: Context,
     intrinsics: Intrinsics,
-    detector: face::Detector,
-    last_faces: Vec<face::FaceDetection>,
+    detector: head::Detector,
+    last_heads: Vec<head::HeadAnchor>,
     started_at: Instant,
 }
 
 impl KinectV2Backend {
     /// Open the first Kinect v2 found on USB and start the depth + colour
     /// streams. Returns an error if no device is connected, libfreenect2
-    /// fails to start, or the YuNet ONNX model can't be loaded into tract.
+    /// fails to start, or the head ONNX model can't be loaded into tract.
     pub fn open() -> Result<Self, Error> {
         let ctx = Context::new()?;
         let count = ctx.enumerate();
@@ -60,7 +60,7 @@ impl KinectV2Backend {
             cx: ir.cx,
             cy: ir.cy,
         };
-        let detector = face::Detector::new()?;
+        let detector = head::Detector::new()?;
         info!(
             n_devices = count,
             fx = intrinsics.fx,
@@ -74,24 +74,27 @@ impl KinectV2Backend {
             _ctx: ctx,
             intrinsics,
             detector,
-            last_faces: Vec::new(),
+            last_heads: Vec::new(),
             started_at: Instant::now(),
         })
     }
 
-    fn refresh_face_from_rgb(&mut self) {
-        // poll_rgb is non-blocking; only re-run YuNet if a fresh frame
-        // arrived. If not, keep the previous detections.
+    fn refresh_head_from_rgb(&mut self) {
+        // poll_rgb is non-blocking; only re-run the head detector if a fresh
+        // frame arrived. If not, keep the previous detections.
         if let Some(rgb) = self.device.poll_rgb() {
             let rgb888 = bgrx_to_rgb888(&rgb.data);
-            self.last_faces = self.detector.detect(&rgb888, rgb.width, rgb.height);
+            self.last_heads = self.detector.detect(&rgb888, rgb.width, rgb.height);
         }
     }
 
     fn frame_to_pose(&self, frame: &DepthFrame) -> Option<Pose> {
-        let face = pick_largest_face(&self.last_faces)?;
-        let xyz = head_from_face_depth(
-            face,
+        let head = pick_largest_head(&self.last_heads)?;
+        let xyz = head_from_region(
+            head.cx,
+            head.cy,
+            head.width,
+            head.height,
             RGB_W,
             RGB_H,
             &frame.data,
@@ -102,14 +105,14 @@ impl KinectV2Backend {
         Some(Pose {
             position_mm: xyz,
             timestamp_us: self.started_at.elapsed().as_micros() as u64,
-            confidence: face.confidence.clamp(0.0, 1.0),
+            confidence: head.confidence.clamp(0.0, 1.0),
         })
     }
 }
 
 impl HeadTracker for KinectV2Backend {
     fn poll(&mut self) -> Option<Pose> {
-        self.refresh_face_from_rgb();
+        self.refresh_head_from_rgb();
         let frame = self.device.poll_depth()?;
         self.frame_to_pose(&frame)
     }
@@ -126,12 +129,12 @@ impl HeadTracker for KinectV2Backend {
 }
 
 /// Errors returned by [`KinectV2Backend::open`]. Consolidates the libfreenect2
-/// failure modes with the YuNet model load path so the session thread has
+/// failure modes with the head model load path so the session thread has
 /// a single error type to surface in logs.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("libfreenect2: {0}")]
     Freenect2(#[from] freenect2::Error),
-    #[error("face detector init: {0}")]
-    Face(#[from] face::Error),
+    #[error("head detector init: {0}")]
+    Head(#[from] head::Error),
 }

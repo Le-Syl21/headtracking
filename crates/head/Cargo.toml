@@ -1,0 +1,17 @@
+[package]
+name = "head"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Head detector — YOLOv8/v11 single-class head ONNX run through pure-Rust tract inference"
+publish = false
+
+[dependencies]
+# Same pure-Rust ONNX paradigm as `u-onnx`/`face`: tract, no native ONNX
+# Runtime to ship. Model is a YOLOv8/v11 head detector at 640×640, single
+# class `head`, raw output0 `[1, 5, 8400]` = `[cx, cy, w, h, score]`
+# (i.e. `u.onnx` without the 32 mask channels). No embedded NMS.
+tract-onnx = { version = "0.22", default-features = false }
+image = { version = "0.25", default-features = false }
+thiserror = "2"
+tracing = "0.1"

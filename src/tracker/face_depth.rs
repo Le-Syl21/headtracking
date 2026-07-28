@@ -26,6 +26,17 @@ pub fn pick_largest_face(faces: &[face::FaceDetection]) -> Option<&face::FaceDet
     })
 }
 
+/// Pick the largest detected head by box area — the head detector's equivalent
+/// of [`pick_largest_face`]. On a pincab the largest head is the one closest to
+/// the sensor, almost always the player. `None` if `heads` is empty.
+pub fn pick_largest_head(heads: &[head::HeadAnchor]) -> Option<&head::HeadAnchor> {
+    heads.iter().max_by(|a, b| {
+        (a.width * a.height)
+            .partial_cmp(&(b.width * b.height))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
 /// Camera intrinsics for the depth (IR) sensor.
 #[derive(Clone, Copy)]
 pub struct Intrinsics {
@@ -35,20 +46,32 @@ pub struct Intrinsics {
     pub cy: f32,
 }
 
-/// Sample depth at the face bbox and deproject through the IR intrinsics.
+/// Sample depth around a head region centre and deproject through the IR
+/// intrinsics. Model-independent: the caller passes the region centre
+/// `(cx, cy)` and size `(width, height)` in RGB pixels, whatever detector
+/// produced it (face bbox today, head bbox once the trackers switch to
+/// crate `head`). This is the core the geometry hangs on; only the input
+/// framing changes with the model.
 ///
 /// The (rgb_w, rgb_h) → (depth_w, depth_h) mapping is a naive linear
 /// rescale. Kinect v1 has the same 640×480 grid for both sensors so the
 /// mapping is identity; Kinect v2 has 1920×1080 RGB and 512×424 depth
 /// with a small physical parallax. The window we sample is wide enough
-/// (face_size × 0.4 in each direction) that a few-pixel parallax error
-/// stays inside the bbox, so the median is unaffected.
+/// (region_size × 0.4 in each direction) that a few-pixel parallax error
+/// stays inside the box, so the median is unaffected.
 ///
 /// Returns `[x_mm, y_mm, z_mm]` in the IR camera frame, or `None` if
-/// fewer than 16 valid depth samples land inside the bbox window (face
-/// off-frame, occlusion, or face detected but no depth coverage).
-pub fn head_from_face_depth(
-    face: &face::FaceDetection,
+/// fewer than 16 valid depth samples land inside the window (region
+/// off-frame, occlusion, or detected but no depth coverage).
+// The region (cx, cy, w, h), the depth frame (buf + dims), and the
+// intrinsics are all genuinely distinct inputs; bundling them into a
+// struct just to satisfy the arg count would obscure the call sites.
+#[allow(clippy::too_many_arguments)]
+pub fn head_from_region(
+    cx: f32,
+    cy: f32,
+    width: f32,
+    height: f32,
     rgb_w: u32,
     rgb_h: u32,
     depth: &[f32],
@@ -61,23 +84,21 @@ pub fn head_from_face_depth(
     }
     let scale_x = depth_w as f32 / rgb_w as f32;
     let scale_y = depth_h as f32 / rgb_h as f32;
-    let face_cx = face.x + face.width * 0.5;
-    let face_cy = face.y + face.height * 0.5;
-    let depth_cx = face_cx * scale_x;
-    let depth_cy = face_cy * scale_y;
-    let half_w = ((face.width * 0.4 * scale_x) as i32).clamp(4, 24);
-    let half_h = ((face.height * 0.4 * scale_y) as i32).clamp(4, 24);
-    let cx = depth_cx as i32;
-    let cy = depth_cy as i32;
+    let depth_cx = cx * scale_x;
+    let depth_cy = cy * scale_y;
+    let half_w = ((width * 0.4 * scale_x) as i32).clamp(4, 24);
+    let half_h = ((height * 0.4 * scale_y) as i32).clamp(4, 24);
+    let depth_ix = depth_cx as i32;
+    let depth_iy = depth_cy as i32;
     let mut samples: Vec<f32> = Vec::with_capacity(((2 * half_w + 1) * (2 * half_h + 1)) as usize);
     for dv in -half_h..=half_h {
-        let v = cy + dv;
+        let v = depth_iy + dv;
         if v < 0 || v >= depth_h as i32 {
             continue;
         }
         let row = (v as usize) * depth_w as usize;
         for du in -half_w..=half_w {
-            let u = cx + du;
+            let u = depth_ix + du;
             if u < 0 || u >= depth_w as i32 {
                 continue;
             }
@@ -98,6 +119,32 @@ pub fn head_from_face_depth(
     let y_mm = (f64::from(depth_cy - intr.cy) * zf / f64::from(intr.fy)) as f32;
 
     Some([x_mm, y_mm, z_mm])
+}
+
+/// Face-detector adapter over [`head_from_region`]: samples depth at the
+/// face bbox centre. Kept so the current YuNet/Ultraface trackers are
+/// untouched while the head detector (crate `head`) is wired in behind it.
+pub fn head_from_face_depth(
+    face: &face::FaceDetection,
+    rgb_w: u32,
+    rgb_h: u32,
+    depth: &[f32],
+    depth_w: u32,
+    depth_h: u32,
+    intr: &Intrinsics,
+) -> Option<[f32; 3]> {
+    head_from_region(
+        face.x + face.width * 0.5,
+        face.y + face.height * 0.5,
+        face.width,
+        face.height,
+        rgb_w,
+        rgb_h,
+        depth,
+        depth_w,
+        depth_h,
+        intr,
+    )
 }
 
 /// Pack a Kinect v2 BGRX colour frame (4 bytes per pixel, X channel
@@ -151,6 +198,29 @@ mod tests {
     fn empty_face_list_returns_none() {
         let faces: Vec<face::FaceDetection> = Vec::new();
         assert!(pick_largest_face(&faces).is_none());
+    }
+
+    #[test]
+    fn head_from_region_centred_matches_wrapper() {
+        // Region centre (50,50) on a constant-1000mm 100×100 grid → same
+        // result as the face wrapper: x≈y≈0, z=1000.
+        let depth: Vec<f32> = vec![1000.0; 100 * 100];
+        let intr = Intrinsics {
+            fx: 200.0,
+            fy: 200.0,
+            cx: 50.0,
+            cy: 50.0,
+        };
+        let p =
+            head_from_region(50.0, 50.0, 20.0, 20.0, 100, 100, &depth, 100, 100, &intr).unwrap();
+        assert!(p[0].abs() < 0.5);
+        assert!(p[1].abs() < 0.5);
+        assert!((p[2] - 1000.0).abs() < 0.1);
+
+        // Wrapper must agree exactly with the region call it delegates to.
+        let face = fd(40.0, 40.0, 20.0, 20.0); // centre (50,50)
+        let q = head_from_face_depth(&face, 100, 100, &depth, 100, 100, &intr).unwrap();
+        assert_eq!(p, q);
     }
 
     #[test]

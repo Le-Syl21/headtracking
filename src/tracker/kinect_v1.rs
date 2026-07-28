@@ -15,11 +15,11 @@ use tracing::{info, warn};
 
 use freenect::{CX, CY, Context, DEPTH_HEIGHT, DEPTH_WIDTH, DepthFrame, Device, FX, FY};
 
-use super::face_depth::{Intrinsics, head_from_face_depth, pick_largest_face};
+use super::face_depth::{Intrinsics, head_from_region, pick_largest_head};
 use super::{HeadTracker, Pose};
 
 /// Kinect v1 RGB and depth share the same 640×480 grid (different sensors,
-/// same factory framing); the linear rescale in `head_from_face_depth`
+/// same factory framing); the linear rescale in `head_from_region`
 /// becomes identity.
 const RGB_W: u32 = DEPTH_WIDTH;
 const RGB_H: u32 = DEPTH_HEIGHT;
@@ -29,8 +29,8 @@ pub struct KinectV1Backend {
     device: Device,
     _ctx: Context,
     intrinsics: Intrinsics,
-    detector: face::Detector,
-    last_faces: Vec<face::FaceDetection>,
+    detector: head::Detector,
+    last_heads: Vec<head::HeadAnchor>,
     last_depth: Vec<f32>,
     started_at: Instant,
 }
@@ -44,7 +44,7 @@ impl KinectV1Backend {
         }
         let mut device = ctx.open(0)?;
         device.start()?;
-        let detector = face::Detector::new()?;
+        let detector = head::Detector::new()?;
         info!(
             n_devices = count,
             fx = FX,
@@ -63,16 +63,16 @@ impl KinectV1Backend {
                 cy: CY,
             },
             detector,
-            last_faces: Vec::new(),
+            last_heads: Vec::new(),
             last_depth: Vec::new(),
             started_at: Instant::now(),
         })
     }
 
-    fn refresh_face_from_rgb(&mut self) {
+    fn refresh_head_from_rgb(&mut self) {
         if let Some(rgb) = self.device.poll_rgb() {
             // libfreenect's RGB stream is already RGB888 at 640×480.
-            self.last_faces = self.detector.detect(&rgb.data, rgb.width, rgb.height);
+            self.last_heads = self.detector.detect(&rgb.data, rgb.width, rgb.height);
         }
     }
 
@@ -87,9 +87,12 @@ impl KinectV1Backend {
         self.last_depth
             .extend(frame.data.iter().map(|&z| f32::from(z)));
 
-        let face = pick_largest_face(&self.last_faces)?;
-        let xyz = head_from_face_depth(
-            face,
+        let head = pick_largest_head(&self.last_heads)?;
+        let xyz = head_from_region(
+            head.cx,
+            head.cy,
+            head.width,
+            head.height,
             RGB_W,
             RGB_H,
             &self.last_depth,
@@ -100,14 +103,14 @@ impl KinectV1Backend {
         Some(Pose {
             position_mm: xyz,
             timestamp_us: self.started_at.elapsed().as_micros() as u64,
-            confidence: face.confidence.clamp(0.0, 1.0),
+            confidence: head.confidence.clamp(0.0, 1.0),
         })
     }
 }
 
 impl HeadTracker for KinectV1Backend {
     fn poll(&mut self) -> Option<Pose> {
-        self.refresh_face_from_rgb();
+        self.refresh_head_from_rgb();
         let frame = self.device.poll_depth()?;
         self.frame_to_pose(&frame)
     }
@@ -127,6 +130,6 @@ impl HeadTracker for KinectV1Backend {
 pub enum Error {
     #[error("libfreenect: {0}")]
     Freenect(#[from] freenect::Error),
-    #[error("face detector init: {0}")]
-    Face(#[from] face::Error),
+    #[error("head detector init: {0}")]
+    Head(#[from] head::Error),
 }

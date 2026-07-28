@@ -1320,14 +1320,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "head"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "thiserror 2.0.18",
+ "tracing",
+ "tract-onnx",
+]
+
+[[package]]
 name = "headtracking"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "arc-swap",
  "bindgen",
  "face",
  "freenect",
  "freenect2",
+ "head",
  "libloading 0.9.0",
  "nalgebra",
  "os_info",
@@ -1810,26 +1821,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
-]
-
-[[package]]
-name = "lockbar-onnx"
-version = "0.1.0"
-dependencies = [
- "image",
- "thiserror 2.0.18",
- "tracing",
- "tract-onnx",
-]
-
-[[package]]
-name = "lockbar-replay"
-version = "0.1.0"
-dependencies = [
- "lockbar-onnx",
- "png",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
