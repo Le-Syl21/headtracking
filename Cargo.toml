@@ -20,7 +20,7 @@ repository = "https://github.com/Le-Syl21/headtracking"
 
 [package]
 name = "headtracking"
-version = "0.0.24"
+version = "0.0.25"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -37,9 +37,10 @@ crate-type = ["cdylib", "rlib"]
 # setting (Auto / Kinect v2 / Kinect v1 / Webcam) selects which one is used,
 # with Auto walking a v2 → v1 → webcam fallback chain.
 default = ["all-trackers"]
-# Each backend pulls the face-detection crate alongside its capture library
-# — every path uses YuNet bbox + face-anchored depth (Kinect) or IOD
-# triangulation (webcam).
+# Kinect paths track the head (crate `head`, embedded SCUT-HEAD nano) and
+# anchor depth on its box; the webcam path stays on YuNet face landmarks for
+# IOD triangulation. `face` is still pulled on the Kinect features for the
+# hand-fiducial calibration step, which keys off eye/nose landmarks.
 kinect-v1 = ["dep:freenect", "dep:face", "dep:head"]
 kinect-v2 = ["dep:freenect2", "dep:face", "dep:head"]
 webcam = ["dep:libloading", "dep:face"]
