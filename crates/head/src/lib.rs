@@ -28,10 +28,15 @@ use image::imageops::FilterType;
 use image::{ImageBuffer, Rgb};
 use tract_onnx::prelude::*;
 
-/// Square model input side (Ultralytics default).
-pub const MODEL_SIDE: usize = 640;
-/// Anchors emitted across the 3 FPN scales: 80² + 40² + 20².
-const NUM_ANCHORS: usize = 8_400;
+/// Square model input side. YOLOv8 is fully convolutional, but an Ultralytics
+/// ONNX export bakes the input size and the anchor-grid reshape in, so this
+/// must match the export's `imgsz` (see [`NUM_ANCHORS`]). 320 trades a little
+/// accuracy for ~3-4× faster CPU inference vs 640.
+pub const MODEL_SIDE: usize = 320;
+/// Anchors emitted across the 3 FPN scales (strides 8/16/32), derived from
+/// [`MODEL_SIDE`]: `(S/8)² + (S/16)² + (S/32)²` — 8400 at 640, 2100 at 320.
+const NUM_ANCHORS: usize =
+    (MODEL_SIDE / 8).pow(2) + (MODEL_SIDE / 16).pow(2) + (MODEL_SIDE / 32).pow(2);
 /// Per-anchor channels of a single-class detect head: `[cx, cy, w, h, score]`.
 const DET_CHANNELS: usize = 5;
 
