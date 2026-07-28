@@ -1078,6 +1078,9 @@ fn poll_active_headless(active: &mut Active) {
                 update_u(
                     &mut active.u_detector,
                     &mut active.u_last_run_at,
+                    &mut active.u_first_detection_at,
+                    &mut active.u_locked,
+                    &mut active.u_best_conf,
                     &mut active.last_lockbar,
                     &mut active.last_u,
                     &rgb888,
@@ -1095,6 +1098,9 @@ fn poll_active_headless(active: &mut Active) {
                 update_u(
                     &mut active.u_detector,
                     &mut active.u_last_run_at,
+                    &mut active.u_first_detection_at,
+                    &mut active.u_locked,
+                    &mut active.u_best_conf,
                     &mut active.last_lockbar,
                     &mut active.last_u,
                     &rgb.data,
@@ -1112,6 +1118,9 @@ fn poll_active_headless(active: &mut Active) {
                 update_u(
                     &mut active.u_detector,
                     &mut active.u_last_run_at,
+                    &mut active.u_first_detection_at,
+                    &mut active.u_locked,
+                    &mut active.u_best_conf,
                     &mut active.last_lockbar,
                     &mut active.last_u,
                     &rgb.data,
@@ -1698,6 +1707,16 @@ struct Active {
     u_detector: Option<u_onnx::UDetector>,
     /// `Some(Instant)` when [`update_u`] last ran — throttles inference.
     u_last_run_at: Option<Instant>,
+    /// `Some(Instant)` of the first successful U detection. The warmup
+    /// window is timed from here; on expiry the best one gets frozen.
+    u_first_detection_at: Option<Instant>,
+    /// `true` once warmup completed and the U was frozen to its
+    /// highest-confidence detection. While locked, [`update_u`] is a
+    /// no-op — CPU goes to the head-tracking thread.
+    u_locked: bool,
+    /// Highest U-seg confidence seen since the backend opened. A new
+    /// detection overwrites the frozen one only when it beats this.
+    u_best_conf: f32,
     /// egui texture holding the translucent U mask overlay (160×160 proto
     /// grid), rebuilt by [`refresh_u_overlay`] each frame a U exists.
     u_mask_texture: Option<TextureHandle>,
@@ -1719,33 +1738,53 @@ struct Active {
 /// the ~300 ms tract cost on every frame.
 const U_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(1500);
 
-/// Run the YOLOv11n-seg "U" detector on the latest RGB frame and refresh
-/// the raw `last_u` mask plus the `last_lockbar` quad derived from it.
+/// Window between the first successful U detection and freezing the best
+/// one — at ~1.5 s cadence we collect 3-4 candidate masks and keep the
+/// highest-confidence one. After this elapses, [`update_u`] stops running
+/// until a backend switch reopens `Active`.
+const U_WARMUP_DURATION: Duration = Duration::from_secs(5);
+
+/// Run the YOLOv11n-seg "U" detector on the latest RGB frame and update
+/// the raw `last_u` mask plus the `last_lockbar` quad derived from it,
+/// using a best-of-warmup auto-lock strategy:
 ///
-/// Throttled to [`U_RECOMPUTE_INTERVAL`] so the tract inference doesn't pace
-/// the UI thread, but it keeps running for the whole session and adopts the
-/// latest above-threshold detection every round — so the lockbar follows if
-/// the camera / cabinet moves and recovers after a brief loss. If a round
-/// finds nothing (below threshold) the previous quad is kept, so short
-/// dropouts don't flicker the overlay.
+///  1. Skip entirely when `*locked` is true (calibration frozen).
+///  2. Otherwise throttle to [`U_RECOMPUTE_INTERVAL`] so the ~300 ms
+///     tract inference doesn't pace the UI thread.
+///  3. Run inference. If the best U beats `*best_conf`, store it in
+///     `*last_u` and re-derive `*last_lockbar` from its closed edge
+///     (see [`u_to_lockbar_quad`]) — keeps the cleanest U seen so far.
+///  4. The warmup clock starts at the *first* successful detection
+///     (`*first_detection_at`). When [`U_WARMUP_DURATION`] elapses past
+///     that instant, flip `*locked = true` so the detector goes silent.
 ///
-/// (An earlier best-of-warmup auto-lock froze the calibration after ~5 s to
-/// save CPU; on the Kinect v1 / webcam — where the first rounds often miss —
-/// that left the U stuck with no lock and never following the view.)
+/// The playfield doesn't move once the camera is mounted, so this gives
+/// us 3-4 inference rounds to pick the cleanest U, then frees the CPU for
+/// head tracking. No user button — pure auto.
 ///
 /// Takes the relevant `Active` fields by `&mut` (rather than
 /// `&mut Active`) so the call site can keep `&mut active.inner` alive
 /// simultaneously — the borrow checker can split disjoint fields, but not
-/// from inside a `match &mut active.inner` arm.
+/// from inside a `match &mut active.inner` arm. The param count trips
+/// clippy's `too_many_arguments`; wrapping them in a struct would force
+/// every read site to indirect, more churn than the lint avoids — narrow
+/// `#[allow]` instead.
+#[allow(clippy::too_many_arguments)]
 fn update_u(
     detector: &mut Option<u_onnx::UDetector>,
     last_run_at: &mut Option<Instant>,
+    first_detection_at: &mut Option<Instant>,
+    locked: &mut bool,
+    best_conf: &mut f32,
     last_lockbar: &mut Option<headtracking::calibration::LockbarQuadRgb>,
     last_u: &mut Option<u_onnx::UDetection>,
     rgb888: &[u8],
     w: u32,
     h: u32,
 ) {
+    if *locked {
+        return;
+    }
     let now = Instant::now();
     if let Some(last) = *last_run_at
         && now.duration_since(last) < U_RECOMPUTE_INTERVAL
@@ -1757,7 +1796,10 @@ fn update_u(
             Ok(mut d) => {
                 // Lower the acceptance score below the 0.25 default: the lockbar
                 // reads weakly on the Kinect v1's 640×480 RGB (vs v2's 1080p), so
-                // the default never fired on v1. 0.10 admits the weaker detection.
+                // the default never detected on v1 — and the warmup-lock only
+                // freezes *after* a first detection, so it stayed unlocked and
+                // kept scanning forever. 0.10 lets v1 lock during warmup as
+                // designed; on v2 the strong lockbar still wins the best-of.
                 d.set_score_threshold(0.10);
                 info!("U-seg detector initialised (score_threshold=0.10)");
                 *detector = Some(d);
@@ -1771,16 +1813,29 @@ fn update_u(
     }
     let det = detector.as_ref().expect("init checked above");
     *last_run_at = Some(now);
-    // `detect` returns survivors highest-confidence first; on a single cabinet
-    // there's at most one. Adopt the latest one each round (no monotonic
-    // best-of-warmup gate) so the overlay follows the current view.
+    // `detect` returns survivors highest-confidence first; on a single
+    // cabinet there's at most one, so take the best.
     if let Some(best) = det.detect(rgb888, w, h).into_iter().next() {
-        // Derive the lockbar (closed edge of the U); keep the previous quad
-        // if extraction degenerates this round.
-        if let Some(quad) = u_to_lockbar_quad(&best, det.mask_threshold(), w, h) {
-            *last_lockbar = Some(quad);
+        if best.confidence > *best_conf {
+            *best_conf = best.confidence;
+            // Derive the lockbar (closed edge of the U) for the existing
+            // 3D-centre maths; keep the old quad if extraction degenerates.
+            if let Some(quad) = u_to_lockbar_quad(&best, det.mask_threshold(), w, h) {
+                *last_lockbar = Some(quad);
+            }
+            *last_u = Some(best);
+            info!(conf = *best_conf, "U: new best detection");
         }
-        *last_u = Some(best);
+        if first_detection_at.is_none() {
+            *first_detection_at = Some(now);
+        }
+    }
+    // Warmup expired? Freeze the current best.
+    if let Some(first) = *first_detection_at
+        && now.duration_since(first) >= U_WARMUP_DURATION
+    {
+        *locked = true;
+        info!(best_conf = *best_conf, "U: warmup over, calibration locked");
     }
 }
 
@@ -2320,6 +2375,9 @@ impl App {
                     update_u(
                         &mut active.u_detector,
                         &mut active.u_last_run_at,
+                        &mut active.u_first_detection_at,
+                        &mut active.u_locked,
+                        &mut active.u_best_conf,
                         &mut active.last_lockbar,
                         &mut active.last_u,
                         &rgb888,
@@ -2366,6 +2424,9 @@ impl App {
                     update_u(
                         &mut active.u_detector,
                         &mut active.u_last_run_at,
+                        &mut active.u_first_detection_at,
+                        &mut active.u_locked,
+                        &mut active.u_best_conf,
                         &mut active.last_lockbar,
                         &mut active.last_u,
                         &rgb.data,
@@ -2426,6 +2487,9 @@ impl App {
                     update_u(
                         &mut active.u_detector,
                         &mut active.u_last_run_at,
+                        &mut active.u_first_detection_at,
+                        &mut active.u_locked,
+                        &mut active.u_best_conf,
                         &mut active.last_lockbar,
                         &mut active.last_u,
                         &rgb.data,
@@ -3199,8 +3263,11 @@ impl App {
         let dx = head.x_mm - lb.x;
         let dy = head.y_mm - lb.y;
         let dz = head.depth_mm - lb.z;
-        // A lockbar quad exists this frame → the U is currently tracking.
-        let (tag, color) = ("U live", Color32::LIGHT_GREEN);
+        let (tag, color) = if active.u_locked {
+            ("locked", Color32::LIGHT_GREEN)
+        } else {
+            ("warmup", Color32::LIGHT_YELLOW)
+        };
         ui.label(
             RichText::new(format!(
                 "→ VPX   ΔX {dx:+.0}   ΔY {dy:+.0}   ΔZ {dz:+.0} mm   [{tag}]"
@@ -3387,6 +3454,9 @@ fn open_kinect_v2() -> Result<Active, String> {
         last_u: None,
         u_detector: None,
         u_last_run_at: None,
+        u_first_detection_at: None,
+        u_locked: false,
+        u_best_conf: 0.0,
         u_mask_texture: None,
         head_detector: detector,
         last_heads: Vec::new(),
@@ -3453,6 +3523,9 @@ fn open_kinect_v1() -> Result<Active, String> {
         last_u: None,
         u_detector: None,
         u_last_run_at: None,
+        u_first_detection_at: None,
+        u_locked: false,
+        u_best_conf: 0.0,
         u_mask_texture: None,
         head_detector: detector,
         last_heads: Vec::new(),
@@ -3505,6 +3578,9 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         last_u: None,
         u_detector: None,
         u_last_run_at: None,
+        u_first_detection_at: None,
+        u_locked: false,
+        u_best_conf: 0.0,
         u_mask_texture: None,
         head_detector: detector,
         last_heads: Vec::new(),
