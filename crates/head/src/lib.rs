@@ -30,11 +30,14 @@ use tract_onnx::prelude::*;
 
 /// Square model input side. YOLOv8 is fully convolutional, but an Ultralytics
 /// ONNX export bakes the input size and the anchor-grid reshape in, so this
-/// must match the export's `imgsz` (see [`NUM_ANCHORS`]). 320 trades a little
-/// accuracy for ~3-4× faster CPU inference vs 640.
-pub const MODEL_SIDE: usize = 320;
+/// must match the export's `imgsz` (see [`NUM_ANCHORS`]). Default 224: on a
+/// pincab the player's head fills much of the frame, so the accuracy cost over
+/// 320 is small while inference is ~2× faster (≈30 ms vs ≈61 ms on the cab
+/// CPU), enough for ~30 fps tracking.
+pub const MODEL_SIDE: usize = 224;
 /// Anchors emitted across the 3 FPN scales (strides 8/16/32), derived from
-/// [`MODEL_SIDE`]: `(S/8)² + (S/16)² + (S/32)²` — 8400 at 640, 2100 at 320.
+/// [`MODEL_SIDE`]: `(S/8)² + (S/16)² + (S/32)²` — 8400 at 640, 2100 at 320,
+/// 1029 at 224.
 const NUM_ANCHORS: usize =
     (MODEL_SIDE / 8).pow(2) + (MODEL_SIDE / 16).pow(2) + (MODEL_SIDE / 32).pow(2);
 /// Per-anchor channels of a single-class detect head: `[cx, cy, w, h, score]`.
