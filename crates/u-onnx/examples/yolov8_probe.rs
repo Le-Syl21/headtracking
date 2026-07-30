@@ -34,7 +34,7 @@ fn main() -> TractResult<()> {
     let outputs = model.run(tvec!(input.into()))?;
     eprintln!("OK: ran in {:?}", t1.elapsed());
 
-    let view = outputs[0].to_array_view::<f32>()?;
+    let view = outputs[0].to_plain_array_view::<f32>()?;
     eprintln!("output shape = {:?}", view.shape());
     // For a head-only model this would be [1, 5, 8400] and the decode is
     // u-onnx's, truncated to the first 5 channels (no mask planes).

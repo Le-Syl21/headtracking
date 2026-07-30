@@ -131,7 +131,7 @@ pub enum Error {
     ModelLoad(String),
 }
 
-type RunModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type RunModel = TypedRunnableModel;
 
 pub struct UDetector {
     model: Arc<RunModel>,
@@ -154,7 +154,7 @@ impl UDetector {
             .into_runnable()
             .map_err(|e| Error::ModelLoad(format!("into_runnable: {e}")))?;
         Ok(Self {
-            model: Arc::new(runnable),
+            model: runnable,
             score_threshold: DEFAULT_SCORE_THRESHOLD,
             nms_iou_threshold: DEFAULT_NMS_IOU_THRESHOLD,
             mask_threshold: DEFAULT_MASK_THRESHOLD,
@@ -199,7 +199,7 @@ impl UDetector {
         let mut det_idx = None;
         let mut proto_idx = None;
         for (i, out) in outputs.iter().enumerate() {
-            if let Ok(view) = out.to_array_view::<f32>() {
+            if let Ok(view) = out.to_plain_array_view::<f32>() {
                 match view.len() {
                     n if n == DET_CHANNELS * NUM_ANCHORS => det_idx = Some(i),
                     n if n == NUM_MASK * PROTO_SIDE * PROTO_SIDE => proto_idx = Some(i),
@@ -214,10 +214,10 @@ impl UDetector {
         // Bind the views to locals so their backing slices outlive the
         // decode below (a slice borrowed from a temporary view wouldn't).
         let det_view = outputs[det_idx]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .expect("checked above");
         let proto_view = outputs[proto_idx]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .expect("checked above");
         let (Some(det), Some(proto)) = (det_view.as_slice(), proto_view.as_slice()) else {
             tracing::warn!("U-seg ONNX output: tensors not contiguous");

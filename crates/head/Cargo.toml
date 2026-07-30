@@ -11,7 +11,7 @@ publish = false
 # Runtime to ship. Model is a YOLOv8/v11 head detector at 640×640, single
 # class `head`, raw output0 `[1, 5, 8400]` = `[cx, cy, w, h, score]`
 # (i.e. `u.onnx` without the 32 mask channels). No embedded NMS.
-tract-onnx = { version = "0.22", default-features = false }
+tract-onnx = { version = "0.23", default-features = false }
 image = { version = "0.25", default-features = false }
 thiserror = "2"
 tracing = "0.1"

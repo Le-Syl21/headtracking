@@ -103,7 +103,7 @@ const DEFAULT_SCORE_THRESHOLD: f32 = 0.6;
 const DEFAULT_NMS_THRESHOLD: f32 = 0.3;
 
 #[allow(dead_code)]
-type RunModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type RunModel = TypedRunnableModel;
 
 /// Hand detector instance. Cheap to construct (one ONNX graph load),
 /// expected to be reused across frames.

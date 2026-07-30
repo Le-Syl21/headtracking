@@ -11,7 +11,7 @@ publish = false
 # native ONNX Runtime to ship. The model is YOLOv11n-seg at 640×640
 # (single class `u`): output0 `[1,37,8400]` (4 box + 1 score + 32 mask
 # coeffs) and output1 `[1,32,160,160]` (32 mask prototypes).
-tract-onnx = { version = "0.22", default-features = false }
+tract-onnx = { version = "0.23", default-features = false }
 image = { version = "0.25", default-features = false }
 thiserror = "2"
 tracing = "0.1"

@@ -30,14 +30,16 @@ use tract_onnx::prelude::*;
 
 /// Square model input side. YOLOv8 is fully convolutional, but an Ultralytics
 /// ONNX export bakes the input size and the anchor-grid reshape in, so this
-/// must match the export's `imgsz` (see [`NUM_ANCHORS`]). Default 224: on a
-/// pincab the player's head fills much of the frame, so the accuracy cost over
-/// 320 is small while inference is ~2× faster (≈30 ms vs ≈61 ms on the cab
-/// CPU), enough for ~30 fps tracking.
-pub const MODEL_SIDE: usize = 224;
+/// must match the export's `imgsz` (see [`NUM_ANCHORS`]). Default 128: on a
+/// pincab the player's head fills much of the frame, so the accuracy cost of
+/// the smallest input is negligible, and 128 keeps a full 60 Hz *even with the
+/// detect overhead* — ≈10 ms inference (≈13.5 ms full detect) on the cab CPU
+/// (160 ≈15, 224 ≈30, 320 ≈61 ms). Run on its own worker thread it delivers a
+/// fresh head well within every 60 Hz frame.
+pub const MODEL_SIDE: usize = 128;
 /// Anchors emitted across the 3 FPN scales (strides 8/16/32), derived from
 /// [`MODEL_SIDE`]: `(S/8)² + (S/16)² + (S/32)²` — 8400 at 640, 2100 at 320,
-/// 1029 at 224.
+/// 1029 at 224, 525 at 160, 336 at 128.
 const NUM_ANCHORS: usize =
     (MODEL_SIDE / 8).pow(2) + (MODEL_SIDE / 16).pow(2) + (MODEL_SIDE / 32).pow(2);
 /// Per-anchor channels of a single-class detect head: `[cx, cy, w, h, score]`.
@@ -105,7 +107,7 @@ pub enum Error {
     ModelIo(#[from] std::io::Error),
 }
 
-type RunModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type RunModel = TypedRunnableModel;
 
 pub struct Detector {
     model: Arc<RunModel>,
@@ -147,7 +149,7 @@ impl Detector {
             .into_runnable()
             .map_err(|e| Error::ModelLoad(format!("into_runnable: {e}")))?;
         Ok(Self {
-            model: Arc::new(runnable),
+            model: runnable,
             score_threshold: DEFAULT_SCORE_THRESHOLD,
             nms_iou_threshold: DEFAULT_NMS_IOU_THRESHOLD,
         })
@@ -186,7 +188,7 @@ impl Detector {
         // Single output `[1, 5, 8400]`; locate it by element count so a
         // stray metadata output doesn't matter.
         let det_view = outputs.iter().find_map(|o| {
-            let v = o.to_array_view::<f32>().ok()?;
+            let v = o.to_plain_array_view::<f32>().ok()?;
             (v.len() == DET_CHANNELS * NUM_ANCHORS).then_some(v)
         });
         let Some(det_view) = det_view else {

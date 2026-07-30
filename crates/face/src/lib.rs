@@ -73,7 +73,7 @@ pub struct FaceDetection {
     pub mouth_left_y: f32,
 }
 
-type RunModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type RunModel = TypedRunnableModel;
 
 pub struct Detector {
     model: Arc<RunModel>,
@@ -99,7 +99,7 @@ impl Detector {
             .into_runnable()
             .map_err(|e| Error::ModelLoad(format!("into_runnable: {e}")))?;
         Ok(Self {
-            model: Arc::new(runnable),
+            model: runnable,
             scores_idx,
             boxes_idx,
             score_threshold: DEFAULT_SCORE_THRESHOLD,
@@ -155,11 +155,11 @@ impl Detector {
             }
         };
 
-        let scores_view = match outputs[self.scores_idx].to_array_view::<f32>() {
+        let scores_view = match outputs[self.scores_idx].to_plain_array_view::<f32>() {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let boxes_view = match outputs[self.boxes_idx].to_array_view::<f32>() {
+        let boxes_view = match outputs[self.boxes_idx].to_plain_array_view::<f32>() {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
