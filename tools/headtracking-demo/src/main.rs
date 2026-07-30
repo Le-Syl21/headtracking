@@ -52,11 +52,8 @@ const LOG_BUFFER_LINES: usize = 1_000;
 // bright playfield reflections and dark cabinet interiors).
 const HEAD_COLOR: Color32 = Color32::from_rgb(0xff, 0x60, 0x60);
 const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
-/// Straight-alpha RGBA for the U mask overlay fill (cyan, ~43 % opacity).
-const U_MASK_RGBA: [u8; 4] = [0x00, 0xe5, 0xff, 110];
-/// Probability cut for "this pixel is inside the U" — matches the
-/// detector's default mask threshold.
-const U_MASK_THR: f32 = 0.5;
+/// Sidebars (playfield rails) — orange, distinct from the cyan lockbar.
+const RAIL_COLOR: Color32 = Color32::from_rgb(0xff, 0x9a, 0x00);
 
 fn main() {
     let logs: Arc<Mutex<VecDeque<String>>> =
@@ -1092,7 +1089,6 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             rgb,
             &active.last_heads,
             active.last_lockbar.as_ref(),
-            active.last_u.as_ref(),
         )?;
         p
     } else {
@@ -1104,7 +1100,6 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             rgb,
             &active.last_heads,
             active.last_lockbar.as_ref(),
-            active.last_u.as_ref(),
         )?
     };
 
@@ -1746,9 +1741,6 @@ struct Active {
     /// [`last_lockbar`] / [`last_u`] back from its snapshot — so the U warmup
     /// no longer hitches rendering (see [`UWorker`]).
     u_worker: UWorker,
-    /// egui texture holding the translucent U mask overlay (160×160 proto
-    /// grid), rebuilt by [`refresh_u_overlay`] each frame a U exists.
-    u_mask_texture: Option<TextureHandle>,
     /// Background thread running the SCUT-HEAD nano detector off the UI
     /// thread — mirrors the plugin (track the head as a *shape*, so tracking
     /// holds when the player leans over the playfield). At MODEL_SIDE=160 one
@@ -1863,6 +1855,7 @@ fn u_worker_loop(
     let mut first_detection_at: Option<Instant> = None;
     let mut locked = false;
     let mut best_conf = 0.0f32;
+    let mut best_score = 0.0f32;
     let lut = detect_boost_lut();
 
     loop {
@@ -1912,23 +1905,40 @@ fn u_worker_loop(
         let dets = det.detect(&item.rgb888, item.w, item.h);
         let u_ms = t0.elapsed().as_secs_f32() * 1000.0;
         if let Some(best) = dets.into_iter().next() {
-            if best.confidence > best_conf {
+            // Derive the U geometry, then keep the frame with the best *lock
+            // score* — a full 3-axis U (lockbar + both sidebars) beats any
+            // lockbar-only frame, so a frame where an arm merely fakes the bar
+            // can never win the calibration (see `u_lock_score`).
+            let quad = u_to_lockbar_quad(&best, det.mask_threshold(), item.w, item.h);
+            let score = quad
+                .as_ref()
+                .map_or(0.0, |q| u_lock_score(q, best.confidence));
+            if score > best_score {
+                best_score = score;
                 best_conf = best.confidence;
-                // Derive the lockbar before taking the output lock so we don't
-                // hold it across the extraction.
-                let quad = u_to_lockbar_quad(&best, det.mask_threshold(), item.w, item.h);
+                let both_rails = quad
+                    .as_ref()
+                    .is_some_and(|q| q.left_rail.is_some() && q.right_rail.is_some());
                 let mut o = out.lock();
                 if let Some(quad) = quad {
                     o.lockbar = Some(quad);
                 }
                 o.u = Some(best);
                 o.u_ms = u_ms;
-                info!(conf = best_conf, "U: new best detection");
+                drop(o);
+                info!(
+                    score = best_score,
+                    conf = best_conf,
+                    three_axes = both_rails,
+                    "U: new best detection"
+                );
+                // Start the warmup window from the first usable geometry, so
+                // the lock freezes a short moment after we first see the U.
+                if first_detection_at.is_none() && score > 0.0 {
+                    first_detection_at = Some(now);
+                }
             } else {
                 out.lock().u_ms = u_ms;
-            }
-            if first_detection_at.is_none() {
-                first_detection_at = Some(now);
             }
         } else {
             out.lock().u_ms = u_ms;
@@ -2081,6 +2091,26 @@ fn apply_detect_boost(rgb888: &mut [u8], lut: &[u8; 256]) {
     }
 }
 
+/// Score a candidate U for the best-of-warmup lock. The camera and lockbar
+/// are fixed, so we freeze the single best frame — and "best" must mean the
+/// most complete real-world reference, NOT the highest raw mask confidence.
+/// A full **3-axis** U (lockbar + both sidebars) dominates any partial one, so
+/// a frame where a player's arm fakes a bright bar (but yields no proper rails
+/// on the open side) can never win the calibration. Ties: total rail length,
+/// then U confidence.
+fn u_lock_score(q: &headtracking::calibration::LockbarQuadRgb, conf: f32) -> f32 {
+    // NOTE: do NOT reward rail *length* — on this overhead camera the longest
+    // "rails" are the players' bodies standing behind the bar. Rails are now
+    // band-limited + corner-attached at extraction, so their mere presence is
+    // the signal; U confidence breaks ties.
+    let axes_bonus = match (q.left_rail.is_some(), q.right_rail.is_some()) {
+        (true, true) => 10_000.0, // the 3 axes — the frame we want to lock
+        (true, false) | (false, true) => 1_000.0,
+        (false, false) => 0.0, // lockbar only
+    };
+    axes_bonus + conf * 100.0
+}
+
 /// Derive the lockbar quad — the *closed* bar of the U, of known physical
 /// width — from a U-seg detection. We don't assume it sits at a fixed
 /// image edge: with the camera mounted above the backglass the U reads as
@@ -2182,6 +2212,90 @@ fn u_to_lockbar_quad(
         .to_degrees();
     let thickness_px = (((bl.1 + br.1) as f32 - (tl.1 + tr.1) as f32) * 0.5).abs() as u32;
     let n_inliers = (det.confidence * 100.0).clamp(0.0, 1_000.0) as u32;
+
+    // --- Sidebars (the rails of the U). Only the part *near* the lockbar is a
+    //     real rail; further out on the open side is the receding playfield —
+    //     or, from this overhead camera, the players standing behind the bar.
+    //     So: (1) open side only, never past the bar; (2) a short band right
+    //     next to the bar (a body read as a long rail is cut off); (3) each
+    //     rail must *start at* the matching lockbar corner (attachment). Fit a
+    //     straight line to each rail-row's outer edge, with outlier rejection
+    //     so a forearm laid across it does not bend it. Emitted `[near, far]`.
+    const RAIL_ATTACH_TOL: f32 = 6.0; // proto px: rail base must meet the corner
+    // The rails follow the PLAYFIELD, which is the side of the lockbar carrying
+    // the most mask (the bright lit table) — NOT the sparse player side. Using
+    // raw fill instead of "which extremity is the bar" stops the rails from
+    // shooting up a player standing right behind the bar. `bar_at_top` here
+    // means "playfield is below the bar → rails go down (large py)". The rails
+    // then span the WHOLE playfield side: from the lockbar corner down to the
+    // near/bottom edge of the visible playfield.
+    let fill_below: u64 = if bar_y1 < py_max {
+        row_count[bar_y1 + 1..=py_max].iter().map(|&c| u64::from(c)).sum()
+    } else {
+        0
+    };
+    let fill_above: u64 = if bar_y0 > py_min {
+        row_count[py_min..bar_y0].iter().map(|&c| u64::from(c)).sum()
+    } else {
+        0
+    };
+    let bar_at_top = fill_below >= fill_above;
+    let (band_lo, band_hi) = if bar_at_top {
+        ((bar_y1 + 1).min(py_max), py_max)
+    } else {
+        (py_min, bar_y0.saturating_sub(1).max(py_min))
+    };
+    // Lockbar edge on the open side — where the rails must attach.
+    let open_bar_row = if bar_at_top { bar_y1 } else { bar_y0 };
+    let bar_left_x = row_left[open_bar_row] as f32;
+    let bar_right_x = row_right[open_bar_row] as f32;
+    let mut left_pts: Vec<(f32, f32)> = Vec::new();
+    let mut right_pts: Vec<(f32, f32)> = Vec::new();
+    let (mut rail_lo, mut rail_hi) = (usize::MAX, 0usize);
+    if band_lo <= band_hi {
+        for py in band_lo..=band_hi {
+            if row_count[py] == 0 {
+                continue; // empty row — nothing to attach a rail to
+            }
+            // The two rails are the LEFT and RIGHT edges of the mask on this
+            // row — whether or not the row is "filled across" (a bright solid
+            // playfield fills the near-lockbar rows, and its two side edges ARE
+            // the rails). Fitting each edge over the band gives one rail per
+            // side; band + attachment keep them short and at the corners.
+            left_pts.push((row_left[py] as f32, py as f32));
+            right_pts.push((row_right[py] as f32, py as f32));
+            rail_lo = rail_lo.min(py);
+            rail_hi = rail_hi.max(py);
+        }
+    }
+    let make_rail = |pts: &[(f32, f32)], bar_edge_x: f32| -> Option<[(u32, u32); 2]> {
+        let (a, b, _) = fit_rail(pts)?;
+        // near = lockbar-adjacent extremity, far = open extremity.
+        let (y_near, y_far) = if bar_at_top {
+            (rail_lo, rail_hi)
+        } else {
+            (rail_hi, rail_lo)
+        };
+        let near_x = a * y_near as f32 + b;
+        // The rail base must meet the lockbar corner, else it is not a rail.
+        if (near_x - bar_edge_x).abs() > RAIL_ATTACH_TOL {
+            return None;
+        }
+        let at = |x: f32, y: usize| -> (u32, u32) {
+            let xc = x.round().clamp(0.0, (n.saturating_sub(1)) as f32) as usize;
+            clamp(det.proto_to_image(xc, y))
+        };
+        Some([at(near_x, y_near), at(a * y_far as f32 + b, y_far)])
+    };
+    let (left_rail, right_rail) = if rail_lo <= rail_hi {
+        (
+            make_rail(&left_pts, bar_left_x),
+            make_rail(&right_pts, bar_right_x),
+        )
+    } else {
+        (None, None)
+    };
+
     Some(headtracking::calibration::LockbarQuadRgb {
         frame_width: w,
         frame_height: h,
@@ -2190,35 +2304,53 @@ fn u_to_lockbar_quad(
         thickness_px,
         n_inliers_top: n_inliers,
         n_inliers_bottom: n_inliers,
+        left_rail,
+        right_rail,
     })
 }
 
-/// Build the translucent U mask overlay as a 160×160 RGBA image on the
-/// proto grid (model space). Painted over the camera feed through
-/// [`u_mask_uv`], which skips the letterbox padding so the tint lands on
-/// the playfield. Cyan straight-alpha where the mask probability clears
-/// `thr`, fully transparent elsewhere.
-fn build_u_overlay(det: &u_onnx::UDetection, thr: f32) -> ColorImage {
-    let n = u_onnx::PROTO_SIDE;
-    let mut rgba = vec![0u8; n * n * 4];
-    for (cell, px) in det.proto_mask.iter().enumerate() {
-        if *px >= thr {
-            let i = cell * 4;
-            rgba[i..i + 4].copy_from_slice(&U_MASK_RGBA);
-        }
-    }
-    ColorImage::from_rgba_unmultiplied([n, n], &rgba)
-}
+/// Max distance (proto-grid px, 160-side) a rail point may sit from the
+/// first-pass line and still count — a forearm laid across a rail bulges well
+/// past this, so it is dropped before the refit.
+const RAIL_OUTLIER_PX: f32 = 3.5;
 
-/// Rebuild + upload the U mask overlay texture for the current detection.
-/// Cheap (160×160) so we just redo it each frame a U exists rather than
-/// track a dirty flag. Disjoint field borrows let this take `&mut Active`.
-fn refresh_u_overlay(active: &mut Active, ctx: &egui::Context) {
-    let Some(det) = active.last_u.as_ref() else {
-        return;
+/// Least-squares fit of a near-vertical rail as `x = a*y + b`, with one refit
+/// after dropping points more than [`RAIL_OUTLIER_PX`] off the first line — so
+/// a forearm laid across a rail is rejected rather than bending it. Returns
+/// `(a, b, inlier_count)`, or `None` when too few points survive.
+fn fit_rail(pts: &[(f32, f32)]) -> Option<(f32, f32, usize)> {
+    const MIN_PTS: usize = 4;
+    if pts.len() < MIN_PTS {
+        return None;
+    }
+    let lsq = |pts: &[(f32, f32)]| -> Option<(f32, f32)> {
+        let n = pts.len() as f32;
+        let (mut sy, mut sx, mut syy, mut sxy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for &(x, y) in pts {
+            sy += y;
+            sx += x;
+            syy += y * y;
+            sxy += x * y;
+        }
+        let den = n * syy - sy * sy;
+        if den.abs() < 1e-3 {
+            return None; // all points on one row — undefined slope
+        }
+        let a = (n * sxy - sy * sx) / den;
+        let b = (sx - a * sy) / n;
+        Some((a, b))
     };
-    let img = build_u_overlay(det, U_MASK_THR);
-    upload_texture(ctx, &mut active.u_mask_texture, img);
+    let (a, b) = lsq(pts)?;
+    let inliers: Vec<(f32, f32)> = pts
+        .iter()
+        .copied()
+        .filter(|&(x, y)| (x - (a * y + b)).abs() <= RAIL_OUTLIER_PX)
+        .collect();
+    if inliers.len() < MIN_PTS {
+        return None;
+    }
+    let (a2, b2) = lsq(&inliers)?;
+    Some((a2, b2, inliers.len()))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2875,9 +3007,6 @@ impl App {
                 }
             }
         }
-        // Inner borrow released — rebuild the U mask overlay texture for
-        // whatever the poll above stored (one place, not per-arm).
-        refresh_u_overlay(active, egui_ctx);
     }
 }
 
@@ -3167,7 +3296,6 @@ impl App {
                         bytes,
                         &active.last_heads,
                         active.last_lockbar.as_ref(),
-                        active.last_u.as_ref(),
                     ));
                     match &self.screenshot_status {
                         Some(Ok(p)) => info!(path = %p.display(), "screenshot saved"),
@@ -3462,20 +3590,8 @@ impl App {
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
-                // Translucent U segmentation mask on top of the feed. The
-                // proto grid lives in letterboxed model space, so the UV
-                // sub-rect skips the padding to land it on the playfield.
-                if let (Some(det), Some(mask)) =
-                    (active.last_u.as_ref(), active.u_mask_texture.as_ref())
-                {
-                    ui.painter().image(
-                        mask.id(),
-                        rect,
-                        u_mask_uv(det, tex.size_vec2()),
-                        Color32::WHITE,
-                    );
-                }
-                // Lockbar quad derived from the U's closed edge, on top.
+                // Lockbar contour (cyan) + sidebars (orange) derived from the
+                // U — no translucent mask fog any more.
                 if let Some(bar) = active.last_lockbar {
                     draw_lockbar(ui.painter(), rect, bar);
                 }
@@ -3775,20 +3891,6 @@ fn draw_head_bbox(painter: &egui::Painter, rect: Rect, head: &head::HeadAnchor, 
     );
 }
 
-/// UV sub-rect that maps the 640-space proto mask texture onto the
-/// displayed camera image, skipping the letterbox padding so the mask
-/// aligns with the playfield. `src` = the source frame's pixel size (the
-/// camera texture's own size, which is what the detector saw).
-fn u_mask_uv(det: &u_onnx::UDetection, src: Vec2) -> Rect {
-    let lb = det.letterbox;
-    let inv = 1.0 / u_onnx::MODEL_SIDE as f32;
-    let (new_w, new_h) = (src.x * lb.scale, src.y * lb.scale);
-    Rect::from_min_max(
-        Pos2::new(lb.pad_x * inv, lb.pad_y * inv),
-        Pos2::new((lb.pad_x + new_w) * inv, (lb.pad_y + new_h) * inv),
-    )
-}
-
 fn draw_lockbar(
     painter: &egui::Painter,
     rect: Rect,
@@ -3817,6 +3919,17 @@ fn draw_lockbar(
     painter.line_segment([pts[1], pts[2]], stroke);
     painter.line_segment([pts[2], pts[3]], stroke);
     painter.line_segment([pts[3], pts[0]], stroke);
+    // Sidebars (rails) in orange, fitted straight segments.
+    let rail_stroke = Stroke::new(3.0_f32, RAIL_COLOR);
+    for rail in [bar.left_rail, bar.right_rail].into_iter().flatten() {
+        painter.line_segment(
+            [
+                to_screen(rail[0].0, rail[0].1),
+                to_screen(rail[1].0, rail[1].1),
+            ],
+            rail_stroke,
+        );
+    }
 }
 
 // ============================================================ Backend opening
@@ -3872,7 +3985,6 @@ fn open_kinect_v2() -> Result<Active, String> {
         last_lockbar: None,
         last_u: None,
         u_worker: UWorker::spawn(),
-        u_mask_texture: None,
         head_worker: HeadWorker::spawn("kinect-v2"),
         last_heads: Vec::new(),
         last_rgb_frame: None,
@@ -3937,7 +4049,6 @@ fn open_kinect_v1() -> Result<Active, String> {
         last_lockbar: None,
         last_u: None,
         u_worker: UWorker::spawn(),
-        u_mask_texture: None,
         head_worker: HeadWorker::spawn("kinect-v1"),
         last_heads: Vec::new(),
         last_rgb_frame: None,
@@ -3988,7 +4099,6 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         last_lockbar: None,
         last_u: None,
         u_worker: UWorker::spawn(),
-        u_mask_texture: None,
         head_worker: HeadWorker::spawn("webcam"),
         last_heads: Vec::new(),
         last_rgb_frame: None,
@@ -4136,25 +4246,11 @@ fn bake_overlays(
     rgb888: &[u8],
     heads: &[head::HeadAnchor],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
-    u: Option<&u_onnx::UDetection>,
 ) -> Vec<u8> {
     const HEAD_RGB: [u8; 3] = [0xff, 0x60, 0x60];
-    const LOCKBAR_RGB: [u8; 3] = [0x00, 0xe5, 0xff];
+    const LOCKBAR_RGB: [u8; 3] = [0x00, 0xe5, 0xff]; // cyan — the lockbar contour
+    const RAIL_RGB: [u8; 3] = [0xff, 0x9a, 0x00]; // orange — the sidebars
     let mut out = rgb888.to_vec();
-    // U segmentation mask first, so the head boxes + lockbar quad stay
-    // crisp on top of the tint (same cyan blend as the live overlay).
-    if let Some(det) = u {
-        for y in 0..height {
-            for x in 0..width {
-                if det.mask_prob_at(x as f32, y as f32) >= U_MASK_THR {
-                    let i = ((y * width + x) as usize) * 3;
-                    out[i] = (u16::from(out[i]) * 2 / 5) as u8;
-                    out[i + 1] = (u16::from(out[i + 1]) * 3 / 5 + 80) as u8;
-                    out[i + 2] = (u16::from(out[i + 2]) * 3 / 5 + 100) as u8;
-                }
-            }
-        }
-    }
     for head in heads {
         // HeadAnchor is centre-based; expand to corners.
         let x0 = (head.cx - head.width * 0.5).round() as i32;
@@ -4164,6 +4260,7 @@ fn bake_overlays(
         draw_rect_outline(&mut out, width, height, (x0, y0), (x1, y1), HEAD_RGB, 1);
     }
     if let Some(bar) = lockbar {
+        // Lockbar contour (cyan) — no more translucent mask fog.
         for w in 0..4 {
             let a = bar.corners[w];
             let b = bar.corners[(w + 1) % 4];
@@ -4174,6 +4271,18 @@ fn bake_overlays(
                 (a.0 as i32, a.1 as i32),
                 (b.0 as i32, b.1 as i32),
                 LOCKBAR_RGB,
+                1,
+            );
+        }
+        // Sidebars (orange), fitted straight segments.
+        for rail in [bar.left_rail, bar.right_rail].into_iter().flatten() {
+            draw_line(
+                &mut out,
+                width,
+                height,
+                (rail[0].0 as i32, rail[0].1 as i32),
+                (rail[1].0 as i32, rail[1].1 as i32),
+                RAIL_RGB,
                 1,
             );
         }
@@ -4190,9 +4299,8 @@ fn save_rgb_screenshot_at(
     rgb888: &[u8],
     heads: &[head::HeadAnchor],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
-    u: Option<&u_onnx::UDetection>,
 ) -> Result<(), String> {
-    let painted = bake_overlays(width, height, rgb888, heads, lockbar, u);
+    let painted = bake_overlays(width, height, rgb888, heads, lockbar);
     let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
     let writer = std::io::BufWriter::new(file);
     let mut encoder = png::Encoder::new(writer, width, height);
@@ -4217,7 +4325,6 @@ fn save_rgb_screenshot(
     rgb888: &[u8],
     heads: &[head::HeadAnchor],
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
-    u: Option<&u_onnx::UDetection>,
 ) -> Result<std::path::PathBuf, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -4230,7 +4337,7 @@ fn save_rgb_screenshot(
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = dir.join(format!("{slug}_{stamp}.png"));
-    save_rgb_screenshot_at(&path, width, height, rgb888, heads, lockbar, u)?;
+    save_rgb_screenshot_at(&path, width, height, rgb888, heads, lockbar)?;
     Ok(path)
 }
 

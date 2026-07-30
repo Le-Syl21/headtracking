@@ -225,6 +225,15 @@ pub struct LockbarQuadRgb {
     /// Inlier counts for the two fitted lines. Higher = more confident.
     pub n_inliers_top: u32,
     pub n_inliers_bottom: u32,
+    /// Left/right playfield **sidebars** (the rails of the U), when the U
+    /// detector could fit them, as straight segments `[near, far]` in image
+    /// pixels: `near` sits at the lockbar end, `far` at the open end of the
+    /// U. Together with the lockbar they bound the playfield opening — the
+    /// fixed real-world reference for the parallax. `None` for detectors that
+    /// only yield the front bar (e.g. the old RGB-OBB path) or when a rail
+    /// could not be fit.
+    pub left_rail: Option<[(u32, u32); 2]>,
+    pub right_rail: Option<[(u32, u32); 2]>,
 }
 
 impl LockbarQuadRgb {
