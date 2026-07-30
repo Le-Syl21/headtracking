@@ -36,7 +36,7 @@ use tract_onnx::prelude::*;
 /// detect overhead* — ≈10 ms inference (≈13.5 ms full detect) on the cab CPU
 /// (160 ≈15, 224 ≈30, 320 ≈61 ms). Run on its own worker thread it delivers a
 /// fresh head well within every 60 Hz frame.
-pub const MODEL_SIDE: usize = 160;
+pub const MODEL_SIDE: usize = 128;
 /// Anchors emitted across the 3 FPN scales (strides 8/16/32), derived from
 /// [`MODEL_SIDE`]: `(S/8)² + (S/16)² + (S/32)²` — 8400 at 640, 2100 at 320,
 /// 1029 at 224, 525 at 160, 336 at 128.
