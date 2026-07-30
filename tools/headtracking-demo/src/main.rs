@@ -32,7 +32,7 @@ use egui::{
 use egui_rotate::{Rotation, RotationPlugin, SoftwareCursor};
 use egui_winit::winit;
 use nalgebra::Matrix4;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 use tracing::{error, info, warn};
@@ -817,11 +817,14 @@ struct DemoShell {
 
 impl DemoShell {
     fn new(app: App) -> Self {
+        let egui_ctx = egui::Context::default();
+        install_extra_glyph_fonts(&egui_ctx);
+        apply_cab_style(&egui_ctx);
         Self {
             app,
             gl_window: None,
             gl: None,
-            egui_ctx: egui::Context::default(),
+            egui_ctx,
             egui_winit: None,
             painter: None,
             parallax: None,
@@ -1753,6 +1756,23 @@ struct App {
     rotation: Rotation,
     /// Set by the Quit button; [`DemoShell`] exits the event loop next frame.
     should_quit: bool,
+    /// Physical lockbar width in mm (= sidebar separation at the lockbar).
+    /// The metric ruler for the monocular (webcam) scale and the cabinet
+    /// calibration; a cross-check for the depth backends. User-set here in the
+    /// demo (the toolbar field, shown only for a webcam input — depth cameras
+    /// measure scale directly); pulled from the VPX table config in the plugin.
+    /// Defaults to `calibration::LOCKBAR_WIDTH_MM` (61 cm widebody).
+    lockbar_width_mm: f32,
+    /// Live-tunable 1€ filter knobs for the head pose (applied to all axes in
+    /// [`App::poll`]). `min_cutoff` sets the baseline smoothing when still;
+    /// `beta` how fast the cutoff rises with motion — the low default `beta`
+    /// felt laggy on quick lateral moves, so it's tunable from the bench row.
+    head_filter_min_cutoff: f32,
+    head_filter_beta: f32,
+    /// Target head-detection rate (Hz). The detector is capped to this so it
+    /// stops pinning a full core running flat-out; the 1€ filter interpolates
+    /// between detections. Live-tunable from the bench row.
+    head_detect_hz: f32,
     /// "Share a capture" window toggle + state.
     contribute_open: bool,
     /// The informed-consent checkbox (see the privacy notice). Gates the
@@ -2108,6 +2128,9 @@ struct HeadWorker {
     job: Arc<(Mutex<Option<HeadJob>>, Condvar)>,
     out: Arc<Mutex<HeadOut>>,
     stop: Arc<AtomicBool>,
+    /// Minimum ms between two inferences — a rate cap so the detector stops
+    /// pinning a full core running flat-out. Live-tunable from the bench row.
+    interval_ms: Arc<AtomicU32>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -2116,17 +2139,29 @@ impl HeadWorker {
         let job = Arc::new((Mutex::new(None::<HeadJob>), Condvar::new()));
         let out = Arc::new(Mutex::new(HeadOut::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (job_t, out_t, stop_t) = (Arc::clone(&job), Arc::clone(&out), Arc::clone(&stop));
+        let interval_ms = Arc::new(AtomicU32::new(0));
+        let (job_t, out_t, stop_t, iv_t) = (
+            Arc::clone(&job),
+            Arc::clone(&out),
+            Arc::clone(&stop),
+            Arc::clone(&interval_ms),
+        );
         let handle = std::thread::Builder::new()
             .name("head-detector".into())
-            .spawn(move || head_worker_loop(backend_name, &job_t, &out_t, &stop_t))
+            .spawn(move || head_worker_loop(backend_name, &job_t, &out_t, &stop_t, &iv_t))
             .expect("spawn head-detector thread");
         Self {
             job,
             out,
             stop,
+            interval_ms,
             handle: Some(handle),
         }
+    }
+
+    /// Cap the detector to at most one inference every `ms` (0 = flat-out).
+    fn set_min_interval_ms(&self, ms: u32) {
+        self.interval_ms.store(ms, Ordering::Relaxed);
     }
 
     /// Hand the worker the latest colour frame, replacing any pending one.
@@ -2151,17 +2186,31 @@ impl Drop for HeadWorker {
     }
 }
 
-/// Body of the head-detector thread: wait for a frame, run inference flat-out
-/// (no throttle — the head is always moving), publish the boxes + timing.
+/// Body of the head-detector thread: wait for a frame, honour the rate cap
+/// (`interval_ms`, so it doesn't pin a core running flat-out), run inference,
+/// publish the boxes + timing. The 1€ filter interpolates between detections,
+/// so a capped rate stays smooth.
 fn head_worker_loop(
     backend_name: &'static str,
     job: &Arc<(Mutex<Option<HeadJob>>, Condvar)>,
     out: &Arc<Mutex<HeadOut>>,
     stop: &Arc<AtomicBool>,
+    interval_ms: &Arc<AtomicU32>,
 ) {
     let detector = init_head_detector(backend_name);
     let lut = detect_boost_lut();
+    let mut last_run = Instant::now();
     loop {
+        // Rate cap: wait out `interval_ms` since the last inference start
+        // before grabbing the next (freshest) frame, so the detector doesn't
+        // pin a core running flat-out. `stop` keeps shutdown snappy.
+        let interval = Duration::from_millis(u64::from(interval_ms.load(Ordering::Relaxed)));
+        while last_run.elapsed() < interval {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
         // Block until a frame arrives (or we're asked to stop).
         let item = {
             let (lock, cvar) = &**job;
@@ -2178,6 +2227,7 @@ fn head_worker_loop(
         let Some(detector) = detector.as_ref() else {
             continue; // detector failed to init — nothing to do.
         };
+        last_run = Instant::now();
         let t0 = Instant::now();
         apply_detect_boost(&mut item.rgb888, &lut);
         let heads = detector.detect(&item.rgb888, item.w, item.h);
@@ -2941,17 +2991,21 @@ impl App {
             // upright on the cab.
             rotation: Rotation::CW90,
             should_quit: false,
+            lockbar_width_mm: headtracking::calibration::LOCKBAR_WIDTH_MM,
+            head_filter_min_cutoff: 1.0,
+            head_filter_beta: 0.4,
+            head_detect_hz: 15.0,
             contribute_open: false,
             consent_checked: false,
             uploader: contribute::Uploader::spawn(),
             contrib_last: None,
             contrib_thumbs: None,
             switch_state: SwitchState::Idle,
-            parallax_enabled: false,
+            parallax_enabled: true,
             parallax_tex: None,
             // Auto-orbit by default: the parallax illusion shows immediately
             // with no camera and no need to move — switch to Live on the cab.
-            parallax_eye_mode: ParallaxEye::AutoOrbit,
+            parallax_eye_mode: ParallaxEye::Live,
             parallax_eye: [0.0, 0.0, PX_DVIEW_MM],
             parallax_gain: 1.0,
             // Y flipped by default: Kinect Y points down, the eye's Y is up.
@@ -3143,6 +3197,20 @@ impl App {
             return;
         };
         active.metrics.tick();
+        // Push the live-tunable 1€ knobs onto the filter each frame (cheap;
+        // set_params keeps the running state, no reset).
+        active.pose_filter.set_params(filter_alias::OneEuroParams {
+            min_cutoff_hz: self.head_filter_min_cutoff,
+            beta: self.head_filter_beta,
+            derivative_cutoff_hz: 1.0,
+        });
+        // Cap the head detector's rate (0 Hz slider = flat-out).
+        let head_ms = if self.head_detect_hz > 0.1 {
+            (1000.0 / self.head_detect_hz) as u32
+        } else {
+            0
+        };
+        active.head_worker.set_min_interval_ms(head_ms);
         match &mut active.inner {
             Inner::KinectV2 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
@@ -3536,8 +3604,9 @@ impl App {
         Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
 
-            // Row 1 — buttons only.
-            ui.horizontal(|ui| {
+            // Row 1 — buttons only. Wrapped so a narrow window folds the bar
+            // onto extra lines instead of clipping controls off the edge.
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Input:");
                 let selected_label = self.label_for(self.selected);
                 // Size the combo to the widest label currently on offer so no
@@ -3571,9 +3640,10 @@ impl App {
                             ui.selectable_value(&mut self.selected, entry.backend, &entry.label);
                         }
                     });
-                if ui.small_button("rescan").clicked() {
+                if ui.button("Rescan").clicked() {
                     self.refresh_available();
                 }
+                self.lockbar_width_field(ui);
                 // Screenshot: writes the latest RGB frame next to the binary
                 // as `<backend-slug>_<YYYYMMDD-HHMMSS>.png`. Disabled until a
                 // frame has been received.
@@ -3582,7 +3652,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|a| a.last_rgb_frame.is_some());
                 let shot_resp =
-                    ui.add_enabled(shot_ready, egui::Button::new("📷 screenshot").small());
+                    ui.add_enabled(shot_ready, egui::Button::new("📷 Screenshot"));
                 if shot_resp.clicked()
                     && let Some(active) = self.active.as_ref()
                     && let Some((w, h, bytes)) = active.last_rgb_frame.as_ref()
@@ -3611,14 +3681,32 @@ impl App {
                 {
                     self.rotation = next_rotation(self.rotation);
                 }
-                // 🪟 Parallax — toggles the off-axis 3D validation view in
-                // the central panel (camera | parallax, side by side).
-                ui.toggle_value(&mut self.parallax_enabled, "🪟 parallax")
+                // Parallax — on/off toggle for the off-axis 3D validation view
+                // stacked below the camera feed. A highlight toggle (blue when
+                // on), matching the parallax eye-mode selector. The 🪟 glyph
+                // renders via the vendored NotoEmoji subset (see
+                // `install_extra_glyph_fonts`).
+                ui.toggle_value(&mut self.parallax_enabled, "🪟 Parallax")
                     .on_hover_text("Show the off-axis 3D validation scene below the camera feed");
-                ui.toggle_value(&mut self.contribute_open, "🎁 Contribute")
+                // 🎁 Contribute — same highlight toggle as the others (so it
+                // never shifts the bar), with a red outline *painted on top* of
+                // its rect as a call to action. Painting the border rather than
+                // using Button::stroke keeps it out of the layout entirely, so
+                // no widget below it moves on hover/press.
+                let contrib = ui
+                    .toggle_value(
+                        &mut self.contribute_open,
+                        RichText::new("🎁 Contribute").strong(),
+                    )
                     .on_hover_text("Share a capture to help train the head-tracking model");
+                ui.painter().rect_stroke(
+                    contrib.rect,
+                    egui::CornerRadius::same(3),
+                    Stroke::new(2.0, Color32::from_rgb(0xe0, 0x3a, 0x3a)),
+                    egui::StrokeKind::Outside,
+                );
                 if ui
-                    .button("⏻ quit")
+                    .button("⏻ Quit")
                     .on_hover_text("Close the demo (fullscreen has no window buttons)")
                     .clicked()
                 {
@@ -3749,7 +3837,7 @@ impl App {
                     // Left: tracing event log
                     cols[0].horizontal(|ui| {
                         ui.label(RichText::new("logs").strong());
-                        if ui.small_button("clear").clicked() {
+                        if ui.small_button("Clear").clicked() {
                             self.logs.lock().clear();
                         }
                     });
@@ -3770,7 +3858,7 @@ impl App {
                     let mut reset_baseline = false;
                     cols[1].horizontal(|ui| {
                         ui.label(RichText::new("VPX output (Δ view)").strong());
-                        if ui.small_button("reset baseline").clicked() {
+                        if ui.small_button("Reset baseline").clicked() {
                             reset_baseline = true;
                         }
                     });
@@ -3849,11 +3937,16 @@ impl App {
         // (a resizable bottom panel) when enabled — side-by-side ate too much
         // width.
         CentralPanel::default().show(ui, |ui| {
+            self.camera_placement_help(ui);
+            ui.separator();
             if self.parallax_enabled {
+                // Fixed 50/50 split between the camera feed (top) and the
+                // parallax scene (bottom) of the area left below the placement
+                // strip — not user-resizable.
+                let half = ui.available_height() * 0.5;
                 Panel::bottom("parallax-view")
-                    .resizable(true)
-                    .default_size(280.0)
-                    .min_size(140.0)
+                    .resizable(false)
+                    .exact_size(half)
                     .show(ui, |ui| self.draw_parallax_view(ui));
             }
             self.draw_camera_view(ui);
@@ -3862,20 +3955,96 @@ impl App {
         self.contribute_window(&ctx);
     }
 
+    /// Lockbar-width field — the metric ruler for the monocular (webcam)
+    /// scale. Shown only for a webcam input: depth cameras measure scale
+    /// directly, so they don't need it (there it's just a cross-check). mm
+    /// with an inch read-out — the international inch is exactly 25.4 mm.
+    fn lockbar_width_field(&mut self, ui: &mut egui::Ui) {
+        let is_webcam = matches!(
+            self.active.as_ref().map(|a| a.backend),
+            Some(Backend::Webcam(_))
+        );
+        if !is_webcam {
+            return;
+        }
+        ui.separator();
+        ui.label("Lockbar:");
+        ui.add(
+            egui::DragValue::new(&mut self.lockbar_width_mm)
+                .speed(1.0)
+                .range(200.0..=1200.0)
+                .suffix(" mm"),
+        );
+        let inches = self.lockbar_width_mm / 25.4;
+        ui.label(RichText::new(format!("({inches:.1} in)")).weak());
+    }
+
+    /// Camera-placement guidance shown at the top of the central panel, above
+    /// the live view: a one-line reminder + three example thumbnails (a good
+    /// frame, and two mounting shots). Useful to everyone, not just
+    /// contributors, so it lives in the main UI rather than the share window.
+    fn camera_placement_help(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        // Order: the two mounting shots first, then what the camera should see.
+        let thumbs = self.contrib_thumbs.get_or_insert_with(|| {
+            [
+                load_thumb(&ctx, "ht_setup_cab", include_bytes!("../assets/setup_cab.jpg")),
+                load_thumb(&ctx, "ht_setup_bg", include_bytes!("../assets/setup_bg.jpg")),
+                load_thumb(&ctx, "ht_cam_view", include_bytes!("../assets/skillshot.jpg")),
+            ]
+        });
+        const CAPTIONS: [&str; 3] = [
+            "Camera on the pincab",
+            "Camera on the backglass / topper",
+            "View from the camera (sidebars, lockbar, face)",
+        ];
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "Camera placement: top of the backglass or topper, centred, facing the \
+                 playfield and the player. A good frame shows the lockbar, a bit of the \
+                 sidebars, and the head.",
+            )
+            .size(12.0),
+        );
+        ui.add_space(3.0);
+        ui.columns(3, |cols| {
+            // Common image height so the three align regardless of aspect ratio
+            // (the widest fills its column, the others are centred), with the
+            // caption below each.
+            let colw = cols[0].available_width().max(1.0);
+            let img_h = thumbs
+                .iter()
+                .map(|t| {
+                    let s = t.size_vec2();
+                    if s.x > 0.0 { colw * s.y / s.x } else { colw }
+                })
+                .fold(f32::MAX, f32::min);
+            for (i, tex) in thumbs.iter().enumerate() {
+                cols[i].vertical_centered(|ui| {
+                    show_thumb(ui, tex, img_h);
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(CAPTIONS[i]).size(11.0));
+                });
+            }
+        });
+    }
+
     /// The "Share a capture" window: the informed-consent notice + checkbox,
     /// the share button (gated on consent + a live frame), upload status, and
-    /// camera-placement help. All demo-only — the plugin has none of this.
+    /// a short capture reminder. All demo-only — the plugin has none of this.
     fn contribute_window(&mut self, ctx: &egui::Context) {
         let mut open = self.contribute_open;
         egui::Window::new("🎁 Share a capture")
             .open(&mut open)
             .resizable(true)
             .default_width(440.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(RichText::new("Please read before accepting").strong());
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical()
-                    .max_height(230.0)
+                    .max_height(420.0)
                     .show(ui, |ui| {
                         ui.label(
                             "By sharing, you upload images from your tracking camera (each \
@@ -3892,7 +4061,10 @@ impl App {
                         }
                     });
                 ui.add_space(6.0);
-                ui.checkbox(
+                // Explicit opt-in as a highlight toggle (blue when on), for
+                // visual consistency with the rest of the UI — still an
+                // affirmative, deliberate action before any upload is allowed.
+                ui.toggle_value(
                     &mut self.consent_checked,
                     "I have read the above and I freely give my informed consent to share \
                      these images under these terms.",
@@ -3935,47 +4107,17 @@ impl App {
                     ui.monospace(format!("{stem}_raw.png · {stem}_det.png"));
                 }
                 ui.separator();
-                egui::CollapsingHeader::new("How to get good captures")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        let thumbs = self.contrib_thumbs.get_or_insert_with(|| {
-                            [
-                                load_thumb(
-                                    ctx,
-                                    "ht_ex_shot",
-                                    include_bytes!("../assets/skillshot.jpg"),
-                                ),
-                                load_thumb(
-                                    ctx,
-                                    "ht_ex_bg",
-                                    include_bytes!("../assets/setup_bg.jpg"),
-                                ),
-                                load_thumb(
-                                    ctx,
-                                    "ht_ex_cab",
-                                    include_bytes!("../assets/setup_cab.jpg"),
-                                ),
-                            ]
-                        });
-                        ui.label(
-                            "A good capture shows the lockbar, a bit of the sidebars, and the \
-                         player's head:",
-                        );
-                        show_thumb(ui, &thumbs[0]);
-                        ui.add_space(8.0);
-                        ui.label(
-                        "Mount the camera on top of the backglass (or topper), ideally centred, \
-                         facing the playfield and the player:",
-                    );
-                        show_thumb(ui, &thumbs[1]);
-                        show_thumb(ui, &thumbs[2]);
-                        ui.add_space(6.0);
-                        ui.label(RichText::new("Help us with variety:").strong());
-                        ui.label(
-                        "different lighting, colours and brightness; with and without a player; \
-                         the lockbar clear and with hands on it.",
-                    );
-                    });
+                ui.label(RichText::new("Before you capture").strong());
+                ui.label(
+                    "Make sure your camera is well placed — see the placement guide above \
+                     the camera view.",
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new("Help us with variety:").strong());
+                ui.label(
+                    "different lighting, colours and brightness; with and without a player; \
+                     the lockbar clear and with hands on it.",
+                );
             });
         self.contribute_open = open;
     }
@@ -4001,7 +4143,10 @@ impl App {
         } else {
             (avail.x, avail.x / aspect)
         };
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(img_w, img_h), Sense::hover());
+        // Allocate the whole available area and centre the (letterboxed) image
+        // rect in it, so a feed narrower than the panel isn't stuck to the left.
+        let (area, _) = ui.allocate_exact_size(avail, Sense::hover());
+        let rect = Rect::from_center_size(area.center(), Vec2::new(img_w, img_h));
 
         if let Some(active) = self.active.as_ref() {
             if let Some(tex) = &active.rgb_texture {
@@ -4097,6 +4242,21 @@ impl App {
                 ui.toggle_value(&mut self.parallax_invert[0], "±X");
                 ui.toggle_value(&mut self.parallax_invert[1], "±Y");
                 ui.toggle_value(&mut self.parallax_invert[2], "±Z");
+            });
+            // 1€ filter knobs — live, so lag on fast head moves can be dialed
+            // out on the cab (higher beta = snappier; higher cutoff = less
+            // smoothing when still). Applied to the pose in `poll`.
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.head_filter_min_cutoff, 0.1..=5.0)
+                        .text("1€ cutoff"),
+                );
+                ui.add(egui::Slider::new(&mut self.head_filter_beta, 0.0..=1.5).text("1€ beta"));
+            });
+            // Head-detection rate cap — trade CPU for re-acquisition latency
+            // live on the cab (30 = flat-out-ish, lower = less CPU).
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut self.head_detect_hz, 3.0..=30.0).text("head Hz"));
             });
         }
 
@@ -4638,14 +4798,76 @@ fn load_thumb(ctx: &egui::Context, name: &str, bytes: &[u8]) -> TextureHandle {
     ctx.load_texture(name, color, egui::TextureOptions::LINEAR)
 }
 
-/// Draw a help thumbnail scaled to the panel width (max 400 px), keeping aspect.
-fn show_thumb(ui: &mut egui::Ui, tex: &TextureHandle) {
+/// Append tiny subset fonts to egui's fallback chain so a few glyphs the
+/// bundled fonts lack still render: ⏻ (U+23FB, power symbol — from Noto Sans
+/// Symbols 2) and 🪟 (U+1FA9F, a 2020-era emoji absent from egui's bundled
+/// NotoEmoji — from Noto Emoji). Both are subset to only the codepoints we use
+/// (~5 KB total), vendored in `assets/` so the build stays offline. Pushed to
+/// the end of each family, so they only kick in when nothing earlier covers the
+/// glyph.
+fn install_extra_glyph_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontFamily};
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "noto-symbols2".to_owned(),
+        std::sync::Arc::new(FontData::from_static(include_bytes!(
+            "../assets/NotoSymbolsSubset.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "noto-emoji-ext".to_owned(),
+        std::sync::Arc::new(FontData::from_static(include_bytes!(
+            "../assets/NotoEmojiSubset.ttf"
+        ))),
+    );
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        let chain = fonts.families.entry(family).or_default();
+        chain.push("noto-symbols2".to_owned());
+        chain.push("noto-emoji-ext".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// Bump text sizes and hit-target padding for legibility on a pincab screen,
+/// and stop widgets from resizing on hover (the ~1 px expansion looked odd,
+/// especially on the red-outlined Contribute button).
+fn apply_cab_style(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+    ctx.all_styles_mut(|style| {
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Button, FontId::new(16.0, FontFamily::Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace));
+        style.spacing.button_padding = egui::vec2(8.0, 5.0);
+        style.spacing.interact_size.y = 28.0;
+        for w in [
+            &mut style.visuals.widgets.inactive,
+            &mut style.visuals.widgets.hovered,
+            &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
+        ] {
+            w.expansion = 0.0;
+        }
+    });
+}
+
+/// Draw a help thumbnail at a fixed `height`, keeping aspect ratio (width
+/// follows). Used to align a row of differently-shaped thumbnails.
+fn show_thumb(ui: &mut egui::Ui, tex: &TextureHandle, height: f32) {
     let size = tex.size_vec2();
-    let w = ui.available_width().min(400.0);
-    let h = if size.x > 0.0 { w * size.y / size.x } else { w };
+    let w = if size.y > 0.0 {
+        height * size.x / size.y
+    } else {
+        height
+    };
     ui.add(egui::Image::new(egui::load::SizedTexture::new(
         tex.id(),
-        egui::vec2(w, h),
+        egui::vec2(w, height),
     )));
 }
 
