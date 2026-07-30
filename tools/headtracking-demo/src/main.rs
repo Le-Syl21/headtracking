@@ -29,9 +29,7 @@ use egui::{
     self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, TextureHandle, Vec2,
 };
-use egui_rotate::{
-    CursorIconExt, Rotation, SoftwareCursor, transform_clipped_primitives, transform_raw_input,
-};
+use egui_rotate::{Rotation, RotationPlugin, SoftwareCursor};
 use egui_winit::winit;
 use nalgebra::Matrix4;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -782,11 +780,11 @@ impl DemoShell {
         let physical_dimensions: [u32; 2] = window.inner_size().into();
         let physical_size =
             egui::Vec2::new(physical_dimensions[0] as f32, physical_dimensions[1] as f32);
-        let rotation = self.app.rotation;
+        let ctx = self.egui_ctx.clone();
 
         // 0. Parallax window: render the offscreen scene into its FBO
         //    *before* the UI runs, so `App::ui` can show this frame's
-        //    texture. egui-rotate then rotates that image like any other.
+        //    texture. The RotationPlugin then rotates that image like any other.
         if self.app.parallax_enabled {
             let gl = self.gl.as_ref().unwrap();
             let painter = self.painter.as_mut().unwrap();
@@ -803,82 +801,46 @@ impl DemoShell {
             self.app.parallax_tex = None;
         }
 
-        // 1. Gather raw winit input, then rotate it into logical space.
+        // 1. Mirror the UI-facing rotation into the plugin before the pass —
+        //    its input/output hooks read it to rotate input, shapes and the
+        //    software cursor. Everything else the plugin does transparently.
+        ctx.plugin::<RotationPlugin>()
+            .lock()
+            .set_rotation(self.app.rotation);
+
+        // 2. Gather raw winit input. egui must see the *physical* screen rect;
+        //    the plugin swaps it to logical in its input hook — no manual
+        //    transform, no per-frame cursor plumbing.
         let mut raw_input = self.egui_winit.as_mut().unwrap().take_egui_input(window);
         if raw_input.screen_rect.is_none() {
             raw_input.screen_rect =
                 Some(egui::Rect::from_min_size(egui::Pos2::ZERO, physical_size));
         }
-        // On a rotated viewport, drive a virtual cursor from raw mouse deltas
-        // (so it moves the way the *viewer* expects) and hide the OS cursor —
-        // `process_input` does the same rotation as `transform_raw_input` plus
-        // the capture/track logic. Off (Esc) or at 0° we keep the OS cursor.
-        let use_sw_cursor = self.app.sw_cursor_on && !rotation.is_none();
-        if use_sw_cursor {
-            if self.app.mouse_delta_accum != egui::Vec2::ZERO {
-                raw_input
-                    .events
-                    .push(egui::Event::MouseMoved(self.app.mouse_delta_accum));
-                self.app.mouse_delta_accum = egui::Vec2::ZERO;
-            }
-            // Seed the virtual position (window centre) so the cursor shows
-            // before the first motion event.
-            if self.app.software_cursor.virtual_pos().is_none() {
-                let logical = rotation.transform_screen_rect(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    physical_size,
-                ));
-                self.app.software_cursor.set_virtual_pos(logical.center());
-            }
-            let _ = self
-                .app
-                .software_cursor
-                .process_input(&mut raw_input, rotation, physical_size);
-        } else {
-            transform_raw_input(&mut raw_input, rotation);
-        }
-        // Confine the OS pointer to the window while the software cursor is
-        // active, so the hidden OS cursor never escapes and the raw deltas
-        // keep flowing. Applied on state change only (re-armed on focus loss).
-        if use_sw_cursor && !self.app.cursor_grab_applied {
-            self.app.cursor_grab_applied = window
-                .set_cursor_grab(winit::window::CursorGrabMode::Confined)
-                .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Locked))
-                .is_ok();
-        } else if !use_sw_cursor && self.app.cursor_grab_applied {
-            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
-            self.app.cursor_grab_applied = false;
-        }
 
-        // 2. Run the UI in the (rotated) logical coordinate space. egui
-        //    0.34's run_ui hands us a root Ui that the panels nest into.
-        let ctx = self.egui_ctx.clone();
+        // 3. Run the UI. The plugin rotates input + shapes and draws the cursor.
         let app = &mut self.app;
         let full_output = ctx.run_ui(raw_input, |ui| app.ui(ui));
 
-        // Rotate the cursor icon to match the display: egui-rotate handles
-        // pointer *positions* via transform_raw_input, but directional icons
-        // (resize arrows, text caret) must be remapped here so they point the
-        // right way on the physically-rotated screen.
-        let mut platform_output = full_output.platform_output.clone();
-        platform_output.cursor_icon = if use_sw_cursor {
-            // Hide the OS cursor — we draw our own, which also sidesteps the
-            // rotated-icon "VerticalText" set-cursor error winit logs.
-            egui::CursorIcon::None
-        } else {
-            platform_output.cursor_icon.rotate(rotation)
-        };
+        // 4. If the software cursor was released to the OS (soft-lock breakout
+        //    or a no-lock edge contact), warp the real cursor to the exit point.
+        //    The plugin drops its own OS grab via a viewport command.
+        if let Some(warp) = ctx.plugin::<RotationPlugin>().lock().take_pending_warp() {
+            let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
+                f64::from(warp.x),
+                f64::from(warp.y),
+            ));
+        }
+
+        // 5. Platform output — the plugin already set the cursor icon (None
+        //    while the software cursor is captured, remapped otherwise).
         self.egui_winit
             .as_mut()
             .unwrap()
-            .handle_platform_output(window, platform_output);
+            .handle_platform_output(window, full_output.platform_output);
 
-        // 3. Tessellate, then rotate primitives back to physical space.
-        let logical_size = ctx.content_rect().size();
-        let mut clipped = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-        transform_clipped_primitives(&mut clipped, rotation, logical_size);
+        // 6. Shapes are already rotated by the plugin — tessellate and paint.
+        let clipped = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
-        // 4. Paint.
         let painter = self.painter.as_mut().unwrap();
         for (id, image_delta) in &full_output.textures_delta.set {
             painter.set_texture(*id, image_delta);
@@ -932,6 +894,21 @@ impl winit::application::ApplicationHandler for DemoShell {
             Some(painter.max_texture_side()),
         );
 
+        // The whole rotation/cursor integration: register the plugin once. It
+        // rotates input + rendered shapes per viewport, draws a rotated
+        // software cursor and hides the OS one. `with_os_cursor_pin` keeps the
+        // hidden real cursor centred so it can never physically leave the
+        // window (kiosk / cabinet) — replaces the old manual `set_cursor_grab`.
+        // Hard lock: the pincab screen is fixed, the cursor stays put.
+        self.egui_ctx.add_plugin(
+            RotationPlugin::new(self.app.rotation).with_software_cursor(
+                SoftwareCursor::new()
+                    .with_lock(true)
+                    .with_os_cursor_pin(true)
+                    .with_scale(1.4),
+            ),
+        );
+
         self.gl_window = Some(gl_window);
         self.gl = Some(gl);
         self.egui_winit = Some(egui_winit);
@@ -962,22 +939,6 @@ impl winit::application::ApplicationHandler for DemoShell {
             }
             return;
         }
-        // Losing focus drops any OS cursor grab — re-arm so `redraw` reapplies
-        // it when focus returns.
-        if let WindowEvent::Focused(false) = &event {
-            self.app.cursor_grab_applied = false;
-        }
-        // Esc toggles the software cursor — the escape hatch back to the plain
-        // OS cursor if the virtual one ever misbehaves. (egui still receives
-        // the key below, so it also closes any open popup.)
-        if let WindowEvent::KeyboardInput { event: key, .. } = &event
-            && key.state == winit::event::ElementState::Pressed
-            && key.physical_key
-                == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape)
-        {
-            self.app.sw_cursor_on = !self.app.sw_cursor_on;
-        }
-
         let window = self.gl_window.as_ref().unwrap().window();
         let response = self
             .egui_winit
@@ -991,8 +952,9 @@ impl winit::application::ApplicationHandler for DemoShell {
 
     /// Raw pointer motion (relative deltas) drives the software cursor — the
     /// window-event `CursorMoved` gives absolute positions that move the wrong
-    /// way once the viewport is rotated, so we accumulate `MouseMotion` and
-    /// feed it as `Event::MouseMoved` in `redraw`.
+    /// way once the viewport is rotated. `egui_winit::State::on_mouse_motion`
+    /// feeds the delta into egui; the `RotationPlugin` input hook turns it into
+    /// the rotated software-cursor movement.
     fn device_event(
         &mut self,
         _event_loop: &winit::event_loop::ActiveEventLoop,
@@ -1000,12 +962,11 @@ impl winit::application::ApplicationHandler for DemoShell {
         event: winit::event::DeviceEvent,
     ) {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event
-            && self.app.sw_cursor_on
+            && let Some(state) = self.egui_winit.as_mut()
+            && state.on_mouse_motion(delta)
+            && let Some(w) = self.gl_window.as_ref()
         {
-            self.app.mouse_delta_accum += egui::vec2(delta.0 as f32, delta.1 as f32);
-            if let Some(w) = self.gl_window.as_ref() {
-                w.window().request_redraw();
-            }
+            w.window().request_redraw();
         }
     }
 
@@ -1164,9 +1125,10 @@ fn poll_active_headless(active: &mut Active) {
         Inner::KinectV2 { device, .. } => {
             if let Some(rgb) = device.poll_rgb() {
                 let rgb888 = bgrx_to_rgb888(&rgb.data);
-                if let Some(detector) = active.head_detector.as_ref() {
-                    active.last_heads = detector.detect(&rgb888, rgb.width, rgb.height);
-                }
+                active
+                    .head_worker
+                    .submit(rgb888.clone(), rgb.width, rgb.height);
+                active.last_heads = active.head_worker.snapshot().heads;
                 active
                     .u_worker
                     .submit(rgb888.clone(), rgb.width, rgb.height);
@@ -1178,9 +1140,10 @@ fn poll_active_headless(active: &mut Active) {
         }
         Inner::KinectV1 { device, .. } => {
             if let Some(rgb) = device.poll_rgb() {
-                if let Some(detector) = active.head_detector.as_ref() {
-                    active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
-                }
+                active
+                    .head_worker
+                    .submit(rgb.data.clone(), rgb.width, rgb.height);
+                active.last_heads = active.head_worker.snapshot().heads;
                 active
                     .u_worker
                     .submit(rgb.data.clone(), rgb.width, rgb.height);
@@ -1192,9 +1155,10 @@ fn poll_active_headless(active: &mut Active) {
         }
         Inner::Webcam { camera } => {
             if let Some(rgb) = camera.poll_rgb() {
-                if let Some(detector) = active.head_detector.as_ref() {
-                    active.last_heads = detector.detect(&rgb.data, rgb.width, rgb.height);
-                }
+                active
+                    .head_worker
+                    .submit(rgb.data.clone(), rgb.width, rgb.height);
+                active.last_heads = active.head_worker.snapshot().heads;
                 active
                     .u_worker
                     .submit(rgb.data.clone(), rgb.width, rgb.height);
@@ -1684,23 +1648,6 @@ struct App {
     /// (see [`rotation_label`]). The ⟳ button cycles +90° clockwise from
     /// the player's seat. Read by [`DemoShell::redraw`].
     rotation: Rotation,
-    /// Virtual cursor for the rotated display: the OS cursor moves in
-    /// physical space, so on a rotated screen it drifts sideways and its
-    /// icon rotation trips winit's "VerticalText" set-cursor error. When
-    /// `sw_cursor_on` we hide the OS cursor and drive this one from raw
-    /// mouse deltas instead (see [`DemoShell::redraw`]). Esc toggles it.
-    software_cursor: SoftwareCursor,
-    /// Accumulated raw mouse motion (winit `DeviceEvent::MouseMotion`)
-    /// since the last frame, fed to the software cursor as `MouseMoved`.
-    mouse_delta_accum: egui::Vec2,
-    /// `false` reverts to the plain OS cursor (Esc). Off automatically when
-    /// the display isn't rotated — the software cursor only earns its keep
-    /// on a rotated viewport.
-    sw_cursor_on: bool,
-    /// Tracks whether the OS pointer is currently grabbed (confined to the
-    /// window) so we only call `set_cursor_grab` on a state change, not every
-    /// frame. Reset when the window loses focus (the OS drops the grab).
-    cursor_grab_applied: bool,
     /// Set by the Quit button; [`DemoShell`] exits the event loop next frame.
     should_quit: bool,
     /// Parallax validation window toggle (🪟 button). When on, the central
@@ -1802,11 +1749,13 @@ struct Active {
     /// egui texture holding the translucent U mask overlay (160×160 proto
     /// grid), rebuilt by [`refresh_u_overlay`] each frame a U exists.
     u_mask_texture: Option<TextureHandle>,
-    /// `Some` once the head detector (SCUT-HEAD nano) is initialised —
-    /// mirrors the plugin: the Kinect/webcam paths track the head as a
-    /// shape, not a frontal face, so tracking holds when the player leans
-    /// over the playfield. Cheap to keep around (nano runs in a few ms on CPU).
-    head_detector: Option<head::Detector>,
+    /// Background thread running the SCUT-HEAD nano detector off the UI
+    /// thread — mirrors the plugin (track the head as a *shape*, so tracking
+    /// holds when the player leans over the playfield). At MODEL_SIDE=160 one
+    /// detection is ~15 ms; on its own core it produces a fresh head every
+    /// ~60 Hz frame while the render loop runs at full camera rate, so
+    /// `out_fps` matches `in_fps` (see [`HeadWorker`]).
+    head_worker: HeadWorker,
     last_heads: Vec<head::HeadAnchor>,
     /// Latest RGB888 frame (width, height, bytes) — kept so the
     /// "Screenshot" button can write it to disk without re-grabbing
@@ -1914,6 +1863,7 @@ fn u_worker_loop(
     let mut first_detection_at: Option<Instant> = None;
     let mut locked = false;
     let mut best_conf = 0.0f32;
+    let lut = detect_boost_lut();
 
     loop {
         // Block until a frame arrives (or we're asked to stop).
@@ -1928,7 +1878,7 @@ fn u_worker_loop(
             }
             slot.take()
         };
-        let Some(item) = item else { continue };
+        let Some(mut item) = item else { continue };
         if locked {
             continue; // calibration frozen — drop the frame.
         }
@@ -1958,6 +1908,7 @@ fn u_worker_loop(
         let det = detector.as_ref().expect("init checked above");
         last_run_at = Some(now);
         let t0 = Instant::now();
+        apply_detect_boost(&mut item.rgb888, &lut);
         let dets = det.detect(&item.rgb888, item.w, item.h);
         let u_ms = t0.elapsed().as_secs_f32() * 1000.0;
         if let Some(best) = dets.into_iter().next() {
@@ -1988,6 +1939,145 @@ fn u_worker_loop(
             locked = true;
             info!(best_conf, "U: warmup over, calibration locked");
         }
+    }
+}
+
+// ---------------------------------------------------------------- Head worker
+
+/// Latest RGB frame handed to the [`HeadWorker`]. Only the most recent one
+/// matters — the worker overwrites any still-unprocessed job.
+struct HeadJob {
+    rgb888: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+/// What the [`HeadWorker`] publishes after each detection.
+#[derive(Clone, Default)]
+struct HeadOut {
+    heads: Vec<head::HeadAnchor>,
+    /// Last head inference time (ms); `0.0` until the first detection.
+    head_ms: f32,
+}
+
+/// Runs the head detector (~15 ms at MODEL_SIDE=160) off the UI thread. The UI
+/// submits the latest colour frame each poll and reads the newest head boxes
+/// back via [`HeadWorker::snapshot`] without ever blocking on inference — so
+/// the render loop keeps the full camera frame rate (`out_fps` == `in_fps`)
+/// and the detector runs flat-out on its own core, yielding a fresh head every
+/// ~60 Hz frame. Unlike [`UWorker`] there is no warmup/freeze: the head moves,
+/// so we keep detecting for the whole session.
+struct HeadWorker {
+    job: Arc<(Mutex<Option<HeadJob>>, Condvar)>,
+    out: Arc<Mutex<HeadOut>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeadWorker {
+    fn spawn(backend_name: &'static str) -> Self {
+        let job = Arc::new((Mutex::new(None::<HeadJob>), Condvar::new()));
+        let out = Arc::new(Mutex::new(HeadOut::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (job_t, out_t, stop_t) = (Arc::clone(&job), Arc::clone(&out), Arc::clone(&stop));
+        let handle = std::thread::Builder::new()
+            .name("head-detector".into())
+            .spawn(move || head_worker_loop(backend_name, &job_t, &out_t, &stop_t))
+            .expect("spawn head-detector thread");
+        Self {
+            job,
+            out,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Hand the worker the latest colour frame, replacing any pending one.
+    fn submit(&self, rgb888: Vec<u8>, w: u32, h: u32) {
+        *self.job.0.lock() = Some(HeadJob { rgb888, w, h });
+        self.job.1.notify_one();
+    }
+
+    /// Newest head boxes the worker has produced. Never blocks on inference.
+    fn snapshot(&self) -> HeadOut {
+        self.out.lock().clone()
+    }
+}
+
+impl Drop for HeadWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.job.1.notify_one();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Body of the head-detector thread: wait for a frame, run inference flat-out
+/// (no throttle — the head is always moving), publish the boxes + timing.
+fn head_worker_loop(
+    backend_name: &'static str,
+    job: &Arc<(Mutex<Option<HeadJob>>, Condvar)>,
+    out: &Arc<Mutex<HeadOut>>,
+    stop: &Arc<AtomicBool>,
+) {
+    let detector = init_head_detector(backend_name);
+    let lut = detect_boost_lut();
+    loop {
+        // Block until a frame arrives (or we're asked to stop).
+        let item = {
+            let (lock, cvar) = &**job;
+            let mut slot = lock.lock();
+            while slot.is_none() && !stop.load(Ordering::Acquire) {
+                cvar.wait(&mut slot);
+            }
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            slot.take()
+        };
+        let Some(mut item) = item else { continue };
+        let Some(detector) = detector.as_ref() else {
+            continue; // detector failed to init — nothing to do.
+        };
+        let t0 = Instant::now();
+        apply_detect_boost(&mut item.rgb888, &lut);
+        let heads = detector.detect(&item.rgb888, item.w, item.h);
+        let head_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let mut o = out.lock();
+        o.heads = heads;
+        o.head_ms = head_ms;
+    }
+}
+
+// ------------------------------------------------------ Brightness / contrast
+
+/// Light brightness + contrast lift applied to the colour frame *before*
+/// inference — the head/U models were trained on well-exposed images, and the
+/// pincab feed (Kinect v1 640×480 especially) is dim, which drags the U-seg
+/// confidence right down. Pivoted around mid-grey so we brighten without
+/// blowing out highlights. Applied to a copy fed to the detectors only; the
+/// on-screen texture keeps the raw pixels.
+const DETECT_BRIGHTNESS: f32 = 12.0; // added after contrast, in 0..255
+const DETECT_CONTRAST: f32 = 1.12; // slope around 128
+
+/// Precompute the 256-entry LUT once (contrast slope + brightness offset,
+/// clamped). A per-byte table lookup keeps the full-frame pass cheap.
+fn detect_boost_lut() -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        let x = i as f32;
+        let y = (x - 128.0) * DETECT_CONTRAST + 128.0 + DETECT_BRIGHTNESS;
+        *v = y.clamp(0.0, 255.0) as u8;
+    }
+    lut
+}
+
+/// Apply the brightness/contrast LUT to a packed RGB buffer in place.
+fn apply_detect_boost(rgb888: &mut [u8], lut: &[u8; 256]) {
+    for b in rgb888.iter_mut() {
+        *b = lut[*b as usize];
     }
 }
 
@@ -2543,12 +2633,6 @@ impl App {
             // see `rotation_label`). This is the orientation that reads
             // upright on the cab.
             rotation: Rotation::CW90,
-            // Locked (kiosk) so the virtual cursor stays inside the window;
-            // scaled up a touch for a cabinet viewed from a distance.
-            software_cursor: SoftwareCursor::new().with_lock(true).with_scale(1.4),
-            mouse_delta_accum: egui::Vec2::ZERO,
-            sw_cursor_on: true,
-            cursor_grab_applied: false,
             should_quit: false,
             parallax_enabled: false,
             parallax_tex: None,
@@ -2636,13 +2720,16 @@ impl App {
                     // detector and screenshot button all consume the
                     // packed-RGB buffer.
                     let rgb888 = bgrx_to_rgb888(&rgb.data);
-                    if let Some(detector) = active.head_detector.as_ref() {
-                        let t0 = Instant::now();
-                        let heads = detector.detect(&rgb888, rgb.width, rgb.height);
-                        active
-                            .metrics
-                            .note_head_ms(t0.elapsed().as_secs_f32() * 1000.0);
-                        active.last_heads = heads;
+                    // Head + U detectors both run on background threads; submit
+                    // the same frame to each and read the newest results back
+                    // without blocking the render loop.
+                    active
+                        .head_worker
+                        .submit(rgb888.clone(), rgb.width, rgb.height);
+                    let head_out = active.head_worker.snapshot();
+                    active.last_heads = head_out.heads;
+                    if head_out.head_ms > 0.0 {
+                        active.metrics.note_head_ms(head_out.head_ms);
                     }
                     active
                         .u_worker
@@ -2691,13 +2778,13 @@ impl App {
             Inner::KinectV1 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
                     active.metrics.note_input_frame();
-                    if let Some(detector) = active.head_detector.as_ref() {
-                        let t0 = Instant::now();
-                        let heads = detector.detect(&rgb.data, rgb.width, rgb.height);
-                        active
-                            .metrics
-                            .note_head_ms(t0.elapsed().as_secs_f32() * 1000.0);
-                        active.last_heads = heads;
+                    active
+                        .head_worker
+                        .submit(rgb.data.clone(), rgb.width, rgb.height);
+                    let head_out = active.head_worker.snapshot();
+                    active.last_heads = head_out.heads;
+                    if head_out.head_ms > 0.0 {
+                        active.metrics.note_head_ms(head_out.head_ms);
                     }
                     active
                         .u_worker
@@ -2743,33 +2830,35 @@ impl App {
             Inner::Webcam { camera } => {
                 if let Some(rgb) = camera.poll_rgb() {
                     active.metrics.note_input_frame();
-                    // Head detection on the raw camera frame (before the
-                    // ColorImage conversion strips the contiguous bytes).
-                    if let Some(detector) = active.head_detector.as_ref() {
-                        let t0 = Instant::now();
-                        let heads = detector.detect(&rgb.data, rgb.width, rgb.height);
-                        active
-                            .metrics
-                            .note_head_ms(t0.elapsed().as_secs_f32() * 1000.0);
-                        active.last_heads = heads;
-                        let preferred = active
-                            .last_lockbar
-                            .as_ref()
-                            .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
-                        if let Some(anchor) =
-                            pick_player_head(&active.last_heads, rgb.width, preferred)
-                        {
-                            let head = head_to_pixel_webcam(anchor, rgb.width, rgb.height);
-                            let smoothed =
-                                smooth_head(Some(head), &mut active.pose_filter, active.started_at);
-                            capture_baseline(&mut active.baseline, smoothed);
-                            active.last_head = smoothed;
-                            if smoothed.is_some() {
-                                active.metrics.note_output_pose();
-                            }
-                        } else {
-                            active.last_head = None;
+                    // Head detection runs on its own thread; submit the raw
+                    // camera frame and read back the newest boxes.
+                    active
+                        .head_worker
+                        .submit(rgb.data.clone(), rgb.width, rgb.height);
+                    let head_out = active.head_worker.snapshot();
+                    active.last_heads = head_out.heads;
+                    if head_out.head_ms > 0.0 {
+                        active.metrics.note_head_ms(head_out.head_ms);
+                    }
+                    // Webcam has no depth: triangulate Z from the head-box
+                    // width against a nominal skull size (see
+                    // `head_to_pixel_webcam`).
+                    let preferred = active
+                        .last_lockbar
+                        .as_ref()
+                        .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
+                    if let Some(anchor) = pick_player_head(&active.last_heads, rgb.width, preferred)
+                    {
+                        let head = head_to_pixel_webcam(anchor, rgb.width, rgb.height);
+                        let smoothed =
+                            smooth_head(Some(head), &mut active.pose_filter, active.started_at);
+                        capture_baseline(&mut active.baseline, smoothed);
+                        active.last_head = smoothed;
+                        if smoothed.is_some() {
+                            active.metrics.note_output_pose();
                         }
+                    } else {
+                        active.last_head = None;
                     }
                     active
                         .u_worker
@@ -3023,9 +3112,32 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("Input:");
                 let selected_label = self.label_for(self.selected);
+                // Size the combo to the widest label currently on offer so no
+                // entry wraps (a wrapped entry spans several lines and pushes
+                // the popup past its max height → a scrollbar). Recomputed
+                // every frame, so it grows when a rescan adds a long webcam
+                // name and shrinks back when the camera is unplugged. Width is
+                // estimated from character count (≈ button glyph advance) — a
+                // hair generous, which is exactly what we want here.
+                let font_h = egui::TextStyle::Button.resolve(ui.style()).size;
+                let glyph_w = font_h * 0.58;
+                let longest = self
+                    .available
+                    .iter()
+                    .map(|e| e.label.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .max(selected_label.chars().count());
+                // Room for the checkmark gutter + dropdown arrow + padding;
+                // clamp so a pathological device name can't overflow the row.
+                let combo_w = (longest as f32 * glyph_w + 48.0).clamp(140.0, 520.0);
                 ComboBox::from_id_salt("backend")
+                    .width(combo_w)
                     .selected_text(selected_label)
                     .show_ui(ui, |ui| {
+                        // Keep each entry on a single line; the popup then
+                        // stretches to exactly the number of entries.
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         let entries = self.available.clone();
                         for entry in &entries {
                             ui.selectable_value(&mut self.selected, entry.backend, &entry.label);
@@ -3317,17 +3429,6 @@ impl App {
             }
             self.draw_camera_view(ui);
         });
-
-        // Draw the virtual cursor last, on the foreground layer, in logical
-        // space — it rotates back to physical with the rest of the frame.
-        if self.sw_cursor_on && !self.rotation.is_none() {
-            let painter = ui.ctx().layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("sw_cursor"),
-            ));
-            self.software_cursor
-                .draw(&painter, egui::CursorIcon::Default);
-        }
     }
 
     /// Camera feed with the lockbar + head overlays, scaled to fit while
@@ -3753,7 +3854,6 @@ fn open_kinect_v2() -> Result<Active, String> {
         .start_streams(true, true)
         .map_err(|e| format!("freenect2 start_streams: {e}"))?;
     let p = device.ir_params();
-    let detector = init_head_detector("kinect-v2");
     Ok(Active {
         backend: Backend::KinectV2,
         intrinsics: Intrinsics {
@@ -3773,7 +3873,7 @@ fn open_kinect_v2() -> Result<Active, String> {
         last_u: None,
         u_worker: UWorker::spawn(),
         u_mask_texture: None,
-        head_detector: detector,
+        head_worker: HeadWorker::spawn("kinect-v2"),
         last_heads: Vec::new(),
         last_rgb_frame: None,
         metrics: Metrics::new(),
@@ -3819,7 +3919,6 @@ fn open_kinect_v1() -> Result<Active, String> {
         warn!(?e, "kinect v1: initial set_led failed");
     }
 
-    let detector = init_head_detector("kinect-v1");
     Ok(Active {
         backend: Backend::KinectV1,
         intrinsics: Intrinsics {
@@ -3839,7 +3938,7 @@ fn open_kinect_v1() -> Result<Active, String> {
         last_u: None,
         u_worker: UWorker::spawn(),
         u_mask_texture: None,
-        head_detector: detector,
+        head_worker: HeadWorker::spawn("kinect-v1"),
         last_heads: Vec::new(),
         last_rgb_frame: None,
         metrics: Metrics::new(),
@@ -3868,7 +3967,6 @@ fn init_head_detector(backend_name: &'static str) -> Option<head::Detector> {
 
 fn open_webcam(index: u32) -> Result<Active, String> {
     let camera = webcam::Camera::open(index).map_err(|e| format!("webcam open: {e}"))?;
-    let detector = init_head_detector("webcam");
     Ok(Active {
         backend: Backend::Webcam(index),
         // Without lockbar/disc calibration, fx ≈ 0.85 × frame_width is a
@@ -3891,7 +3989,7 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         last_u: None,
         u_worker: UWorker::spawn(),
         u_mask_texture: None,
-        head_detector: detector,
+        head_worker: HeadWorker::spawn("webcam"),
         last_heads: Vec::new(),
         last_rgb_frame: None,
         metrics: Metrics::new(),
