@@ -39,3 +39,4 @@ target
 # Mirror of crates/lockbar-onnx/models/lockbar.onnx — only the in-crate
 # copy is checked in (build pulls from there via include_bytes!).
 /models/
+/.work/

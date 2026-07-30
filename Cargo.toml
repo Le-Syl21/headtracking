@@ -55,7 +55,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 os_info = { version = "3", default-features = false }
 arc-swap = "1"
 parking_lot = "0.12"
-nalgebra = "0.34"
 thiserror = "2"
 freenect = { path = "crates/freenect", optional = true }
 freenect2 = { path = "crates/freenect2", optional = true }

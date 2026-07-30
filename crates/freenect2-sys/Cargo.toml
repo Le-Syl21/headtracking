@@ -25,3 +25,10 @@ libusb-sys = { path = "../libusb-sys" }
 [build-dependencies]
 cxx-build = "1.0"
 cmake = "0.1"
+
+# turbojpeg-sys and libusb-sys are build-time *link* dependencies: build.rs
+# reads their `DEP_TURBOJPEG_*` / `DEP_USB_1.0_*` metadata to feed the static
+# libfreenect2 build, but nothing `use`s them in Rust — so cargo-machete flags
+# them as unused. Silence the false positives.
+[package.metadata.cargo-machete]
+ignored = ["turbojpeg-sys", "libusb-sys"]

@@ -17,3 +17,9 @@ libusb-sys = { path = "../libusb-sys" }
 [build-dependencies]
 bindgen = "0.72"
 cmake = "0.1"
+
+# libusb-sys is a build-time *link* dependency: build.rs reads its
+# `DEP_USB_1.0_*` metadata to source libusb, but nothing `use`s it in Rust —
+# so cargo-machete can't see it. Silence the false positive.
+[package.metadata.cargo-machete]
+ignored = ["libusb-sys"]
