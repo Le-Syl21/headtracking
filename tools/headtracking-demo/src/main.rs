@@ -45,6 +45,39 @@ const DEPTH_MAX_MM: f32 = 2_500.0;
 
 const LOG_BUFFER_LINES: usize = 1_000;
 
+mod contribute;
+
+/// Privacy-notice bullets for the Share-a-capture window (title, body).
+const CONTRIB_TERMS: &[(&str, &str)] = &[
+    (
+        "Sole use",
+        "to train and improve the pincab head-tracking model. Nothing else.",
+    ),
+    (
+        "Private storage",
+        "each capture is saved locally in the demo's contributions/ folder (your own \
+         copy) and uploaded to the maintainer's private, write-only server. On the \
+         server no one — not even you — can list, read or download anything; only the \
+         maintainer sees the uploads.",
+    ),
+    (
+        "Never public",
+        "never published, sold, shared with third parties, or used beyond training.",
+    ),
+    (
+        "Your responsibility",
+        "share only images you have the right to distribute. If people appear (children \
+         included), you confirm you have their consent (or are the parent/guardian). You \
+         must be of legal age.",
+    ),
+    (
+        "Withdrawal",
+        "uploads are anonymous and can't be searched by author — to have one removed, give \
+         its exact file name (shown after upload) on Discord #headtracking \
+         (https://discord.gg/cFcNrt9AY).",
+    ),
+];
+
 // Overlay colours, kept here so the toolbar status text and the canvas
 // drawing stay in sync. Head → soft red; the U segmentation mask → a
 // translucent cyan fill, with the lockbar quad derived from its closed
@@ -70,6 +103,29 @@ fn main() {
         arch = host.architecture().unwrap_or("unknown"),
         "headtracking-demo starting"
     );
+
+    // Hidden `--upload-test`: exercise the contribution upload path (ureq /
+    // rustls / auth / write-only drop) end to end without the GUI, then exit.
+    if std::env::args().any(|a| a == "--upload-test") {
+        let uploader = contribute::Uploader::spawn();
+        let name = format!("{}_uploadtest.txt", contribution_stem(Backend::None));
+        println!("upload-test: PUT {name}");
+        uploader.submit(name.clone(), b"headtracking-demo upload test\n".to_vec());
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            let st = uploader.status();
+            if st.pending == 0 {
+                if st.uploaded > 0 {
+                    println!("upload-test: OK ({name})");
+                    std::process::exit(0);
+                }
+                eprintln!("upload-test: FAILED — {:?}", st.last_error);
+                std::process::exit(1);
+            }
+        }
+        eprintln!("upload-test: timeout");
+        std::process::exit(1);
+    }
 
     // CLI: `--capture <backend>` runs a headless capture (no eframe)
     // and exits. Used by `ssh` from a remote workstation to iterate
@@ -1070,6 +1126,31 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
         "headless capture starting"
     );
     let mut active = open_backend(cap.backend)?;
+    // Same stream-liveness recovery as the GUI, but blocking: wait for the
+    // first RGB frame and bounce the stream up to MAX_STREAM_BOUNCES times
+    // (the Kinect v1 sometimes opens without ever delivering a frame).
+    for bounce in 0..=MAX_STREAM_BOUNCES {
+        let deadline = Instant::now() + FIRST_FRAME_WAIT;
+        let mut live = false;
+        while Instant::now() < deadline {
+            if active.poll_first_rgb() {
+                live = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if live {
+            break;
+        }
+        if bounce == MAX_STREAM_BOUNCES {
+            return Err(format!(
+                "{}: no video after {MAX_STREAM_BOUNCES} stream restarts",
+                backend_slug(cap.backend)
+            ));
+        }
+        warn!(backend = ?cap.backend, next = bounce + 1, "headless: no first frame, bouncing stream");
+        active.bounce_stream()?;
+    }
     let deadline = Instant::now() + Duration::from_secs_f32(cap.wait_secs.max(0.1));
     while Instant::now() < deadline {
         poll_active_headless(&mut active);
@@ -1617,6 +1698,33 @@ fn fix_kinect_access() -> Result<(), String> {
 
 // ============================================================ App state
 
+/// Duration each of the two settle phases lasts when switching backend.
+const SWITCH_SETTLE: Duration = Duration::from_millis(500);
+/// How long to wait for the first RGB frame after opening before bouncing the
+/// stream. The Kinect v1 in particular sometimes needs a stream restart.
+const FIRST_FRAME_WAIT: Duration = Duration::from_millis(900);
+/// Stream bounces (stop+start / reopen) attempted before giving up on a frame.
+const MAX_STREAM_BOUNCES: u8 = 3;
+
+/// Backend-switch state machine (see [`App::switch_state`]).
+enum SwitchState {
+    /// Not switching — the active backend (if any) matches the selection.
+    Idle,
+    /// The old backend was just closed; waiting out the release settle.
+    Closing(Instant),
+    /// Settle done; showing "opening" before the actual open call.
+    Opening(Instant),
+    /// Device opened; polling for the first RGB frame. If none arrives within
+    /// [`FIRST_FRAME_WAIT`] the stream is bounced (up to [`MAX_STREAM_BOUNCES`]
+    /// times, shown as "retry n/3") before the open is declared failed.
+    Waiting {
+        active: Box<Active>,
+        /// Bounce attempts so far (0 = first wait, no bounce yet).
+        bounces: u8,
+        since: Instant,
+    },
+}
+
 struct App {
     selected: Backend,
     available: Vec<BackendEntry>,
@@ -1645,6 +1753,25 @@ struct App {
     rotation: Rotation,
     /// Set by the Quit button; [`DemoShell`] exits the event loop next frame.
     should_quit: bool,
+    /// "Share a capture" window toggle + state.
+    contribute_open: bool,
+    /// The informed-consent checkbox (see the privacy notice). Gates the
+    /// share button; in-memory for the session.
+    consent_checked: bool,
+    /// Background uploader for shared captures (write-only Nextcloud drop).
+    uploader: contribute::Uploader,
+    /// Stem of the last capture shared, shown so the user can note it (needed
+    /// to request a removal, since the drop is anonymous).
+    contrib_last: Option<String>,
+    /// Embedded help thumbnails (example capture + the two setup photos),
+    /// decoded to textures on first open of the panel.
+    contrib_thumbs: Option<[TextureHandle; 3]>,
+    /// Backend-switch state machine. Switching device closes the old one, then
+    /// waits ~500 ms ("closing"), then ~500 ms ("opening") before the actual
+    /// open — ~1 s of USB settle so a Kinect released by one backend is ready
+    /// before the next grabs it (see [`App::ensure_active`]). Non-blocking: the
+    /// waits are checked each frame so the UI stays live and shows the status.
+    switch_state: SwitchState,
     /// Parallax validation window toggle (🪟 button). When on, the central
     /// panel shows the camera feed with the off-axis 3D scene stacked below
     /// it (see `docs/parallax-validation-window.md`).
@@ -2230,12 +2357,18 @@ fn u_to_lockbar_quad(
     // then span the WHOLE playfield side: from the lockbar corner down to the
     // near/bottom edge of the visible playfield.
     let fill_below: u64 = if bar_y1 < py_max {
-        row_count[bar_y1 + 1..=py_max].iter().map(|&c| u64::from(c)).sum()
+        row_count[bar_y1 + 1..=py_max]
+            .iter()
+            .map(|&c| u64::from(c))
+            .sum()
     } else {
         0
     };
     let fill_above: u64 = if bar_y0 > py_min {
-        row_count[py_min..bar_y0].iter().map(|&c| u64::from(c)).sum()
+        row_count[py_min..bar_y0]
+            .iter()
+            .map(|&c| u64::from(c))
+            .sum()
     } else {
         0
     };
@@ -2480,6 +2613,48 @@ impl Inner {
             self,
             Inner::KinectV1 { .. } | Inner::KinectV2 { .. } | Inner::Webcam { .. }
         )
+    }
+}
+
+impl Active {
+    /// Non-blocking check for whether the RGB stream has produced a frame yet.
+    /// Consumes that frame (the poll loop will get the next one) — used only to
+    /// confirm the stream is alive right after opening.
+    fn poll_first_rgb(&self) -> bool {
+        match &self.inner {
+            Inner::KinectV1 { device, .. } => device.poll_rgb().is_some(),
+            Inner::KinectV2 { device, .. } => device.poll_rgb().is_some(),
+            Inner::Webcam { camera } => camera.poll_rgb().is_some(),
+        }
+    }
+
+    /// Bounce the RGB stream to recover from a stalled open: stop+start for the
+    /// Kinects, reopen the SDL device for the webcam. Returns the failure
+    /// reason if the restart itself errors.
+    fn bounce_stream(&mut self) -> Result<(), String> {
+        let backend = self.backend;
+        match &mut self.inner {
+            Inner::KinectV1 { device, .. } => {
+                device.stop().map_err(|e| format!("v1 stop: {e}"))?;
+                device
+                    .start_streams(true, true)
+                    .map_err(|e| format!("v1 start: {e}"))
+            }
+            Inner::KinectV2 { device, .. } => {
+                device.stop().map_err(|e| format!("v2 stop: {e}"))?;
+                device
+                    .start_streams(true, true)
+                    .map_err(|e| format!("v2 start: {e}"))
+            }
+            Inner::Webcam { camera } => {
+                let id = match backend {
+                    Backend::Webcam(i) => i,
+                    _ => 1,
+                };
+                *camera = webcam::Camera::open(id).map_err(|e| format!("webcam reopen: {e}"))?;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -2766,6 +2941,12 @@ impl App {
             // upright on the cab.
             rotation: Rotation::CW90,
             should_quit: false,
+            contribute_open: false,
+            consent_checked: false,
+            uploader: contribute::Uploader::spawn(),
+            contrib_last: None,
+            contrib_thumbs: None,
+            switch_state: SwitchState::Idle,
             parallax_enabled: false,
             parallax_tex: None,
             // Auto-orbit by default: the parallax illusion shows immediately
@@ -2802,41 +2983,159 @@ impl App {
         self.kinect_access_result = None;
     }
 
+    /// State machine, ticked once per frame. On a selection change it closes
+    /// the old backend, waits out a "closing" then an "opening" settle (~1 s
+    /// total of USB release time) and only then opens the new one — so the UI
+    /// never blocks and a Kinect freed by one backend is ready before the next
+    /// grabs it. A first open (nothing to close) skips straight to "opening".
     fn ensure_active(&mut self) {
-        let needs_change = match (&self.active, self.selected) {
-            (Some(a), sel) => a.backend != sel,
-            (None, Backend::None) => false,
-            (None, _) => true,
-        };
-        if !needs_change {
-            return;
+        // Take the state out so the `Waiting` arm can own its `Box<Active>`;
+        // each arm restores a non-`Idle` state when it should stay in-flight.
+        match std::mem::replace(&mut self.switch_state, SwitchState::Idle) {
+            SwitchState::Idle => {
+                let needs_change = match (&self.active, self.selected) {
+                    (Some(a), sel) => a.backend != sel,
+                    (None, Backend::None) => false,
+                    (None, _) => true,
+                };
+                if !needs_change {
+                    return; // stays Idle
+                }
+                let had_old = self.active.is_some();
+                if let Some(old) = self.active.take() {
+                    info!(backend = ?old.backend, "closing backend");
+                    drop(old);
+                }
+                self.error = None;
+                if matches!(self.selected, Backend::None) {
+                    return; // nothing to open — stay Idle
+                }
+                self.switch_state = if had_old {
+                    SwitchState::Closing(Instant::now())
+                } else {
+                    SwitchState::Opening(Instant::now())
+                };
+            }
+            SwitchState::Closing(t) => {
+                self.switch_state = if t.elapsed() >= SWITCH_SETTLE {
+                    SwitchState::Opening(Instant::now())
+                } else {
+                    SwitchState::Closing(t)
+                };
+            }
+            SwitchState::Opening(t) => {
+                if t.elapsed() < SWITCH_SETTLE {
+                    self.switch_state = SwitchState::Opening(t);
+                    return;
+                }
+                if matches!(self.selected, Backend::None) {
+                    return; // selection changed to None during the settle → Idle
+                }
+                match open_backend(self.selected) {
+                    Ok(active) => {
+                        info!(
+                            backend = ?active.backend,
+                            fx = active.intrinsics.fx,
+                            fy = active.intrinsics.fy,
+                            cx = active.intrinsics.cx,
+                            cy = active.intrinsics.cy,
+                            "backend opened"
+                        );
+                        // Opening succeeded, but confirm the stream actually
+                        // flows before going live (Kinect v1 can open yet never
+                        // deliver a frame until the stream is bounced).
+                        self.switch_state = SwitchState::Waiting {
+                            active: Box::new(active),
+                            bounces: 0,
+                            since: Instant::now(),
+                        };
+                    }
+                    Err(e) => {
+                        error!(?e, "failed to open backend");
+                        self.error = Some(e);
+                        self.selected = Backend::None;
+                    }
+                }
+            }
+            SwitchState::Waiting {
+                mut active,
+                bounces,
+                since,
+            } => {
+                if active.poll_first_rgb() {
+                    info!(backend = ?active.backend, bounces, "stream live");
+                    self.active = Some(*active); // → Idle
+                } else if since.elapsed() < FIRST_FRAME_WAIT {
+                    self.switch_state = SwitchState::Waiting {
+                        active,
+                        bounces,
+                        since,
+                    }; // keep waiting this window
+                } else if bounces >= MAX_STREAM_BOUNCES {
+                    let msg = format!(
+                        "{}: no video after {MAX_STREAM_BOUNCES} stream restarts — check the cable / USB",
+                        backend_slug(active.backend)
+                    );
+                    error!("{msg}");
+                    self.error = Some(msg);
+                    self.selected = Backend::None; // drop active → Idle
+                } else {
+                    warn!(backend = ?active.backend, next = bounces + 1, "no first frame, bouncing stream");
+                    match active.bounce_stream() {
+                        Ok(()) => {
+                            self.switch_state = SwitchState::Waiting {
+                                active,
+                                bounces: bounces + 1,
+                                since: Instant::now(),
+                            };
+                        }
+                        Err(e) => {
+                            error!("stream restart failed: {e}");
+                            self.error = Some(e);
+                            self.selected = Backend::None;
+                        }
+                    }
+                }
+            }
         }
-        if let Some(old) = self.active.take() {
-            info!(backend = ?old.backend, "closing backend");
-            drop(old);
-        }
-        self.error = None;
-        if matches!(self.selected, Backend::None) {
-            return;
-        }
-        match open_backend(self.selected) {
-            Ok(active) => {
-                info!(
-                    backend = ?active.backend,
-                    fx = active.intrinsics.fx,
-                    fy = active.intrinsics.fy,
-                    cx = active.intrinsics.cx,
-                    cy = active.intrinsics.cy,
-                    "backend opened"
+    }
+
+    /// Encode the current frame's raw + detection images, save both to
+    /// `contributions/` and queue them for the write-only upload. No-op if no
+    /// frame is available. Called from the "Share a capture" button.
+    fn share_capture(&mut self) {
+        let payload = self.active.as_ref().and_then(|active| {
+            active.last_rgb_frame.as_ref().map(|(w, h, raw)| {
+                let det = bake_overlays(
+                    *w,
+                    *h,
+                    raw,
+                    &active.last_heads,
+                    active.last_lockbar.as_ref(),
                 );
-                self.active = Some(active);
-            }
-            Err(e) => {
-                error!(?e, "failed to open backend");
-                self.error = Some(e);
-                self.selected = Backend::None;
+                (active.backend, *w, *h, raw.clone(), det)
+            })
+        });
+        let Some((backend, w, h, raw, det)) = payload else {
+            return;
+        };
+        let stem = contribution_stem(backend);
+        let dir = contributions_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for (kind, src) in [("raw", &raw), ("det", &det)] {
+            match png_bytes(w, h, src) {
+                Ok(bytes) => {
+                    let name = format!("{stem}_{kind}.png");
+                    if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
+                        warn!(name, "contribution: local save failed: {e}");
+                    }
+                    self.uploader.submit(name, bytes);
+                }
+                Err(e) => warn!("contribution: png encode failed: {e}"),
             }
         }
+        info!(stem, "capture shared");
+        self.contrib_last = Some(stem);
     }
 
     fn poll(&mut self, egui_ctx: &egui::Context) {
@@ -3316,6 +3615,8 @@ impl App {
                 // the central panel (camera | parallax, side by side).
                 ui.toggle_value(&mut self.parallax_enabled, "🪟 parallax")
                     .on_hover_text("Show the off-axis 3D validation scene below the camera feed");
+                ui.toggle_value(&mut self.contribute_open, "🎁 Contribute")
+                    .on_hover_text("Share a capture to help train the head-tracking model");
                 if ui
                     .button("⏻ quit")
                     .on_hover_text("Close the demo (fullscreen has no window buttons)")
@@ -3557,6 +3858,126 @@ impl App {
             }
             self.draw_camera_view(ui);
         });
+        let ctx = ui.ctx().clone();
+        self.contribute_window(&ctx);
+    }
+
+    /// The "Share a capture" window: the informed-consent notice + checkbox,
+    /// the share button (gated on consent + a live frame), upload status, and
+    /// camera-placement help. All demo-only — the plugin has none of this.
+    fn contribute_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.contribute_open;
+        egui::Window::new("🎁 Share a capture")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Please read before accepting").strong());
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(230.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            "By sharing, you upload images from your tracking camera (each \
+                             capture = the raw image + the detection). These images may show \
+                             places, people, and their faces.",
+                        );
+                        ui.add_space(4.0);
+                        for (title, body) in CONTRIB_TERMS {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                ui.label(RichText::new(format!("{title}:")).strong());
+                                ui.label(*body);
+                            });
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut self.consent_checked,
+                    "I have read the above and I freely give my informed consent to share \
+                     these images under these terms.",
+                );
+                ui.add_space(6.0);
+                let has_frame = self
+                    .active
+                    .as_ref()
+                    .is_some_and(|a| a.last_rgb_frame.is_some());
+                let ready = self.consent_checked && has_frame;
+                if ui
+                    .add_enabled(ready, egui::Button::new("📸 Share this capture"))
+                    .clicked()
+                {
+                    self.share_capture();
+                }
+                if !has_frame {
+                    ui.label(RichText::new("(select a device and wait for the feed first)").weak());
+                }
+                // Upload status.
+                let st = self.uploader.status();
+                if st.pending > 0 {
+                    ui.label(format!("uploading… {} file(s) pending", st.pending));
+                }
+                if st.uploaded > 0 {
+                    ui.label(
+                        RichText::new(format!("✓ {} file(s) uploaded", st.uploaded))
+                            .color(Color32::from_rgb(0x66, 0xff, 0x99)),
+                    );
+                }
+                if let Some(err) = &st.last_error {
+                    ui.label(
+                        RichText::new(format!("upload issue: {err} — saved locally"))
+                            .color(Color32::from_rgb(0xff, 0x99, 0x66)),
+                    );
+                }
+                if let Some(stem) = &self.contrib_last {
+                    ui.add_space(4.0);
+                    ui.label("Shared — note this if you may want it removed:");
+                    ui.monospace(format!("{stem}_raw.png · {stem}_det.png"));
+                }
+                ui.separator();
+                egui::CollapsingHeader::new("How to get good captures")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let thumbs = self.contrib_thumbs.get_or_insert_with(|| {
+                            [
+                                load_thumb(
+                                    ctx,
+                                    "ht_ex_shot",
+                                    include_bytes!("../assets/skillshot.jpg"),
+                                ),
+                                load_thumb(
+                                    ctx,
+                                    "ht_ex_bg",
+                                    include_bytes!("../assets/setup_bg.jpg"),
+                                ),
+                                load_thumb(
+                                    ctx,
+                                    "ht_ex_cab",
+                                    include_bytes!("../assets/setup_cab.jpg"),
+                                ),
+                            ]
+                        });
+                        ui.label(
+                            "A good capture shows the lockbar, a bit of the sidebars, and the \
+                         player's head:",
+                        );
+                        show_thumb(ui, &thumbs[0]);
+                        ui.add_space(8.0);
+                        ui.label(
+                        "Mount the camera on top of the backglass (or topper), ideally centred, \
+                         facing the playfield and the player:",
+                    );
+                        show_thumb(ui, &thumbs[1]);
+                        show_thumb(ui, &thumbs[2]);
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Help us with variety:").strong());
+                        ui.label(
+                        "different lighting, colours and brightness; with and without a player; \
+                         the lockbar clear and with hands on it.",
+                    );
+                    });
+            });
+        self.contribute_open = open;
     }
 
     /// Camera feed with the lockbar + head overlays, scaled to fit while
@@ -3612,11 +4033,24 @@ impl App {
                 centered(ui, rect, "waiting for first RGB frame…");
             }
         } else {
-            let msg = self
-                .error
-                .as_deref()
-                .unwrap_or("select an input device above to start streaming");
-            centered(ui, rect, msg);
+            // During a backend switch the old device is already closed, so we
+            // land here — show the settle status instead of the idle prompt.
+            let msg = match &self.switch_state {
+                SwitchState::Closing(_) => "closing…".to_string(),
+                SwitchState::Opening(_) => format!("opening {}…", self.label_for(self.selected)),
+                SwitchState::Waiting { bounces: 0, .. } => {
+                    format!("opening {}…", self.label_for(self.selected))
+                }
+                SwitchState::Waiting { bounces, .. } => {
+                    format!("retry {bounces}/{MAX_STREAM_BOUNCES}…")
+                }
+                SwitchState::Idle => self
+                    .error
+                    .as_deref()
+                    .unwrap_or("select an input device above to start streaming")
+                    .to_string(),
+            };
+            centered(ui, rect, &msg);
         }
     }
 
@@ -4147,6 +4581,72 @@ fn backend_slug(b: Backend) -> String {
         Backend::KinectV2 => "kinect-v2".to_string(),
         Backend::Webcam(i) => format!("webcam-{i}"),
     }
+}
+
+/// Directory for shared captures, next to the running binary.
+fn contributions_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("contributions")
+}
+
+/// Shared stem for a capture's two files: `ht_<backend>_<UTC>_<rand6>`, where
+/// `rand6` is 6 hex chars from the sub-second clock (unique enough — the drop
+/// rejects duplicate names — and unambiguous to read back for a removal).
+fn contribution_stem(backend: Backend) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let rand6 = now.subsec_nanos() & 0x00ff_ffff;
+    format!(
+        "ht_{}_{}_{rand6:06x}",
+        backend_slug(backend),
+        format_utc_stamp(now.as_secs())
+    )
+}
+
+/// Encode an RGB888 buffer to PNG bytes in memory (for the contribution
+/// upload — the screenshot path writes straight to a file instead).
+fn png_bytes(width: u32, height: u32, rgb888: &[u8]) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut wr = encoder
+            .write_header()
+            .map_err(|e| format!("png header: {e}"))?;
+        wr.write_image_data(rgb888)
+            .map_err(|e| format!("png write: {e}"))?;
+    }
+    Ok(buf)
+}
+
+/// Decode an embedded JPEG thumbnail into an egui texture (once, at panel open).
+fn load_thumb(ctx: &egui::Context, name: &str, bytes: &[u8]) -> TextureHandle {
+    let color = match image::load_from_memory(bytes) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
+        }
+        Err(_) => ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]),
+    };
+    ctx.load_texture(name, color, egui::TextureOptions::LINEAR)
+}
+
+/// Draw a help thumbnail scaled to the panel width (max 400 px), keeping aspect.
+fn show_thumb(ui: &mut egui::Ui, tex: &TextureHandle) {
+    let size = tex.size_vec2();
+    let w = ui.available_width().min(400.0);
+    let h = if size.x > 0.0 { w * size.y / size.x } else { w };
+    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+        tex.id(),
+        egui::vec2(w, h),
+    )));
 }
 
 /// Format a UNIX-epoch-seconds value as `YYYYMMDD-HHMMSS` in UTC.
