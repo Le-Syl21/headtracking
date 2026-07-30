@@ -3,6 +3,7 @@
 #include "shim.h"
 #include "freenect2-sys/src/lib.rs.h"
 
+#include <libfreenect2/config.h>
 #include <libfreenect2/packet_pipeline.h>
 
 #include <cstring>
@@ -122,6 +123,25 @@ int32_t enumerate(Freenect2Ctx &ctx) {
 
 std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx) {
     auto holder = std::make_unique<Freenect2Dev>();
+#ifdef LIBFREENECT2_WITH_OPENCL_SUPPORT
+    // Prefer the OpenCL depth pipeline. The Kinect v2 phase-unwrap +
+    // bilateral/edge-aware filtering is what pins the CPU pipeline at
+    // ~260% (and drops USB depth packets when it can't keep up); OpenCL
+    // runs it on the GPU instead. `openDefaultDevice` takes ownership of
+    // the pipeline even on failure, so a null return means the GPU path
+    // is already freed and we can safely retry with the CPU pipeline
+    // (missing ICD, no usable device, etc.).
+    {
+        libfreenect2::PacketPipeline *gpu = new libfreenect2::OpenCLPacketPipeline();
+        holder->dev = ctx.inner.openDefaultDevice(gpu);
+        if (holder->dev) {
+            holder->dev->setIrAndDepthFrameListener(&holder->depth_listener);
+            holder->dev->setColorFrameListener(&holder->rgb_listener);
+            return holder;
+        }
+    }
+#endif
+    // CPU fallback (also the only path on non-OpenCL builds).
     libfreenect2::PacketPipeline *pipeline = new libfreenect2::CpuPacketPipeline();
     // openDefaultDevice takes ownership of the pipeline, even on failure.
     holder->dev = ctx.inner.openDefaultDevice(pipeline);
