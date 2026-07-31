@@ -1,0 +1,18 @@
+[package]
+name = "personseg"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Person silhouette segmentation — MediaPipe Selfie Segmentation ONNX via pure-Rust tract"
+publish = false
+
+[dependencies]
+# Same pure-Rust ONNX paradigm as `head`/`u-onnx`: tract, no native ONNX
+# runtime to ship. Model is MediaPipe Selfie Segmentation "general" (256×256,
+# onnx-community/mediapipe_selfie_segmentation, Apache-2.0): input
+# `pixel_values [1,3,256,256]` RGB in [0,1], output `alphas [1,1,256,256]`
+# already sigmoid-activated in [0,1].
+tract-onnx = { version = "0.23", default-features = false }
+image = { version = "0.25", default-features = false }
+thiserror = "2"
+tracing = "0.1"
