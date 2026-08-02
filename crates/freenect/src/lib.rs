@@ -23,7 +23,7 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -53,6 +53,16 @@ pub struct DepthFrame {
 /// `[R, G, B]` per pixel.
 #[derive(Debug, Clone)]
 pub struct RgbFrame {
+    pub width: u32,
+    pub height: u32,
+    pub timestamp_raw: u32,
+    pub data: Vec<u8>,
+}
+
+/// One 8-bit IR frame copied out of libfreenect's internal buffer.
+/// Row-major grayscale — `width * height` bytes, one intensity byte per pixel.
+#[derive(Debug, Clone)]
+pub struct IrFrame {
     pub width: u32,
     pub height: u32,
     pub timestamp_raw: u32,
@@ -452,6 +462,115 @@ impl Device {
         self.slots.video.poll()
     }
 
+    /// Momentarily switch the video stream to 8-bit IR, let it settle, grab
+    /// one frame, then switch back to RGB. The depth stream is untouched.
+    ///
+    /// The Kinect v1 shares a single USB isochronous endpoint between RGB and
+    /// IR, so the two are mutually exclusive — this reconfigures the video
+    /// mode in place. The RGB stream therefore blinks for ~100–150 ms (mode
+    /// reconfigure + warmup); call it from a manual action, not per frame.
+    /// `warmup` fresh IR frames are discarded before one is kept (the sensor
+    /// needs a couple of frames for its auto-exposure to settle — 3 is a good
+    /// default). Precondition: the video stream is already running (so the
+    /// event loop is live); otherwise this returns [`Error::CaptureTimeout`]
+    /// after restoring RGB.
+    pub fn capture_ir(&mut self, warmup: usize) -> Result<IrFrame, Error> {
+        // Reconfigure to IR_8BIT (640×480, one byte per pixel).
+        self.set_video_format(
+            sys::freenect_video_format_FREENECT_VIDEO_IR_8BIT,
+            (VIDEO_WIDTH * VIDEO_HEIGHT) as usize,
+        )?;
+        // Keep the Nth fresh frame that arrives after the switch.
+        let grabbed = self.grab_fresh_video(warmup.max(1), Duration::from_millis(1500));
+        // Always restore RGB, even if the grab timed out.
+        let restore = self.set_video_format(
+            sys::freenect_video_format_FREENECT_VIDEO_RGB,
+            (VIDEO_WIDTH * VIDEO_HEIGHT * 3) as usize,
+        );
+        let (data, timestamp_raw) = grabbed.ok_or(Error::CaptureTimeout)?;
+        restore?;
+        Ok(IrFrame {
+            width: VIDEO_WIDTH,
+            height: VIDEO_HEIGHT,
+            timestamp_raw,
+            data,
+        })
+    }
+
+    /// Stop the video stream, set a new video format + matching frame size,
+    /// and restart it. The event loop and depth stream are left alone. The
+    /// API lock is held for the whole reconfigure so the event thread can't
+    /// call into libfreenect mid-switch.
+    fn set_video_format(
+        &mut self,
+        format: sys::freenect_video_format,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        let g = self.ctx.api_lock.lock();
+        if self.video_running {
+            // SAFETY: video stream was started; device is open.
+            let _ = unsafe { sys::freenect_stop_video(self.raw) };
+            self.video_running = false;
+        }
+        // SAFETY: device is open and video is stopped — the only state in
+        // which libfreenect allows a mode change.
+        let mode = unsafe {
+            sys::freenect_find_video_mode(
+                sys::freenect_resolution_FREENECT_RESOLUTION_MEDIUM,
+                format,
+            )
+        };
+        if mode.is_valid == 0 {
+            drop(g);
+            return Err(Error::ModeUnavailable);
+        }
+        // SAFETY: `mode` is a valid descriptor for this open device.
+        let rc = unsafe { sys::freenect_set_video_mode(self.raw, mode) };
+        if rc < 0 {
+            drop(g);
+            return Err(Error::ModeUnavailable);
+        }
+        // Match the callback's slice length to the new mode before any frame
+        // can land.
+        self.slots.video.bytes.store(bytes, Ordering::Relaxed);
+        // SAFETY: mode is set, device open.
+        let rc = unsafe { sys::freenect_start_video(self.raw) };
+        if rc < 0 {
+            drop(g);
+            return Err(Error::StartFailed(rc));
+        }
+        self.video_running = true;
+        drop(g);
+        Ok(())
+    }
+
+    /// Block until `count` fresh video frames have arrived (keeping the last),
+    /// or `timeout` elapses. Does not hold the API lock, so the event thread
+    /// keeps delivering frames while this spins.
+    fn grab_fresh_video(&self, count: usize, timeout: Duration) -> Option<(Vec<u8>, u32)> {
+        // Drop any stale frame so we only count ones that land *after* the
+        // mode switch.
+        self.slots.video.has_new.store(false, Ordering::Release);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut kept: Option<(Vec<u8>, u32)> = None;
+        let mut got = 0usize;
+        while got < count {
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            if self.slots.video.has_new.load(Ordering::Acquire) {
+                let g = self.slots.video.inner.lock();
+                kept = Some((g.data.clone(), g.timestamp));
+                drop(g);
+                self.slots.video.has_new.store(false, Ordering::Release);
+                got += 1;
+            } else {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        kept
+    }
+
     /// Drive the motorised base to `angle_deg` (clamped to the
     /// `[TILT_MIN_DEG, TILT_MAX_DEG]` range). The call returns once the
     /// command has been queued; mechanical motion takes a beat.
@@ -582,10 +701,24 @@ impl DepthSlot {
     }
 }
 
-#[derive(Default)]
 struct VideoSlot {
     inner: Mutex<VideoInner>,
     has_new: AtomicBool,
+    /// Bytes per frame the current video mode delivers: RGB888 = `w*h*3`,
+    /// IR_8BIT = `w*h`. The video callback reads this to size the slice it
+    /// copies, so switching the video format (e.g. a momentary IR capture)
+    /// stays sound without a second callback. Defaults to the RGB size.
+    bytes: AtomicUsize,
+}
+
+impl Default for VideoSlot {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(VideoInner::default()),
+            has_new: AtomicBool::new(false),
+            bytes: AtomicUsize::new((VIDEO_WIDTH * VIDEO_HEIGHT * 3) as usize),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -657,8 +790,12 @@ extern "C" fn video_callback(dev: *mut sys::freenect_device, video: *mut c_void,
     }
     // SAFETY: see `depth_callback`.
     let slots = unsafe { &*(user as *const Slots) };
-    // SAFETY: video points to width*height*3 bytes (FREENECT_VIDEO_RGB).
-    let bytes = (VIDEO_WIDTH * VIDEO_HEIGHT * 3) as usize;
+    // The buffer size follows the active video mode (RGB888 = w*h*3,
+    // IR_8BIT = w*h). `set_video_format` keeps this in step with the mode
+    // set on the device, so the slice length always matches what libfreenect
+    // filled.
+    let bytes = slots.video.bytes.load(Ordering::Relaxed);
+    // SAFETY: libfreenect fills `bytes` bytes for the current video mode.
     let data = unsafe { std::slice::from_raw_parts(video.cast::<u8>(), bytes) };
     slots.video.write(data, timestamp);
 }
@@ -733,6 +870,8 @@ pub enum Error {
     StartFailed(i32),
     #[error("freenect_stop_depth or _video failed (rc={0})")]
     StopFailed(i32),
+    #[error("timed out waiting for an IR frame after the mode switch")]
+    CaptureTimeout,
     #[error("failed to spawn event thread: {0}")]
     Spawn(std::io::Error),
     #[error("freenect_set_tilt_degs failed (rc={0})")]

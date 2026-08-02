@@ -6,6 +6,7 @@
 #include <libfreenect2/config.h>
 #include <libfreenect2/packet_pipeline.h>
 
+#include <cmath>
 #include <cstring>
 
 namespace freenect2_shim {
@@ -35,37 +36,62 @@ void install_logger(uint32_t level) {
         static_cast<libfreenect2::Logger::Level>(level)));
 }
 
-bool DepthSink::onNewFrame(libfreenect2::Frame::Type type,
-                           libfreenect2::Frame *frame) {
-    if (type != libfreenect2::Frame::Depth) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(mu_);
+bool IrDepthSink::onNewFrame(libfreenect2::Frame::Type type,
+                             libfreenect2::Frame *frame) {
     const size_t pixels = static_cast<size_t>(frame->width) * frame->height;
-    width_ = frame->width;
-    height_ = frame->height;
-    timestamp_ = frame->timestamp;
-    data_.resize(pixels);
-    // libfreenect2 hands us f32 millimeters (0.0 = no data).
-    std::memcpy(data_.data(), frame->data, pixels * sizeof(float));
-    has_new_.store(true, std::memory_order_release);
+    if (type == libfreenect2::Frame::Depth) {
+        std::lock_guard<std::mutex> lock(depth_mu_);
+        depth_w_ = frame->width;
+        depth_h_ = frame->height;
+        depth_ts_ = frame->timestamp;
+        depth_.resize(pixels);
+        // libfreenect2 hands us f32 millimeters (0.0 = no data).
+        std::memcpy(depth_.data(), frame->data, pixels * sizeof(float));
+        depth_new_.store(true, std::memory_order_release);
+    } else if (type == libfreenect2::Frame::Ir) {
+        std::lock_guard<std::mutex> lock(ir_mu_);
+        ir_w_ = frame->width;
+        ir_h_ = frame->height;
+        ir_ts_ = frame->timestamp;
+        ir_.resize(pixels);
+        // IR is f32 intensity in roughly [0, 65535].
+        std::memcpy(ir_.data(), frame->data, pixels * sizeof(float));
+        ir_new_.store(true, std::memory_order_release);
+    }
     return false;  // we copied; libfreenect2 keeps ownership of the buffer.
 }
 
-bool DepthSink::poll(uint32_t &w, uint32_t &h, uint32_t &ts,
-                     std::vector<float> &out) {
-    if (!has_new_.load(std::memory_order_acquire)) {
+bool IrDepthSink::poll_depth(uint32_t &w, uint32_t &h, uint32_t &ts,
+                             std::vector<float> &out) {
+    if (!depth_new_.load(std::memory_order_acquire)) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!has_new_.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(depth_mu_);
+    if (!depth_new_.load(std::memory_order_relaxed)) {
         return false;
     }
-    w = width_;
-    h = height_;
-    ts = timestamp_;
-    out = data_;
-    has_new_.store(false, std::memory_order_release);
+    w = depth_w_;
+    h = depth_h_;
+    ts = depth_ts_;
+    out = depth_;
+    depth_new_.store(false, std::memory_order_release);
+    return true;
+}
+
+bool IrDepthSink::poll_ir(uint32_t &w, uint32_t &h, uint32_t &ts,
+                          std::vector<float> &out) {
+    if (!ir_new_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ir_mu_);
+    if (!ir_new_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    w = ir_w_;
+    h = ir_h_;
+    ts = ir_ts_;
+    out = ir_;
+    ir_new_.store(false, std::memory_order_release);
     return true;
 }
 
@@ -135,7 +161,7 @@ std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx) {
         libfreenect2::PacketPipeline *gpu = new libfreenect2::OpenCLPacketPipeline();
         holder->dev = ctx.inner.openDefaultDevice(gpu);
         if (holder->dev) {
-            holder->dev->setIrAndDepthFrameListener(&holder->depth_listener);
+            holder->dev->setIrAndDepthFrameListener(&holder->ir_depth_listener);
             holder->dev->setColorFrameListener(&holder->rgb_listener);
             return holder;
         }
@@ -148,7 +174,7 @@ std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx) {
     if (!holder->dev) {
         return nullptr;
     }
-    holder->dev->setIrAndDepthFrameListener(&holder->depth_listener);
+    holder->dev->setIrAndDepthFrameListener(&holder->ir_depth_listener);
     holder->dev->setColorFrameListener(&holder->rgb_listener);
     return holder;
 }
@@ -172,7 +198,25 @@ bool poll_depth(Freenect2Dev &dev, DepthFrame &out) {
     if (!dev.dev) return false;
     uint32_t w = 0, h = 0, ts = 0;
     std::vector<float> data;
-    if (!dev.depth_listener.poll(w, h, ts, data)) {
+    if (!dev.ir_depth_listener.poll_depth(w, h, ts, data)) {
+        return false;
+    }
+    out.width = w;
+    out.height = h;
+    out.timestamp_raw = ts;
+    out.data.clear();
+    out.data.reserve(data.size());
+    for (float v : data) {
+        out.data.push_back(v);
+    }
+    return true;
+}
+
+bool poll_ir(Freenect2Dev &dev, IrFrame &out) {
+    if (!dev.dev) return false;
+    uint32_t w = 0, h = 0, ts = 0;
+    std::vector<float> data;
+    if (!dev.ir_depth_listener.poll_ir(w, h, ts, data)) {
         return false;
     }
     out.width = w;
@@ -218,6 +262,39 @@ IrCameraParams ir_params(const Freenect2Dev &dev) {
     r.p1 = p.p1;
     r.p2 = p.p2;
     return r;
+}
+
+std::unique_ptr<Registration> new_registration(const Freenect2Dev &dev) {
+    auto reg = std::make_unique<Registration>();
+    if (!dev.dev) {
+        return reg;  // inner stays null
+    }
+    auto *d = const_cast<libfreenect2::Freenect2Device *>(dev.dev);
+    reg->inner = std::make_unique<libfreenect2::Registration>(
+        d->getIrCameraParams(), d->getColorCameraParams());
+    return reg;
+}
+
+ColorPixel map_depth_to_color(const Registration &reg, int32_t dx, int32_t dy,
+                              float dz) {
+    ColorPixel out{};
+    out.x = 0.0f;
+    out.y = 0.0f;
+    out.valid = false;
+    if (!reg.inner) {
+        return out;
+    }
+    // apply() returns the color-image pixel coordinate (0..1919, 0..1079)
+    // despite the header calling it "normalized" — the implementation yields
+    // pixels. Points with no valid mapping come back as ±inf / NaN.
+    float cx = 0.0f, cy = 0.0f;
+    reg.inner->apply(dx, dy, dz, cx, cy);
+    if (std::isfinite(cx) && std::isfinite(cy)) {
+        out.x = cx;
+        out.y = cy;
+        out.valid = true;
+    }
+    return out;
 }
 
 }  // namespace freenect2_shim

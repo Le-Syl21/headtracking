@@ -9,6 +9,7 @@
 
 #include <libfreenect2/libfreenect2.hpp>
 #include <libfreenect2/frame_listener.hpp>
+#include <libfreenect2/registration.h>
 #include <libfreenect2/logger.h>
 
 #include <atomic>
@@ -21,24 +22,43 @@ namespace freenect2_shim {
 
 // Forward declarations of cxx-generated shared types (defined in lib.rs.h).
 struct DepthFrame;
+struct IrFrame;
 struct RgbFrame;
 struct IrCameraParams;
+struct ColorPixel;
 
-class DepthSink : public libfreenect2::FrameListener {
+// The combined IR+Depth listener slot. libfreenect2 delivers both the IR and
+// the Depth frame to a *single* FrameListener (setIrAndDepthFrameListener),
+// tagged by Frame::Type — there is no separate IR listener to register. So one
+// sink object keeps the latest of each in its own slot, and the Rust side sees
+// three symmetric pipes (poll_depth / poll_ir / poll_rgb).
+class IrDepthSink : public libfreenect2::FrameListener {
 public:
     bool onNewFrame(libfreenect2::Frame::Type type, libfreenect2::Frame *frame) override;
 
-    // Drain the latest depth frame into `out` if a new one is available.
-    bool poll(uint32_t &width, uint32_t &height, uint32_t &timestamp,
-              std::vector<float> &data);
+    // Drain the latest depth frame (float millimetres) if a new one arrived.
+    bool poll_depth(uint32_t &width, uint32_t &height, uint32_t &timestamp,
+                    std::vector<float> &data);
+
+    // Drain the latest IR frame (float intensity, ~0..65535) if a new one
+    // arrived. Same 512×424 geometry as depth.
+    bool poll_ir(uint32_t &width, uint32_t &height, uint32_t &timestamp,
+                 std::vector<float> &data);
 
 private:
-    std::mutex mu_;
-    std::atomic<bool> has_new_{false};
-    uint32_t width_ = 0;
-    uint32_t height_ = 0;
-    uint32_t timestamp_ = 0;
-    std::vector<float> data_;
+    std::mutex depth_mu_;
+    std::atomic<bool> depth_new_{false};
+    uint32_t depth_w_ = 0;
+    uint32_t depth_h_ = 0;
+    uint32_t depth_ts_ = 0;
+    std::vector<float> depth_;
+
+    std::mutex ir_mu_;
+    std::atomic<bool> ir_new_{false};
+    uint32_t ir_w_ = 0;
+    uint32_t ir_h_ = 0;
+    uint32_t ir_ts_ = 0;
+    std::vector<float> ir_;
 };
 
 class RgbSink : public libfreenect2::FrameListener {
@@ -65,7 +85,7 @@ struct Freenect2Ctx {
 
 struct Freenect2Dev {
     libfreenect2::Freenect2Device *dev = nullptr;
-    DepthSink depth_listener;
+    IrDepthSink ir_depth_listener;
     RgbSink rgb_listener;
 
     ~Freenect2Dev();
@@ -74,6 +94,16 @@ struct Freenect2Dev {
     Freenect2Dev() = default;
     Freenect2Dev(const Freenect2Dev &) = delete;
     Freenect2Dev &operator=(const Freenect2Dev &) = delete;
+};
+
+// Owns a `libfreenect2::Registration` built from the device's factory IR +
+// color intrinsics. Maps depth pixels onto the color image using libfreenect2's
+// reverse-engineered depth↔color model — the proper fix for the IR-vs-RGB
+// sensor parallax (~5 cm baseline, different FOV) that a naive resolution-ratio
+// scale can't correct. `inner` is null if built before the device streamed its
+// camera params (getColorCameraParams would be all-zero).
+struct Registration {
+    std::unique_ptr<libfreenect2::Registration> inner;
 };
 
 // Subclass of libfreenect2's Logger that forwards each log call into
@@ -99,7 +129,11 @@ bool start_depth(Freenect2Dev &dev);
 bool start_streams(Freenect2Dev &dev, bool rgb, bool depth);
 bool stop_device(Freenect2Dev &dev);
 bool poll_depth(Freenect2Dev &dev, DepthFrame &out);
+bool poll_ir(Freenect2Dev &dev, IrFrame &out);
 bool poll_rgb(Freenect2Dev &dev, RgbFrame &out);
 IrCameraParams ir_params(const Freenect2Dev &dev);
+std::unique_ptr<Registration> new_registration(const Freenect2Dev &dev);
+ColorPixel map_depth_to_color(const Registration &reg, int32_t dx, int32_t dy,
+                              float dz);
 
 }  // namespace freenect2_shim

@@ -29,7 +29,31 @@ use cxx::UniquePtr;
 use parking_lot::Mutex;
 
 use freenect2_sys as sys;
-pub use freenect2_sys::{DepthFrame, IrCameraParams, RgbFrame, take_last_log_error};
+pub use freenect2_sys::{DepthFrame, IrCameraParams, IrFrame, RgbFrame, take_last_log_error};
+
+/// Depth↔color registration model (IR-vs-RGB parallax correction).
+///
+/// Wraps libfreenect2's `Registration`, built from the device's factory IR +
+/// color intrinsics. Use [`Registration::map_depth_to_color`] to place a depth
+/// pixel onto the 1920×1080 color image accurately — the Kinect v2's IR and
+/// color sensors sit ~5 cm apart with different fields of view, so a naive
+/// resolution-ratio scale is visibly off (worse as the subject nears the
+/// camera). `apply` is pure math, so this is `Send + Sync`.
+pub struct Registration {
+    inner: UniquePtr<sys::Registration>,
+}
+
+impl Registration {
+    /// Map a depth pixel `(dx, dy)` at depth `dz` millimeters onto the color
+    /// image. Returns `Some((cx, cy))` in color-frame pixels, or `None` when
+    /// the point has no valid color mapping (out of the color frustum, or the
+    /// registration was built before the device streamed its camera params).
+    pub fn map_depth_to_color(&self, dx: u32, dy: u32, dz: f32) -> Option<(f32, f32)> {
+        let reg = self.inner.as_ref()?;
+        let p = sys::map_depth_to_color(reg, dx as i32, dy as i32, dz);
+        p.valid.then_some((p.x, p.y))
+    }
+}
 
 /// Top-level libfreenect2 context. Construct one per process; opening multiple
 /// devices off the same context is supported by libfreenect2 itself.
@@ -155,6 +179,25 @@ impl Device {
         }
     }
 
+    /// Read the latest IR frame (512×424, f32 intensity ~0..65535), if any.
+    /// Returns `None` if no new sample has arrived since the last call. IR is
+    /// produced by the same depth pipeline, so it streams whenever depth does
+    /// (see [`Device::start_streams`] with `depth = true`).
+    pub fn poll_ir(&self) -> Option<IrFrame> {
+        let mut guard = self.inner.lock();
+        let mut out = IrFrame {
+            width: 0,
+            height: 0,
+            timestamp_raw: 0,
+            data: Vec::new(),
+        };
+        if sys::poll_ir(guard.pin_mut(), &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
     /// Read the latest color frame (BGRX, 1920×1080), if any.
     pub fn poll_rgb(&self) -> Option<RgbFrame> {
         let mut guard = self.inner.lock();
@@ -175,6 +218,18 @@ impl Device {
     pub fn ir_params(&self) -> IrCameraParams {
         let guard = self.inner.lock();
         sys::ir_params(&guard)
+    }
+
+    /// Build a depth↔color [`Registration`] from this device's factory
+    /// intrinsics. Call after the color stream has started (see
+    /// [`Device::start_streams`]) — otherwise the camera params are all-zero
+    /// and every mapping comes back `None`. Cheap to build; build it once and
+    /// reuse it (the intrinsics don't change while streaming).
+    pub fn registration(&self) -> Registration {
+        let guard = self.inner.lock();
+        Registration {
+            inner: sys::new_registration(&guard),
+        }
     }
 }
 

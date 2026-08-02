@@ -71,6 +71,18 @@ mod ffi {
         pub data: Vec<f32>,
     }
 
+    /// IR frame from the Kinect v2 (512×424, same geometry as depth).
+    /// `data` holds `width * height` floats, each an IR intensity in roughly
+    /// `[0, 65535]`. Delivered on the same listener as depth.
+    #[derive(Clone)]
+    pub struct IrFrame {
+        pub width: u32,
+        pub height: u32,
+        /// `timestamp` field from libfreenect2 (units of 0.125 ms per tick).
+        pub timestamp_raw: u32,
+        pub data: Vec<f32>,
+    }
+
     /// Color frame from the Kinect v2 (1920×1080, BGRX 4 bytes per pixel).
     /// libfreenect2 decodes the on-wire MJPEG via TurboJPEG transparently;
     /// we just hand the decoded buffer up.
@@ -97,6 +109,17 @@ mod ffi {
         pub p2: f32,
     }
 
+    /// A depth pixel mapped onto the color image via [`map_depth_to_color`].
+    /// `x`/`y` are color-frame pixel coordinates (0..1920, 0..1080); `valid`
+    /// is `false` when the depth point has no color mapping (out of the color
+    /// frustum, or the registration was built before camera params loaded).
+    #[derive(Clone, Copy, Default)]
+    pub struct ColorPixel {
+        pub x: f32,
+        pub y: f32,
+        pub valid: bool,
+    }
+
     extern "Rust" {
         /// Bridge symbol called from the C++ `RustLogger`. Must match the
         /// free function defined above; cxx generates the trampoline.
@@ -111,6 +134,11 @@ mod ffi {
 
         /// Wraps a `libfreenect2::Freenect2Device*` plus our depth FrameListener.
         type Freenect2Dev;
+
+        /// Owns a `libfreenect2::Registration` (depth↔color mapping model).
+        /// Built from a started device via [`new_registration`]; used by
+        /// [`map_depth_to_color`] to correct IR-vs-RGB sensor parallax.
+        type Registration;
 
         /// Install a `RustLogger` as libfreenect2's global logger, capped
         /// at the given verbosity. `level` matches
@@ -143,18 +171,35 @@ mod ffi {
         /// frame has arrived since the last call.
         fn poll_depth(dev: Pin<&mut Freenect2Dev>, out: &mut DepthFrame) -> bool;
 
+        /// Read the most recent IR frame, if any. Returns `false` if no new
+        /// frame has arrived since the last call. IR is produced by the depth
+        /// pipeline, so it flows whenever the depth stream is running.
+        fn poll_ir(dev: Pin<&mut Freenect2Dev>, out: &mut IrFrame) -> bool;
+
         /// Read the most recent color frame, if any.
         fn poll_rgb(dev: Pin<&mut Freenect2Dev>, out: &mut RgbFrame) -> bool;
 
         /// IR / depth camera intrinsics, available after the device starts.
         fn ir_params(dev: &Freenect2Dev) -> IrCameraParams;
+
+        /// Build a depth↔color [`Registration`] from the device's factory
+        /// intrinsics. Call after `start_streams` — before the camera params
+        /// have loaded the returned registration maps nothing (all `valid=false`).
+        fn new_registration(dev: &Freenect2Dev) -> UniquePtr<Registration>;
+
+        /// Map a depth pixel `(dx, dy)` at depth `dz` (mm) onto the color image.
+        /// See [`ColorPixel`]. Pure/const — safe to call from any thread.
+        fn map_depth_to_color(reg: &Registration, dx: i32, dy: i32, dz: f32) -> ColorPixel;
     }
 }
 
-pub use ffi::{DepthFrame, Freenect2Ctx, Freenect2Dev, IrCameraParams, RgbFrame};
 pub use ffi::{
-    enumerate, install_logger, ir_params, new_context, open_default, poll_depth, poll_rgb,
-    start_depth, start_streams, stop_device,
+    ColorPixel, DepthFrame, Freenect2Ctx, Freenect2Dev, IrCameraParams, IrFrame, Registration,
+    RgbFrame,
+};
+pub use ffi::{
+    enumerate, install_logger, ir_params, map_depth_to_color, new_context, new_registration,
+    open_default, poll_depth, poll_ir, poll_rgb, start_depth, start_streams, stop_device,
 };
 
 // SAFETY: libfreenect2 spawns its own internal worker threads; the
@@ -164,3 +209,7 @@ pub use ffi::{
 // enforced by the safe wrapper's `Mutex<UniquePtr<...>>`.
 unsafe impl Send for ffi::Freenect2Ctx {}
 unsafe impl Send for ffi::Freenect2Dev {}
+// `Registration::apply` is a const, pure-math method with no shared mutable
+// state — safe to move between threads and to share by `&`.
+unsafe impl Send for ffi::Registration {}
+unsafe impl Sync for ffi::Registration {}
