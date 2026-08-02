@@ -1932,10 +1932,6 @@ struct App {
     /// felt laggy on quick lateral moves, so it's tunable from the bench row.
     head_filter_min_cutoff: f32,
     head_filter_beta: f32,
-    /// Target head-detection rate (Hz). The detector is capped to this so it
-    /// stops pinning a full core running flat-out; the 1€ filter interpolates
-    /// between detections. Live-tunable from the bench row.
-    head_detect_hz: f32,
     /// Debug: bypass everything between raw detection and the pose — the 1€
     /// filter, the lockbar-centred picker (→ largest head), and most of the
     /// depth-sample gate — to see which stage is dropping the head.
@@ -3063,6 +3059,11 @@ impl Metrics {
             self.u_ms * 0.8 + ms * 0.2
         };
     }
+    /// U-seg calibration is locked → the detector no longer runs, so report
+    /// 0 ms instead of holding the last inference time.
+    fn note_u_locked(&mut self) {
+        self.u_ms = 0.0;
+    }
     fn note_input_frame(&mut self) {
         self.in_frames += 1;
     }
@@ -3128,7 +3129,6 @@ impl App {
             lockbar_width_mm: headtracking::calibration::LOCKBAR_WIDTH_MM,
             head_filter_min_cutoff: 1.0,
             head_filter_beta: 0.4,
-            head_detect_hz: 15.0,
             bypass_filters: false,
             contribute_open: false,
             consent_checked: false,
@@ -3429,14 +3429,9 @@ impl App {
             beta: self.head_filter_beta,
             derivative_cutoff_hz: 1.0,
         });
-        // Cap the head detector's rate (0 Hz slider = flat-out).
-        let head_ms = if self.head_detect_hz > 0.1 {
-            (1000.0 / self.head_detect_hz) as u32
-        } else {
-            0
-        };
-        // Rate-cap the pose inference (0 Hz slider = flat-out).
-        active.blaze_worker.set_min_interval_ms(head_ms);
+        // One pose inference per input frame — no rate cap. BlazePose is
+        // ~7 ms, well under the camera frame budget, so it keeps up.
+        active.blaze_worker.set_min_interval_ms(0);
         // Debug bypass: raw pose, relaxed depth gate.
         let bypass = self.bypass_filters;
         let depth_min = if bypass { 4 } else { 16 };
@@ -3465,7 +3460,9 @@ impl App {
                     let u_out = active.u_worker.snapshot();
                     active.last_u = u_out.u;
                     active.last_lockbar = u_out.lockbar;
-                    if u_out.u_ms > 0.0 {
+                    if active.u_worker.is_locked() {
+                        active.metrics.note_u_locked();
+                    } else if u_out.u_ms > 0.0 {
                         active.metrics.note_u_ms(u_out.u_ms);
                     }
                     upload_texture(egui_ctx, &mut active.rgb_texture, img);
@@ -3540,7 +3537,9 @@ impl App {
                     let u_out = active.u_worker.snapshot();
                     active.last_u = u_out.u;
                     active.last_lockbar = u_out.lockbar;
-                    if u_out.u_ms > 0.0 {
+                    if active.u_worker.is_locked() {
+                        active.metrics.note_u_locked();
+                    } else if u_out.u_ms > 0.0 {
                         active.metrics.note_u_ms(u_out.u_ms);
                     }
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
@@ -3605,7 +3604,9 @@ impl App {
                     let u_out = active.u_worker.snapshot();
                     active.last_u = u_out.u;
                     active.last_lockbar = u_out.lockbar;
-                    if u_out.u_ms > 0.0 {
+                    if active.u_worker.is_locked() {
+                        active.metrics.note_u_locked();
+                    } else if u_out.u_ms > 0.0 {
                         active.metrics.note_u_ms(u_out.u_ms);
                     }
                     let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
@@ -4565,11 +4566,7 @@ impl App {
                 );
                 ui.add(egui::Slider::new(&mut self.head_filter_beta, 0.0..=1.5).text("1€ beta"));
             });
-            // Head-detection rate cap — trade CPU for re-acquisition latency
-            // live on the cab (30 = flat-out-ish, lower = less CPU).
             ui.horizontal(|ui| {
-                ui.add(egui::Slider::new(&mut self.head_detect_hz, 3.0..=30.0).text("head Hz"));
-                ui.separator();
                 ui.toggle_value(&mut self.bypass_filters, "no filters")
                     .on_hover_text("Bypass 1€ filter + picker scoring + most of the depth gate");
             });
