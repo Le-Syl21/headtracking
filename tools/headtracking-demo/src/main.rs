@@ -1126,6 +1126,9 @@ Usage: headtracking-demo [--capture <backend> [--out <path>] [--wait <secs>]]
                         named `<backend>_<UTC-timestamp>.png`.
   --wait <secs>         Seconds to let the device warm up + head/lockbar
                         detectors lock on before the capture (default 3).
+  --lockbar-mm <mm>     Real lockbar width in mm — the scale reference for the
+                        cam↔bar distance (default 610). Set it to your cab's.
+  --pf-deg <deg>        Playfield inclination in degrees (default 6.5).
   --list-cameras        Print the cameras SDL enumerates (id + name), exit.
   --selftest            Validate the skeleton pipeline with no one in front of
     [--image <jpg>]     the camera: synthesise an upper-body silhouette (depth
@@ -1141,6 +1144,8 @@ struct CaptureArgs {
     backend: Backend,
     out_path: Option<std::path::PathBuf>,
     wait_secs: f32,
+    lockbar_mm: f32,
+    pf_deg: f32,
 }
 
 fn parse_cli() -> Result<Option<CaptureArgs>, String> {
@@ -1156,6 +1161,8 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
     let mut backend: Option<Backend> = None;
     let mut out_path: Option<std::path::PathBuf> = None;
     let mut wait_secs: f32 = 3.0;
+    let mut lockbar_mm: f32 = headtracking::calibration::LOCKBAR_WIDTH_MM;
+    let mut pf_deg: f32 = DEFAULT_TABLE_INCL_DEG;
     let mut iter = raw.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1173,6 +1180,18 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
                     .parse()
                     .map_err(|e| format!("--wait value '{v}' invalid: {e}"))?;
             }
+            "--lockbar-mm" => {
+                let v = iter.next().ok_or("--lockbar-mm needs a value")?;
+                lockbar_mm = v
+                    .parse()
+                    .map_err(|e| format!("--lockbar-mm value '{v}' invalid: {e}"))?;
+            }
+            "--pf-deg" => {
+                let v = iter.next().ok_or("--pf-deg needs a value")?;
+                pf_deg = v
+                    .parse()
+                    .map_err(|e| format!("--pf-deg value '{v}' invalid: {e}"))?;
+            }
             other => return Err(format!("unknown flag '{other}'")),
         }
     }
@@ -1181,6 +1200,8 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
         backend,
         out_path,
         wait_secs,
+        lockbar_mm,
+        pf_deg,
     }))
 }
 
@@ -1248,26 +1269,58 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
         .last_rgb_frame
         .as_ref()
         .ok_or_else(|| format!("no RGB frame received in {:.1}s", cap.wait_secs))?;
+    let (w, h, rgb) = (*w, *h, rgb.clone());
+
+    let slug = backend_slug(active.backend);
+    let meta = capture_meta(
+        active.backend,
+        (w, h),
+        &slug,
+        CabGeom {
+            table_incl_deg: cap.pf_deg,
+            lockbar_mm: cap.lockbar_mm,
+        },
+        active.last_head,
+        active.last_pose.as_ref(),
+        active.last_lockbar.as_ref(),
+    );
+    // Surface the lockbar-derived geometry on stdout so an SSH-driven capture
+    // round can read the cam↔bar distance + camera offset without opening the
+    // PNG. `ht_lockbar` == "none" here means U-seg never locked the bar.
+    for key in [
+        "ht_lockbar",
+        "ht_lockbar_width_px",
+        "ht_lockbar_dist_mm",
+        "ht_lockbar_center_px",
+        "ht_cam_offset_x_mm",
+        "ht_cam_offset_y_mm",
+        "ht_lockbar_slope_deg",
+    ] {
+        if let Some((_, v)) = meta.iter().find(|(k, _)| k == key) {
+            info!(target: "capture", "{key} = {v}");
+        }
+    }
 
     let path = if let Some(p) = cap.out_path {
         save_rgb_screenshot_at(
             &p,
-            *w,
-            *h,
-            rgb,
+            w,
+            h,
+            &rgb,
             active.last_pose.as_ref(),
             active.last_lockbar.as_ref(),
+            &meta,
         )?;
         p
     } else {
-        let slug = backend_slug(active.backend);
         save_rgb_screenshot(
             &slug,
-            *w,
-            *h,
-            rgb,
+            w,
+            h,
+            &rgb,
             active.last_pose.as_ref(),
             active.last_lockbar.as_ref(),
+            &meta,
         )?
     };
 
@@ -3066,7 +3119,7 @@ impl App {
             parallax_eye_mode: ParallaxEye::Live,
             parallax_eye: [0.0, 0.0, PX_DVIEW_MM],
             parallax_gain: 1.0,
-            table_incl_deg: 6.5,
+            table_incl_deg: DEFAULT_TABLE_INCL_DEG,
             // Y flipped by default: Kinect Y points down, the eye's Y is up.
             parallax_invert: [false, true, false],
             parallax_panel_rect: None,
@@ -3270,7 +3323,10 @@ impl App {
             backend,
             (w, h),
             &stem,
-            self.table_incl_deg,
+            CabGeom {
+                table_incl_deg: self.table_incl_deg,
+                lockbar_mm: self.lockbar_width_mm,
+            },
             head,
             pose.as_ref(),
             lockbar.as_ref(),
@@ -3828,6 +3884,18 @@ impl App {
                     && let Some((w, h, bytes)) = active.last_rgb_frame.as_ref()
                 {
                     let slug = backend_slug(active.backend);
+                    let meta = capture_meta(
+                        active.backend,
+                        (*w, *h),
+                        &slug,
+                        CabGeom {
+                            table_incl_deg: self.table_incl_deg,
+                            lockbar_mm: self.lockbar_width_mm,
+                        },
+                        active.last_head,
+                        active.last_pose.as_ref(),
+                        active.last_lockbar.as_ref(),
+                    );
                     self.screenshot_status = Some(save_rgb_screenshot(
                         &slug,
                         *w,
@@ -3835,6 +3903,7 @@ impl App {
                         bytes,
                         active.last_pose.as_ref(),
                         active.last_lockbar.as_ref(),
+                        &meta,
                     ));
                     match &self.screenshot_status {
                         Some(Ok(p)) => info!(path = %p.display(), "screenshot saved"),
@@ -5005,6 +5074,19 @@ fn png_bytes_meta(
     Ok(buf)
 }
 
+/// Default table inclination (degrees) — a typical widebody playfield slope.
+/// The GUI exposes it as an editable field; headless capture assumes it.
+const DEFAULT_TABLE_INCL_DEG: f32 = 6.5;
+
+/// Physical cab geometry that scales the lockbar-derived read-out: the real
+/// bar width (mm) and the playfield inclination (deg). Both are per-cab and
+/// eventually come from VPX; here they're GUI fields / CLI args.
+#[derive(Debug, Clone, Copy)]
+struct CabGeom {
+    table_incl_deg: f32,
+    lockbar_mm: f32,
+}
+
 /// Build the tracking read-out embedded into a contribution capture as PNG
 /// `tEXt` chunks. Lets us line up v1/v2/webcam shots of the same scene and
 /// compare what each backend recovered — head **Z** above all (depth-sampled
@@ -5014,11 +5096,15 @@ fn capture_meta(
     backend: Backend,
     dims: (u32, u32),
     stem: &str,
-    table_incl_deg: f32,
+    geom: CabGeom,
     head: Option<HeadPixel>,
     pose: Option<&blazepose::Pose>,
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
 ) -> Vec<(String, String)> {
+    let CabGeom {
+        table_incl_deg,
+        lockbar_mm,
+    } = geom;
     let mut m: Vec<(String, String)> = Vec::new();
     let mut push = |k: &str, v: String| m.push((k.to_string(), v));
     push("ht_stem", stem.to_string());
@@ -5034,6 +5120,7 @@ fn capture_meta(
     let (w, h) = dims;
     push("ht_frame", format!("{w}x{h}"));
     push("ht_table_incl_deg", format!("{table_incl_deg:.2}"));
+    push("ht_lockbar_mm", format!("{lockbar_mm:.0}"));
     // How the head Z was obtained differs by sensor — record it so a mm value
     // is never read out of context.
     push(
@@ -5085,7 +5172,7 @@ fn capture_meta(
             let width_px = 0.5 * (edge(tl, tr) + edge(bl, br));
             let fx = lb.frame_width as f32 * 0.9;
             let dist_mm = if width_px > 1.0 {
-                fx * headtracking::calibration::LOCKBAR_WIDTH_MM / width_px
+                fx * lockbar_mm / width_px
             } else {
                 0.0
             };
@@ -5556,6 +5643,7 @@ fn save_rgb_screenshot_at(
     rgb888: &[u8],
     pose: Option<&blazepose::Pose>,
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    meta: &[(String, String)],
 ) -> Result<(), String> {
     let painted = bake_overlays(width, height, rgb888, pose, lockbar);
     let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
@@ -5563,6 +5651,9 @@ fn save_rgb_screenshot_at(
     let mut encoder = png::Encoder::new(writer, width, height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
+    for (k, v) in meta {
+        let _ = encoder.add_text_chunk(k.clone(), v.clone());
+    }
     let mut wr = encoder
         .write_header()
         .map_err(|e| format!("png header: {e}"))?;
@@ -5582,6 +5673,7 @@ fn save_rgb_screenshot(
     rgb888: &[u8],
     pose: Option<&blazepose::Pose>,
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    meta: &[(String, String)],
 ) -> Result<std::path::PathBuf, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -5594,7 +5686,7 @@ fn save_rgb_screenshot(
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = dir.join(format!("{slug}_{stamp}.png"));
-    save_rgb_screenshot_at(&path, width, height, rgb888, pose, lockbar)?;
+    save_rgb_screenshot_at(&path, width, height, rgb888, pose, lockbar, meta)?;
     Ok(path)
 }
 
