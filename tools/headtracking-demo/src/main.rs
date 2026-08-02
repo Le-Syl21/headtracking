@@ -1298,6 +1298,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
     for key in [
         "ht_lockbar",
         "ht_lockbar_width_px",
+        "ht_color_fx",
         "ht_lockbar_dist_mm",
         "ht_lockbar_center_px",
         "ht_cam_offset_x_mm",
@@ -5116,6 +5117,24 @@ struct CabGeom {
     lockbar_mm: f32,
 }
 
+/// Colour-camera focal length in pixels for the lockbar-distance estimate.
+/// The Kinects have known **factory** colour intrinsics (independent of any
+/// detection), so we use them directly — scaled to the actual frame width in
+/// case the resolution differs from the native one. The webcam's focal is
+/// unknown until the lockbar autocalib recovers it, so fall back to a nominal
+/// `0.9 × width`.
+fn color_focal_px(backend: Backend, frame_width: u32) -> f32 {
+    let w = frame_width as f32;
+    match backend {
+        // Kinect v2 colour: ~1081 px at 1920×1080.
+        Backend::KinectV2 => 1081.0 * w / 1920.0,
+        // Kinect v1 RGB: ~525 px at 640×480.
+        Backend::KinectV1 => 525.0 * w / 640.0,
+        // Webcam / none: nominal until autocalib supplies the real focal.
+        _ => w * 0.9,
+    }
+}
+
 /// Build the tracking read-out embedded into a contribution capture as PNG
 /// `tEXt` chunks. Lets us line up v1/v2/webcam shots of the same scene and
 /// compare what each backend recovered — head **Z** above all (depth-sampled
@@ -5199,12 +5218,14 @@ fn capture_meta(
             let [tl, tr, br, bl] = lb.corners.map(|(u, v)| (u as f32, v as f32));
             let edge = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
             let width_px = 0.5 * (edge(tl, tr) + edge(bl, br));
-            let fx = lb.frame_width as f32 * 0.9;
+            // Factory colour focal for the Kinects, nominal for the webcam.
+            let fx = color_focal_px(backend, lb.frame_width);
             let dist_mm = if width_px > 1.0 {
                 fx * lockbar_mm / width_px
             } else {
                 0.0
             };
+            push("ht_color_fx", format!("{fx:.0}"));
             let cx = 0.25 * (tl.0 + tr.0 + br.0 + bl.0);
             let cy = 0.25 * (tl.1 + tr.1 + br.1 + bl.1);
             let frame_cx = lb.frame_width as f32 * 0.5;
