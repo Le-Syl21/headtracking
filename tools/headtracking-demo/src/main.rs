@@ -169,6 +169,35 @@ fn main() {
         }
     }
 
+    // `--pose-test --raw <png> [--depth <png>] [--ir <png>] [--out <png>]`:
+    // headless validation of the BlazePose head/pose path on real captured
+    // modalities (e.g. a contribution raw+depth pair). Runs BlazePose on the
+    // raw, samples depth at the nose, renders the skeleton, prints + exits.
+    if std::env::args().any(|a| a == "--pose-test") {
+        let mut args = std::env::args();
+        let (mut raw, mut depth, mut ir, mut out) = (None, None, None, None);
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "--raw" => raw = args.next(),
+                "--depth" => depth = args.next(),
+                "--ir" => ir = args.next(),
+                "--out" => out = args.next(),
+                _ => {}
+            }
+        }
+        let Some(raw) = raw else {
+            eprintln!("--pose-test needs --raw <png>");
+            std::process::exit(2);
+        };
+        match run_pose_test(&raw, depth.as_deref(), ir.as_deref(), out.as_deref()) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("pose-test failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // CLI: `--capture <backend>` runs a headless capture (no eframe)
     // and exits. Used by `ssh` from a remote workstation to iterate
     // on the lockbar algorithm without needing a body in front of
@@ -2337,6 +2366,127 @@ impl Drop for HeadWorker {
         self.job.1.notify_one();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+        }
+    }
+}
+
+// -------------------------------------------------------------- Pose worker
+
+/// What the [`BlazePoseWorker`] publishes after each inference.
+#[derive(Clone, Default)]
+struct PoseOut {
+    pose: Option<blazepose::Pose>,
+    /// Last inference time (ms); `0.0` until the first pose.
+    ms: f32,
+}
+
+/// Runs BlazePose (detector + 33 landmarks, ~12 ms) off the UI thread — same
+/// submit/snapshot pattern as [`HeadWorker`]. Loads its ONNX models on the
+/// thread so the UI never blocks. Replaces the RGB head net + depth blob +
+/// silhouette skeleton with one pose model that reads straight off the frame.
+struct BlazePoseWorker {
+    job: Arc<(Mutex<Option<HeadJob>>, Condvar)>,
+    out: Arc<Mutex<PoseOut>>,
+    stop: Arc<AtomicBool>,
+    interval_ms: Arc<AtomicU32>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BlazePoseWorker {
+    fn spawn() -> Self {
+        let job = Arc::new((Mutex::new(None::<HeadJob>), Condvar::new()));
+        let out = Arc::new(Mutex::new(PoseOut::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let interval_ms = Arc::new(AtomicU32::new(0));
+        let (job_t, out_t, stop_t, iv_t) = (
+            Arc::clone(&job),
+            Arc::clone(&out),
+            Arc::clone(&stop),
+            Arc::clone(&interval_ms),
+        );
+        let handle = std::thread::Builder::new()
+            .name("blazepose".into())
+            .spawn(move || blazepose_worker_loop(&job_t, &out_t, &stop_t, &iv_t))
+            .expect("spawn blazepose thread");
+        Self {
+            job,
+            out,
+            stop,
+            interval_ms,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_min_interval_ms(&self, ms: u32) {
+        self.interval_ms.store(ms, Ordering::Relaxed);
+    }
+
+    fn submit(&self, rgb888: Vec<u8>, w: u32, h: u32) {
+        *self.job.0.lock() = Some(HeadJob { rgb888, w, h });
+        self.job.1.notify_one();
+    }
+
+    fn snapshot(&self) -> PoseOut {
+        self.out.lock().clone()
+    }
+}
+
+impl Drop for BlazePoseWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.job.1.notify_one();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn blazepose_worker_loop(
+    job: &Arc<(Mutex<Option<HeadJob>>, Condvar)>,
+    out: &Arc<Mutex<PoseOut>>,
+    stop: &Arc<AtomicBool>,
+    interval_ms: &Arc<AtomicU32>,
+) {
+    let mut bp = match blazepose::BlazePose::new() {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("blazepose init failed: {e}");
+            return;
+        }
+    };
+    let mut last_run = Instant::now();
+    loop {
+        let interval = Duration::from_millis(u64::from(interval_ms.load(Ordering::Relaxed)));
+        while last_run.elapsed() < interval {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let job_item = {
+            let (lock, cvar) = &**job;
+            let mut slot = lock.lock();
+            while slot.is_none() && !stop.load(Ordering::Acquire) {
+                cvar.wait(&mut slot);
+            }
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            slot.take()
+        };
+        let Some(HeadJob { rgb888, w, h }) = job_item else {
+            continue;
+        };
+        last_run = Instant::now();
+        let t0 = Instant::now();
+        match bp.detect(&rgb888, w, h) {
+            Ok(pose) => {
+                let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                let mut o = out.lock();
+                o.pose = pose;
+                o.ms = ms;
+            }
+            Err(e) => warn!("blazepose detect: {e}"),
         }
     }
 }
@@ -6212,6 +6362,116 @@ fn run_selftest_webcam(dir: &std::path::Path) -> Result<(), String> {
 /// Run the headless skeleton self-test. `image` (optional, JPEG) additionally
 /// exercises the full webcam path via a file; `webcam` grabs a LIVE frame from
 /// the camera and runs the same personseg → `track_mask` path.
+/// Headless validation of the BlazePose head/pose path: run BlazePose on a real
+/// `raw` frame, draw the 33 landmarks, and (if a 16-bit `depth` PNG is given)
+/// sample the depth at the nose to derive the head distance. This is the same
+/// derivation the live pipeline uses, exercised offline on captured modalities.
+fn run_pose_test(
+    raw_path: &str,
+    depth_path: Option<&str>,
+    _ir_path: Option<&str>,
+    out_path: Option<&str>,
+) -> Result<(), String> {
+    use blazepose::idx::{
+        LEFT_ELBOW, LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_ELBOW, RIGHT_SHOULDER, RIGHT_WRIST,
+    };
+    let img = image::open(raw_path)
+        .map_err(|e| format!("open {raw_path}: {e}"))?
+        .to_rgb8();
+    let (w, h) = img.dimensions();
+    let mut bp = blazepose::BlazePose::new().map_err(|e| format!("blazepose: {e}"))?;
+    let Some(pose) = bp
+        .detect(img.as_raw(), w, h)
+        .map_err(|e| format!("detect: {e}"))?
+    else {
+        println!("NO POSE on {raw_path}");
+        return Ok(());
+    };
+
+    // Draw skeleton on a copy of the frame.
+    let mut buf = img.as_raw().clone();
+    let (wu, hu) = (w as usize, h as usize);
+    let bones = [
+        (LEFT_SHOULDER, RIGHT_SHOULDER),
+        (LEFT_SHOULDER, LEFT_ELBOW),
+        (LEFT_ELBOW, LEFT_WRIST),
+        (RIGHT_SHOULDER, RIGHT_ELBOW),
+        (RIGHT_ELBOW, RIGHT_WRIST),
+        (NOSE, LEFT_SHOULDER),
+        (NOSE, RIGHT_SHOULDER),
+    ];
+    let g = |i: usize| (pose.landmarks[i].x as i32, pose.landmarks[i].y as i32);
+    for (a, b) in bones {
+        draw_line_rgb(&mut buf, wu, hu, g(a), g(b), [0xcc, 0xcc, 0xcc]);
+    }
+    let r = (w / 220).max(4) as i32;
+    for (i, l) in pose.landmarks.iter().enumerate() {
+        let c = if (11..=16).contains(&i) {
+            [0xff, 0x96, 0x00]
+        } else {
+            [0x00, 0xdc, 0x3c]
+        };
+        draw_disc_rgb(&mut buf, wu, hu, l.x as i32, l.y as i32, r, c);
+    }
+
+    println!(
+        "== pose-test {raw_path} ({w}x{h}) — presence={:.2}",
+        pose.presence
+    );
+    for (n, i) in [
+        ("nose", NOSE),
+        ("Lsh", LEFT_SHOULDER),
+        ("Rsh", RIGHT_SHOULDER),
+        ("Lwr", LEFT_WRIST),
+        ("Rwr", RIGHT_WRIST),
+    ] {
+        let l = &pose.landmarks[i];
+        println!("  {n:5} ({:.0},{:.0}) vis={:.2}", l.x, l.y, l.visibility);
+    }
+
+    // Head distance: median non-zero depth in a small window at the nose.
+    // Naive RGB→depth ratio (exact on v1; approximate on v2 — ignores the
+    // IR-vs-RGB parallax, but validates the derivation offline).
+    if let Some(dp) = depth_path {
+        let d = image::open(dp)
+            .map_err(|e| format!("open {dp}: {e}"))?
+            .to_luma16();
+        let (dw, dh) = d.dimensions();
+        let nose = &pose.landmarks[NOSE];
+        let dx = (nose.x / w as f32 * dw as f32) as i32;
+        let dy = (nose.y / h as f32 * dh as f32) as i32;
+        let mut samples = Vec::new();
+        let rad = 6i32;
+        for oy in -rad..=rad {
+            for ox in -rad..=rad {
+                let (sx, sy) = (dx + ox, dy + oy);
+                if sx >= 0 && sy >= 0 && (sx as u32) < dw && (sy as u32) < dh {
+                    let v = d.get_pixel(sx as u32, sy as u32).0[0];
+                    if v != 0 {
+                        samples.push(v);
+                    }
+                }
+            }
+        }
+        if samples.is_empty() {
+            println!("  head depth: no valid samples at nose ({dx},{dy} in {dw}x{dh})");
+        } else {
+            samples.sort_unstable();
+            let mm = samples[samples.len() / 2];
+            println!(
+                "  head depth @nose ({dx},{dy} in {dw}x{dh}) = {mm} mm  ({} samples)",
+                samples.len()
+            );
+        }
+    }
+
+    let out = out_path.unwrap_or("pose-test.png");
+    let bytes = png_bytes(w, h, &buf)?;
+    std::fs::write(out, &bytes).map_err(|e| format!("write {out}: {e}"))?;
+    println!("  -> {out}");
+    Ok(())
+}
+
 fn run_selftest(image: Option<std::path::PathBuf>, webcam: bool) -> Result<(), String> {
     let dir = exe_dir();
 
