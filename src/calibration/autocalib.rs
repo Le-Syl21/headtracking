@@ -155,10 +155,11 @@ pub fn calibrate_from_lockbar(
     })
 }
 
-/// Standard lockbar front-to-back depth (mm) — the metric that turns the
-/// lockbar into a *known rectangle* (width × this), so calibration needs no
-/// extra measurement even for a perfectly centred camera.
-pub const LOCKBAR_DEPTH_MM: f32 = 70.0;
+/// Fallback lockbar front-to-back depth (mm) if the host hasn't supplied one.
+/// This is a **cabinet geometry variable**, not a fixed constant — VPX exposes
+/// it per table (alongside the lockbar width and playfield inclination), so the
+/// caller passes the real value; this is only a sane default.
+pub const DEFAULT_LOCKBAR_DEPTH_MM: f32 = 70.0;
 
 /// Solve `A x = b` for an N×N system by Gaussian elimination with partial
 /// pivoting. Returns `None` if singular.
@@ -212,13 +213,15 @@ fn homography_4pt(src: [(f32, f32); 4], dst: [(f32, f32); 4]) -> Option<[[f32; 3
     Some([[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1.0]])
 }
 
-/// Calibrate from the lockbar treated as a metric rectangle (`width` ×
-/// [`LOCKBAR_DEPTH_MM`]) via a single-plane homography (Zhang). Works for a
-/// centred camera (no vanishing-point degeneracy). Returns `fx` + the camera
-/// pose relative to the playfield.
+/// Calibrate from the lockbar treated as a metric rectangle (`lockbar_width_mm`
+/// × `lockbar_depth_mm`) via a single-plane homography (Zhang). Both are cabinet
+/// geometry the host provides (VPX exposes them per table). Works for a centred
+/// camera (no vanishing-point degeneracy). Returns `fx` + the camera pose
+/// relative to the playfield.
 pub fn calibrate_homography(
     quad: &LockbarQuadRgb,
     lockbar_width_mm: f32,
+    lockbar_depth_mm: f32,
 ) -> Option<CabCalibration> {
     let f2 = |p: (u32, u32)| (p.0 as f32, p.1 as f32);
     let cx = quad.frame_width as f32 * 0.5;
@@ -229,7 +232,7 @@ pub fn calibrate_homography(
         (u - cx, v - cy)
     });
     // Metric rectangle: x = lateral (±W/2), y = depth (0 front, +T back).
-    let (hw, td) = (lockbar_width_mm * 0.5, LOCKBAR_DEPTH_MM);
+    let (hw, td) = (lockbar_width_mm * 0.5, lockbar_depth_mm);
     let src = [(-hw, 0.0), (hw, 0.0), (hw, td), (-hw, td)];
     let h = homography_4pt(src, c)?;
     // Columns h1, h2 = images of the metric X, Y axes.
@@ -299,7 +302,7 @@ mod tests {
         let pitch = 25.0f32.to_radians();
         let (cp, sp) = (pitch.cos(), pitch.sin());
         let w = 520.0f32;
-        let td = LOCKBAR_DEPTH_MM;
+        let td = DEFAULT_LOCKBAR_DEPTH_MM;
         let cam_at = [0.0f32, 100.0, 550.0];
         // metric (x lateral, y depth) → 3D camera coords.
         let place = |x: f32, y: f32| {
@@ -324,7 +327,7 @@ mod tests {
             left_rail: None,
             right_rail: None,
         };
-        let cal = calibrate_homography(&quad, w).expect("calibrate");
+        let cal = calibrate_homography(&quad, w, td).expect("calibrate");
         assert!(
             (cal.fx - f).abs() / f < 0.06,
             "centred-camera focal recovered {} vs {f}",
