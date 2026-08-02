@@ -3145,7 +3145,9 @@ impl App {
             parallax_gain: 1.0,
             table_incl_deg: DEFAULT_TABLE_INCL_DEG,
             // Y flipped by default: Kinect Y points down, the eye's Y is up.
-            parallax_invert: [false, true, false],
+            // Z inverted so moving closer (head depth shrinks) pulls the eye
+            // toward the screen → the scene grows, the fish-tank expectation.
+            parallax_invert: [false, true, true],
             parallax_panel_rect: None,
             parallax_mouse_z: PX_DVIEW_MM,
             parallax_aspect: 16.0 / 9.0,
