@@ -1272,7 +1272,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
     let (w, h, rgb) = (*w, *h, rgb.clone());
 
     let slug = backend_slug(active.backend);
-    let meta = capture_meta(
+    let mut meta = capture_meta(
         active.backend,
         (w, h),
         &slug,
@@ -1284,6 +1284,14 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
         active.last_pose.as_ref(),
         active.last_lockbar.as_ref(),
     );
+    // Autocalibration + depth ground-truth (the lockbar homography focal/pose,
+    // and the measured Kinect depth at the bar).
+    meta.extend(autocalib_meta(
+        active.last_lockbar.as_ref(),
+        (w, h),
+        cap.lockbar_mm,
+        active.last_depth.as_ref(),
+    ));
     // Surface the lockbar-derived geometry on stdout so an SSH-driven capture
     // round can read the cam↔bar distance + camera offset without opening the
     // PNG. `ht_lockbar` == "none" here means U-seg never locked the bar.
@@ -1295,6 +1303,10 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
         "ht_cam_offset_x_mm",
         "ht_cam_offset_y_mm",
         "ht_lockbar_slope_deg",
+        "ht_autocalib_fx",
+        "ht_autocalib_dist_mm",
+        "ht_autocalib_vp_fx",
+        "ht_lockbar_depth_mm",
     ] {
         if let Some((_, v)) = meta.iter().find(|(k, _)| k == key) {
             info!(target: "capture", "{key} = {v}");
@@ -1353,6 +1365,14 @@ fn poll_active_headless(active: &mut Active) {
                 active.last_lockbar = u_out.lockbar;
                 active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
             }
+            // Depth too, so the capture can cross-check the lockbar distance.
+            if let Some(depth) = device.poll_depth() {
+                active.last_depth = Some((
+                    depth.width,
+                    depth.height,
+                    depth.data.iter().map(|&z| z as u16).collect(),
+                ));
+            }
         }
         Inner::KinectV1 { device, .. } => {
             if let Some(rgb) = device.poll_rgb() {
@@ -1367,6 +1387,9 @@ fn poll_active_headless(active: &mut Active) {
                 active.last_u = u_out.u;
                 active.last_lockbar = u_out.lockbar;
                 active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
+            }
+            if let Some(depth) = device.poll_depth() {
+                active.last_depth = Some((depth.width, depth.height, depth.data.clone()));
             }
         }
         Inner::Webcam { camera } => {
@@ -3319,7 +3342,7 @@ impl App {
         let _ = std::fs::create_dir_all(&dir);
         // Tracking read-out shared by both colour planes — embedded as PNG
         // tEXt so the capture is self-describing (head Z per backend, etc.).
-        let meta = capture_meta(
+        let mut meta = capture_meta(
             backend,
             (w, h),
             &stem,
@@ -3331,6 +3354,12 @@ impl App {
             pose.as_ref(),
             lockbar.as_ref(),
         );
+        meta.extend(autocalib_meta(
+            lockbar.as_ref(),
+            (w, h),
+            self.lockbar_width_mm,
+            depth.as_ref(),
+        ));
         // Collect every image this capture produced, then save + queue them
         // in one pass. RGB planes are 8-bit colour; depth is 16-bit gray in
         // raw mm; v2 IR is 16-bit gray intensity; v1 IR is 8-bit gray.
@@ -5194,6 +5223,93 @@ fn capture_meta(
             push("ht_lockbar_thickness_px", lb.thickness_px.to_string());
         }
         None => push("ht_lockbar", "none".to_string()),
+    }
+    m
+}
+
+/// Median valid Kinect depth (mm) in a `2·half+1` window around an RGB pixel
+/// `(u,v)`, mapped into the depth grid with the same crude scale as
+/// [`head_pixel_from_pose_depth`]. `None` if too few valid samples.
+fn sample_depth_at(
+    depth: &[u16],
+    depth_dims: (u32, u32),
+    rgb_dims: (u32, u32),
+    u: f32,
+    v: f32,
+    half: i32,
+) -> Option<f32> {
+    let (dw, dh) = depth_dims;
+    let (rw, rh) = rgb_dims;
+    if dw == 0 || dh == 0 || rw == 0 || rh == 0 {
+        return None;
+    }
+    let cu = (u * dw as f32 / rw as f32) as i32;
+    let cv = (v * dh as f32 / rh as f32) as i32;
+    let (lo, hi) = (DEPTH_MIN_MM as u16, DEPTH_MAX_MM as u16);
+    let mut s: Vec<u16> = Vec::new();
+    for dv in -half..=half {
+        let y = cv + dv;
+        if y < 0 || y >= dh as i32 {
+            continue;
+        }
+        let row = y as usize * dw as usize;
+        for du in -half..=half {
+            let x = cu + du;
+            if x < 0 || x >= dw as i32 {
+                continue;
+            }
+            let z = depth[row + x as usize];
+            if (lo..=hi).contains(&z) {
+                s.push(z);
+            }
+        }
+    }
+    if s.len() < 8 {
+        return None;
+    }
+    s.sort_unstable();
+    Some(f32::from(s[s.len() / 2]))
+}
+
+/// Autocalibration read-out for a capture: the focal + camera distance the
+/// **lockbar homography** recovers (the zero-install calibration), the
+/// sidebar vanishing-point focal when both rails were fit, and — on the
+/// Kinects — the **measured depth at the lockbar** as ground truth that checks
+/// both the recovered focal and the operator's tape measure in one shot.
+/// See [[headtracking-autocalib-vision]].
+fn autocalib_meta(
+    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    rgb_dims: (u32, u32),
+    lockbar_mm: f32,
+    depth: Option<&(u32, u32, Vec<u16>)>,
+) -> Vec<(String, String)> {
+    use headtracking::calibration::autocalib;
+    let mut m: Vec<(String, String)> = Vec::new();
+    let Some(q) = lockbar else {
+        return m;
+    };
+    // Lockbar-rectangle homography (Zhang): focal + pose, no manual step. `t`
+    // is the front-edge centre in camera coords, so |t| = cam↔bar distance.
+    if let Some(cal) =
+        autocalib::calibrate_homography(q, lockbar_mm, autocalib::DEFAULT_LOCKBAR_DEPTH_MM)
+    {
+        let dist = (cal.t[0] * cal.t[0] + cal.t[1] * cal.t[1] + cal.t[2] * cal.t[2]).sqrt();
+        m.push(("ht_autocalib_fx".to_string(), format!("{:.0}", cal.fx)));
+        m.push(("ht_autocalib_dist_mm".to_string(), format!("{dist:.0}")));
+    }
+    // Sidebar vanishing-point focal (needs both rails; long lever arm → robust
+    // depth axis). `None` when the U-seg only yielded the front bar.
+    if let Some(cal) = autocalib::calibrate_from_lockbar(q, lockbar_mm) {
+        m.push(("ht_autocalib_vp_fx".to_string(), format!("{:.0}", cal.fx)));
+    }
+    // Ground truth: measured depth at the lockbar centre (Kinect only).
+    if let Some((dw, dh, dd)) = depth {
+        let c = q.corners.map(|(u, v)| (u as f32, v as f32));
+        let bx = 0.25 * (c[0].0 + c[1].0 + c[2].0 + c[3].0);
+        let by = 0.25 * (c[0].1 + c[1].1 + c[2].1 + c[3].1);
+        if let Some(z) = sample_depth_at(dd, (*dw, *dh), rgb_dims, bx, by, 6) {
+            m.push(("ht_lockbar_depth_mm".to_string(), format!("{z:.0}")));
+        }
     }
     m
 }
