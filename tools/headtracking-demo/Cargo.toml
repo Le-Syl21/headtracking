@@ -15,6 +15,8 @@ head = { path = "../../crates/head" }
 freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
 u-onnx = { path = "../../crates/u-onnx" }
+personseg = { path = "../../crates/personseg" }
+skeleton-depth = "0.3"
 webcam = { path = "../../crates/webcam" }
 headtracking = { path = "../.." }
 # Linear algebra for the parallax off-axis projection (Matrix4: column-major
