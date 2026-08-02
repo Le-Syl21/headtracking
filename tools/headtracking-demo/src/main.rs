@@ -83,7 +83,6 @@ const CONTRIB_TERMS: &[(&str, &str)] = &[
 // translucent cyan fill, with the lockbar quad derived from its closed
 // edge drawn in solid cyan (high contrast against red, visible on both
 // bright playfield reflections and dark cabinet interiors).
-const HEAD_COLOR: Color32 = Color32::from_rgb(0xff, 0x60, 0x60);
 const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
 /// Sidebars (playfield rails) — orange, distinct from the cyan lockbar.
 const RAIL_COLOR: Color32 = Color32::from_rgb(0xff, 0x9a, 0x00);
@@ -142,31 +141,6 @@ fn main() {
             Err(e) => println!("camera enumeration failed: {e}"),
         }
         std::process::exit(0);
-    }
-
-    // `--selftest [--image <path.jpg>] [--webcam]`: validate the skeleton
-    // pipeline with NOBODY in front of the camera by synthesising an upper-body
-    // silhouette (depth + mask); `--image` also runs a real JPEG through
-    // personseg, `--webcam` grabs a LIVE camera frame. Writes selftest-*.png
-    // next to the binary + prints the joints. Exits.
-    if std::env::args().any(|a| a == "--selftest") {
-        let mut args = std::env::args();
-        let mut image: Option<std::path::PathBuf> = None;
-        let mut webcam = false;
-        while let Some(a) = args.next() {
-            match a.as_str() {
-                "--image" => image = args.next().map(std::path::PathBuf::from),
-                "--webcam" => webcam = true,
-                _ => {}
-            }
-        }
-        match run_selftest(image, webcam) {
-            Ok(()) => std::process::exit(0),
-            Err(e) => {
-                eprintln!("selftest failed: {e}");
-                std::process::exit(1);
-            }
-        }
     }
 
     // `--pose-test --raw <png> [--depth <png>] [--ir <png>] [--out <png>]`:
@@ -1281,7 +1255,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             *w,
             *h,
             rgb,
-            &active.last_heads,
+            active.last_pose.as_ref(),
             active.last_lockbar.as_ref(),
         )?;
         p
@@ -1292,14 +1266,14 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             *w,
             *h,
             rgb,
-            &active.last_heads,
+            active.last_pose.as_ref(),
             active.last_lockbar.as_ref(),
         )?
     };
 
     info!(
         path = %path.display(),
-        n_heads = active.last_heads.len(),
+        pose_found = active.last_pose.is_some(),
         lockbar_found = active.last_lockbar.is_some(),
         "headless capture saved"
     );
@@ -1315,9 +1289,9 @@ fn poll_active_headless(active: &mut Active) {
             if let Some(rgb) = device.poll_rgb() {
                 let rgb888 = bgrx_to_rgb888(&rgb.data);
                 active
-                    .head_worker
+                    .blaze_worker
                     .submit(rgb888.clone(), rgb.width, rgb.height);
-                active.last_heads = active.head_worker.snapshot().heads;
+                active.last_pose = active.blaze_worker.snapshot().pose;
                 active
                     .u_worker
                     .submit(rgb888.clone(), rgb.width, rgb.height);
@@ -1330,9 +1304,9 @@ fn poll_active_headless(active: &mut Active) {
         Inner::KinectV1 { device, .. } => {
             if let Some(rgb) = device.poll_rgb() {
                 active
-                    .head_worker
+                    .blaze_worker
                     .submit(rgb.data.clone(), rgb.width, rgb.height);
-                active.last_heads = active.head_worker.snapshot().heads;
+                active.last_pose = active.blaze_worker.snapshot().pose;
                 active
                     .u_worker
                     .submit(rgb.data.clone(), rgb.width, rgb.height);
@@ -1345,9 +1319,9 @@ fn poll_active_headless(active: &mut Active) {
         Inner::Webcam { camera } => {
             if let Some(rgb) = camera.poll_rgb() {
                 active
-                    .head_worker
+                    .blaze_worker
                     .submit(rgb.data.clone(), rgb.width, rgb.height);
-                active.last_heads = active.head_worker.snapshot().heads;
+                active.last_pose = active.blaze_worker.snapshot().pose;
                 active
                     .u_worker
                     .submit(rgb.data.clone(), rgb.width, rgb.height);
@@ -1887,23 +1861,6 @@ struct App {
     /// filter, the lockbar-centred picker (→ largest head), and most of the
     /// depth-sample gate — to see which stage is dropping the head.
     bypass_filters: bool,
-    /// Kinect only: find the head straight from the depth image (nearest blob
-    /// above the lockbar) instead of the RGB neural detector — the classic,
-    /// ~free approach. On by default for depth backends.
-    depth_head: bool,
-    /// Latest depth-blob head, in RGB-frame pixels, for the overlay marker.
-    /// `None` when depth-head is off or nothing was found this frame.
-    last_depth_head: Option<(f32, f32)>,
-    /// Webcam only: derive the head from a person-segmentation silhouette fed to
-    /// `skeleton-depth` (the same skeleton path as Kinect), instead of the RGB
-    /// head detector — works on any background. Off by default; the YOLO head
-    /// net is skipped while it's on.
-    skeleton_webcam: bool,
-    /// Kinect only: feed the depth frame to `skeleton-depth` (connectivity-aware
-    /// upper-body skeleton) and take its head joint, instead of the nearest-cone
-    /// depth blob. Lets us A/B the skeleton head vs `head_from_depth_blob` live
-    /// (both draw the magenta crosshair). Off by default; the RGB net is skipped.
-    skeleton_kinect: bool,
     /// "Share a capture" window toggle + state.
     contribute_open: bool,
     /// The informed-consent checkbox (see the privacy notice). Gates the
@@ -2034,23 +1991,10 @@ struct Active {
     /// [`last_lockbar`] / [`last_u`] back from its snapshot — so the U warmup
     /// no longer hitches rendering (see [`UWorker`]).
     u_worker: UWorker,
-    /// Background thread running the SCUT-HEAD nano detector off the UI
-    /// thread — mirrors the plugin (track the head as a *shape*, so tracking
-    /// holds when the player leans over the playfield). At MODEL_SIDE=160 one
-    /// detection is ~15 ms; on its own core it produces a fresh head every
-    /// ~60 Hz frame while the render loop runs at full camera rate, so
-    /// `out_fps` matches `in_fps` (see [`HeadWorker`]).
-    head_worker: HeadWorker,
-    last_heads: Vec<head::HeadAnchor>,
     /// Latest RGB888 frame (width, height, bytes) — kept so the
     /// "Screenshot" button can write it to disk without re-grabbing
     /// from the device. `None` until the first frame arrives.
     last_rgb_frame: Option<(u32, u32, Vec<u8>)>,
-    /// Kinect v2 depth↔color registration, built lazily on the first depth
-    /// poll (the device must have streamed its camera params first). Corrects
-    /// the IR-vs-RGB sensor parallax when placing the depth-blob head crosshair
-    /// on the color image. `None` for v1/webcam and until first built.
-    depth_registration: Option<freenect2::Registration>,
     /// Latest depth frame (width, height, millimetres) — kept so the
     /// "Share a capture" button can export it alongside the RGB. `None` for
     /// the webcam backend (no depth) and until the first depth poll. Stored
@@ -2061,13 +2005,12 @@ struct Active {
     /// (its IR needs a momentary video-mode switch, done on demand in
     /// [`DemoShell::share_capture`]) and the webcam.
     last_ir: Option<(u32, u32, Vec<u16>)>,
-    /// Webcam silhouette skeleton path (behind the `skeleton_webcam` toggle):
-    /// MediaPipe person segmenter + the `skeleton-depth` tracker fed its mask.
-    /// Built lazily on first use; `None` for Kinect and until built. The latest
-    /// skeleton is kept for the overlay + head/hands read-out.
-    seg: Option<personseg::Segmenter>,
-    skel_tracker: Option<skeleton_depth::Tracker>,
-    last_skeleton: Option<skeleton_depth::Skeleton>,
+    /// BlazePose worker (pose/head) — replaces the RGB head net + depth blob +
+    /// silhouette skeleton with one model read straight off the frame. Its 33
+    /// landmarks drive the head crosshair and (later) the hands↔lockbar player
+    /// selection so only the person holding the flipper is tracked.
+    blaze_worker: BlazePoseWorker,
+    last_pose: Option<blazepose::Pose>,
     /// Live perf counters (inference times, CPU%, in/out FPS). Reset per
     /// backend open — each device gets a fresh measurement window.
     metrics: Metrics,
@@ -2293,83 +2236,6 @@ struct HeadJob {
     h: u32,
 }
 
-/// What the [`HeadWorker`] publishes after each detection.
-#[derive(Clone, Default)]
-struct HeadOut {
-    heads: Vec<head::HeadAnchor>,
-    /// Last head inference time (ms); `0.0` until the first detection.
-    head_ms: f32,
-}
-
-/// Runs the head detector (~15 ms at MODEL_SIDE=160) off the UI thread. The UI
-/// submits the latest colour frame each poll and reads the newest head boxes
-/// back via [`HeadWorker::snapshot`] without ever blocking on inference — so
-/// the render loop keeps the full camera frame rate (`out_fps` == `in_fps`)
-/// and the detector runs flat-out on its own core, yielding a fresh head every
-/// ~60 Hz frame. Unlike [`UWorker`] there is no warmup/freeze: the head moves,
-/// so we keep detecting for the whole session.
-struct HeadWorker {
-    job: Arc<(Mutex<Option<HeadJob>>, Condvar)>,
-    out: Arc<Mutex<HeadOut>>,
-    stop: Arc<AtomicBool>,
-    /// Minimum ms between two inferences — a rate cap so the detector stops
-    /// pinning a full core running flat-out. Live-tunable from the bench row.
-    interval_ms: Arc<AtomicU32>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl HeadWorker {
-    fn spawn(backend_name: &'static str) -> Self {
-        let job = Arc::new((Mutex::new(None::<HeadJob>), Condvar::new()));
-        let out = Arc::new(Mutex::new(HeadOut::default()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let interval_ms = Arc::new(AtomicU32::new(0));
-        let (job_t, out_t, stop_t, iv_t) = (
-            Arc::clone(&job),
-            Arc::clone(&out),
-            Arc::clone(&stop),
-            Arc::clone(&interval_ms),
-        );
-        let handle = std::thread::Builder::new()
-            .name("head-detector".into())
-            .spawn(move || head_worker_loop(backend_name, &job_t, &out_t, &stop_t, &iv_t))
-            .expect("spawn head-detector thread");
-        Self {
-            job,
-            out,
-            stop,
-            interval_ms,
-            handle: Some(handle),
-        }
-    }
-
-    /// Cap the detector to at most one inference every `ms` (0 = flat-out).
-    fn set_min_interval_ms(&self, ms: u32) {
-        self.interval_ms.store(ms, Ordering::Relaxed);
-    }
-
-    /// Hand the worker the latest colour frame, replacing any pending one.
-    fn submit(&self, rgb888: Vec<u8>, w: u32, h: u32) {
-        *self.job.0.lock() = Some(HeadJob { rgb888, w, h });
-        self.job.1.notify_one();
-    }
-
-    /// Newest head boxes the worker has produced. Never blocks on inference.
-    fn snapshot(&self) -> HeadOut {
-        self.out.lock().clone()
-    }
-}
-
-impl Drop for HeadWorker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        self.job.1.notify_one();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
 // -------------------------------------------------------------- Pose worker
 
 /// What the [`BlazePoseWorker`] publishes after each inference.
@@ -2488,56 +2354,6 @@ fn blazepose_worker_loop(
             }
             Err(e) => warn!("blazepose detect: {e}"),
         }
-    }
-}
-
-/// Body of the head-detector thread: wait for a frame, honour the rate cap
-/// (`interval_ms`, so it doesn't pin a core running flat-out), run inference,
-/// publish the boxes + timing. The 1€ filter interpolates between detections,
-/// so a capped rate stays smooth.
-fn head_worker_loop(
-    backend_name: &'static str,
-    job: &Arc<(Mutex<Option<HeadJob>>, Condvar)>,
-    out: &Arc<Mutex<HeadOut>>,
-    stop: &Arc<AtomicBool>,
-    interval_ms: &Arc<AtomicU32>,
-) {
-    let detector = init_head_detector(backend_name);
-    let mut last_run = Instant::now();
-    loop {
-        // Rate cap: wait out `interval_ms` since the last inference start
-        // before grabbing the next (freshest) frame, so the detector doesn't
-        // pin a core running flat-out. `stop` keeps shutdown snappy.
-        let interval = Duration::from_millis(u64::from(interval_ms.load(Ordering::Relaxed)));
-        while last_run.elapsed() < interval {
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        // Block until a frame arrives (or we're asked to stop).
-        let item = {
-            let (lock, cvar) = &**job;
-            let mut slot = lock.lock();
-            while slot.is_none() && !stop.load(Ordering::Acquire) {
-                cvar.wait(&mut slot);
-            }
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            slot.take()
-        };
-        let Some(item) = item else { continue };
-        let Some(detector) = detector.as_ref() else {
-            continue; // detector failed to init — nothing to do.
-        };
-        last_run = Instant::now();
-        let t0 = Instant::now();
-        let heads = detector.detect(&item.rgb888, item.w, item.h);
-        let head_ms = t0.elapsed().as_secs_f32() * 1000.0;
-        let mut o = out.lock();
-        o.heads = heads;
-        o.head_ms = head_ms;
     }
 }
 
@@ -2981,65 +2797,13 @@ impl Active {
     }
 }
 
-/// Score-based head picker: "closer to the camera AND more centred
-/// on the lockbar wins". Centrality is measured against `preferred_u`
-/// (lockbar pixel-centre when locked, otherwise frame centre); the
-/// score is `area × centrality²` so a head at the very edge is
-/// heavily down-weighted but never zero — the lone head in the frame
-/// is still picked.
-///
-/// Doesn't try to be the long-term solution (a bystander standing
-/// directly between the player and the lockbar would still win); see
-/// the BlazePalm "hands on the lockbar = player" path on the P2
-/// roadmap for the robust version.
-/// Debug picker: the largest head, ignoring position — used by the "no
-/// filters" toggle to take detection out of the equation.
-fn pick_largest_head(heads: &[head::HeadAnchor]) -> Option<&head::HeadAnchor> {
-    heads.iter().max_by(|a, b| {
-        (a.width * a.height)
-            .partial_cmp(&(b.width * b.height))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-fn pick_player_head(
-    heads: &[head::HeadAnchor],
-    frame_w: u32,
-    preferred_u: Option<f32>,
-) -> Option<&head::HeadAnchor> {
-    if heads.is_empty() {
-        return None;
-    }
-    let target = preferred_u.unwrap_or(frame_w as f32 * 0.5);
-    let half_w = (frame_w as f32 * 0.5).max(1.0);
-    // `HeadAnchor` is centre-based, so the box centre is `cx` directly.
-    let score = |h: &head::HeadAnchor| -> f32 {
-        let dist_norm = ((h.cx - target).abs() / half_w).clamp(0.0, 1.0);
-        let centrality = (1.0 - dist_norm).max(0.05);
-        h.width * h.height * centrality * centrality
-    };
-    heads.iter().max_by(|a, b| {
-        score(a)
-            .partial_cmp(&score(b))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-/// Anchor the head pose to the head detector's bbox: scale the head-box
-/// centre from the RGB pixel grid into the depth pixel grid, sample a
-/// window of valid depth values there, take the median (robust to
-/// outliers), then deproject through the IR intrinsics. Returns `None`
-/// when not enough valid depth pixels land inside the head window.
-///
-/// Mirrors the plugin's `head_from_region` (see `src/tracker/face_depth.rs`)
-/// — the demo keeps its own copy because it also needs the pixel `(u, v)`
-/// for the status label. Naive linear rescale between the two pixel grids —
-/// on the Kinect v2 the IR and RGB sensors are physically offset, so the
-/// sampled window can drift a few pixels off the head for very close
-/// subjects. Good enough to land on the skull; libfreenect2's Registration
-/// is the proper fix and gets wired up later.
-fn head_pixel_from_depth(
-    head: &head::HeadAnchor,
+/// Head pixel from a BlazePose nose + a depth frame: map the nose (RGB px)
+/// into the depth grid, take the median valid depth in a small window, and
+/// deproject through the IR intrinsics. Mirrors [`head_pixel_from_depth`] but
+/// keyed on the pose's nose instead of a head bbox — the depth path once
+/// BlazePose replaces the head net.
+fn head_pixel_from_pose_depth(
+    pose: &blazepose::Pose,
     rgb: (u32, u32),
     depth_data: &[f32],
     depth_dims: (u32, u32),
@@ -3051,23 +2815,19 @@ fn head_pixel_from_depth(
     if rgb_w == 0 || rgb_h == 0 || depth_w == 0 || depth_h == 0 {
         return None;
     }
-    let scale_x = depth_w as f32 / rgb_w as f32;
-    let scale_y = depth_h as f32 / rgb_h as f32;
-    // `HeadAnchor` is already centre-based.
-    let depth_cx = head.cx * scale_x;
-    let depth_cy = head.cy * scale_y;
-    let half_w = ((head.width * 0.4 * scale_x) as i32).clamp(4, 24);
-    let half_h = ((head.height * 0.4 * scale_y) as i32).clamp(4, 24);
-    let cx = depth_cx as i32;
-    let cy = depth_cy as i32;
-    let mut samples: Vec<f32> = Vec::with_capacity(((2 * half_w + 1) * (2 * half_h + 1)) as usize);
-    for dv in -half_h..=half_h {
+    let nose = &pose.landmarks[blazepose::idx::NOSE];
+    let depth_cx = nose.x * depth_w as f32 / rgb_w as f32;
+    let depth_cy = nose.y * depth_h as f32 / rgb_h as f32;
+    let (cx, cy) = (depth_cx as i32, depth_cy as i32);
+    let half = 8i32;
+    let mut samples: Vec<f32> = Vec::new();
+    for dv in -half..=half {
         let v = cy + dv;
         if v < 0 || v >= depth_h as i32 {
             continue;
         }
-        let row = (v as usize) * depth_w as usize;
-        for du in -half_w..=half_w {
+        let row = v as usize * depth_w as usize;
+        for du in -half..=half {
             let u = cx + du;
             if u < 0 || u >= depth_w as i32 {
                 continue;
@@ -3083,263 +2843,44 @@ fn head_pixel_from_depth(
     }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let depth_mm = samples[samples.len() / 2];
-
     let zf = f64::from(depth_mm);
-    let x_mm = (f64::from(depth_cx - intr.cx) * zf / f64::from(intr.fx)) as f32;
-    let y_mm = (f64::from(depth_cy - intr.cy) * zf / f64::from(intr.fy)) as f32;
-
     Some(HeadPixel {
         u: depth_cx.max(0.0) as u32,
         v: depth_cy.max(0.0) as u32,
         depth_mm,
-        x_mm,
-        y_mm,
+        x_mm: (f64::from(depth_cx - intr.cx) * zf / f64::from(intr.fx)) as f32,
+        y_mm: (f64::from(depth_cy - intr.cy) * zf / f64::from(intr.fy)) as f32,
     })
 }
 
-/// Find the player's head **directly in the depth image** — the classic
-/// Kinect approach, no RGB and no neural net. The head is the top of the
-/// nearest sizeable blob in the *player region* (the rows above the lockbar,
-/// so the playfield surface and the hands resting on the bar are excluded).
-///
-/// `rgb_w/h` are the colour-frame dimensions the lockbar quad is expressed in;
-/// the quad's top edge is scaled into depth-pixel space to bound the ROI.
-/// Returns the head pixel (depth grid) + deprojected mm, or `None` when the
-/// blob is too small to trust.
-#[allow(clippy::too_many_arguments)]
-fn head_from_depth_blob(
-    depth: &[f32],
-    dw: u32,
-    dh: u32,
-    intr: &Intrinsics,
-    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
-    rgb_w: u32,
-    rgb_h: u32,
-) -> Option<HeadPixel> {
-    if dw == 0 || dh == 0 || depth.len() != (dw as usize) * (dh as usize) {
+/// Head pixel from a BlazePose pose on a **webcam** frame (no depth):
+/// triangulate distance from the shoulder width — a stable ~0.40 m span, so
+/// `Z = fx · W / w_px` — then deproject the nose. `None` if the shoulders
+/// aren't confidently seen.
+fn head_pixel_from_pose_webcam(pose: &blazepose::Pose, intr: &Intrinsics) -> Option<HeadPixel> {
+    use blazepose::idx::{LEFT_SHOULDER, NOSE, RIGHT_SHOULDER};
+    let (ls, rs, nose) = (
+        &pose.landmarks[LEFT_SHOULDER],
+        &pose.landmarks[RIGHT_SHOULDER],
+        &pose.landmarks[NOSE],
+    );
+    if ls.visibility < 0.5 || rs.visibility < 0.5 {
         return None;
     }
-    // Search a 45° cone opening upward from the lockbar centre — the head
-    // stays inside it even when it moves laterally (a hard nudge, or aiming
-    // from the side on tables like Star Trek), while the lower corners (where
-    // a side object could be nearer than the head) are excluded. RGB→depth.
-    let (u_apex, v_apex) = match lockbar {
-        Some(q) if rgb_w > 0 && rgb_h > 0 => {
-            let uc = (q.corners[0].0 + q.corners[1].0) as f32 * 0.5 * dw as f32 / rgb_w as f32;
-            let vt = (q.corners[0].1.min(q.corners[1].1) as f32) * dh as f32 / rgb_h as f32;
-            (uc, vt.clamp(1.0, dh as f32))
-        }
-        _ => (dw as f32 * 0.5, dh as f32 * 0.65),
-    };
-    let v_end = v_apex as u32;
-    // At row `v`, the 45° cone (tan 45° = 1) spans `u_apex ± (v_apex - v)`.
-    let cone = |v: u32| -> (usize, usize) {
-        let hw = (v_apex - v as f32).max(0.0);
-        let lo = (u_apex - hw).max(0.0) as usize;
-        let hi = (((u_apex + hw) as usize) + 1).min(dw as usize);
-        (lo.min(hi), hi)
-    };
-
-    // Pass 1 — depth histogram over the ROI (25 mm bins) to find the nearest
-    // real surface robustly (ignore sub-blob noise specks).
-    const BIN_MM: f32 = 25.0;
-    let n_bins = ((DEPTH_MAX_MM - DEPTH_MIN_MM) / BIN_MM) as usize + 1;
-    let mut hist = vec![0u32; n_bins];
-    for v in 0..v_end {
-        let (ulo, uhi) = cone(v);
-        let row = (v as usize) * dw as usize;
-        for u in ulo..uhi {
-            let z = depth[row + u];
-            if (DEPTH_MIN_MM..=DEPTH_MAX_MM).contains(&z) {
-                hist[((z - DEPTH_MIN_MM) / BIN_MM) as usize] += 1;
-            }
-        }
-    }
-    // Nearest bin whose 3-bin window holds enough pixels to be a body, not noise.
-    const MIN_BLOB_PX: u32 = 60;
-    let near_bin =
-        (0..n_bins).find(|&b| hist[b..(b + 3).min(n_bins)].iter().sum::<u32>() >= MIN_BLOB_PX)?;
-    let d_near = DEPTH_MIN_MM + near_bin as f32 * BIN_MM;
-
-    // Pass 2 — mask = the near slab (head + shoulders front). Find the crown
-    // (topmost row with a real run of slab pixels), then a head-height band
-    // below it, and take the centroid + median depth there.
-    const SLAB_MM: f32 = 350.0;
-    const MIN_ROW_RUN: u32 = 6;
-    let (lo, hi) = (d_near - BIN_MM, d_near + SLAB_MM);
-    let in_slab = |z: f32| z >= lo && z <= hi;
-
-    let mut crown_v = None;
-    for v in 0..v_end {
-        let (ulo, uhi) = cone(v);
-        let row = (v as usize) * dw as usize;
-        let run = (ulo..uhi).filter(|&u| in_slab(depth[row + u])).count() as u32;
-        if run >= MIN_ROW_RUN {
-            crown_v = Some(v);
-            break;
-        }
-    }
-    let crown_v = crown_v?;
-    // Head is ~250 mm tall; convert to rows at this distance.
-    let band_rows = ((250.0 * intr.fy / d_near) as u32).clamp(6, dh);
-    let band_end = (crown_v + band_rows).min(v_end);
-
-    let (mut su, mut sv, mut n) = (0f64, 0f64, 0u32);
-    let mut depths: Vec<f32> = Vec::new();
-    for v in crown_v..band_end {
-        let (ulo, uhi) = cone(v);
-        let row = (v as usize) * dw as usize;
-        for u in ulo..uhi {
-            let z = depth[row + u];
-            if in_slab(z) {
-                su += u as f64;
-                sv += v as f64;
-                n += 1;
-                depths.push(z);
-            }
-        }
-    }
-    if n < 20 {
+    let w_px = ((ls.x - rs.x).powi(2) + (ls.y - rs.y).powi(2)).sqrt();
+    if w_px < 1.0 {
         return None;
     }
-    let cu = (su / n as f64) as f32;
-    let cv = (sv / n as f64) as f32;
-    depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let depth_mm = depths[depths.len() / 2];
-
+    const SHOULDER_W_MM: f32 = 400.0;
+    let depth_mm = intr.fx * SHOULDER_W_MM / w_px;
     let zf = f64::from(depth_mm);
-    let x_mm = (f64::from(cu - intr.cx) * zf / f64::from(intr.fx)) as f32;
-    let y_mm = (f64::from(cv - intr.cy) * zf / f64::from(intr.fy)) as f32;
     Some(HeadPixel {
-        u: cu.max(0.0) as u32,
-        v: cv.max(0.0) as u32,
+        u: nose.x.max(0.0) as u32,
+        v: nose.y.max(0.0) as u32,
         depth_mm,
-        x_mm,
-        y_mm,
+        x_mm: (f64::from(nose.x - intr.cx) * zf / f64::from(intr.fx)) as f32,
+        y_mm: (f64::from(nose.y - intr.cy) * zf / f64::from(intr.fy)) as f32,
     })
-}
-
-/// Build a [`HeadPixel`] from a head detection on a depth-less webcam frame.
-/// Z is triangulated from the head-box *width* in pixels against a nominal
-/// 155 mm physical head width (bitragion breadth) and `fx ≈ 0.85 × frame_w`
-/// (typical 60° HFOV webcam). This is the webcam counterpart to the Kinect
-/// depth path and matches the intended design: with no depth sensor, head
-/// width takes the role the lockbar width plays elsewhere. `ht-calibrate`
-/// will replace the nominal `fx` with the lockbar-measured focal length so
-/// the absolute scale becomes real.
-fn head_to_pixel_webcam(head: &head::HeadAnchor, frame_w: u32, frame_h: u32) -> HeadPixel {
-    const HEAD_WIDTH_MM: f32 = 155.0;
-    let fx = 0.85 * frame_w as f32;
-    let fy = fx;
-    let cx = (frame_w as f32) / 2.0;
-    let cy = (frame_h as f32) / 2.0;
-
-    let pixel_w = head.width.max(1.0);
-    let depth_mm = HEAD_WIDTH_MM * fx / pixel_w;
-
-    // Head-box centre as the head pixel.
-    let u = head.cx;
-    let v = head.cy;
-
-    let x_mm = (u - cx) * depth_mm / fx;
-    let y_mm = (v - cy) * depth_mm / fy;
-
-    HeadPixel {
-        u: u.max(0.0) as u32,
-        v: v.max(0.0) as u32,
-        depth_mm,
-        x_mm,
-        y_mm,
-    }
-}
-
-/// Build a [`HeadPixel`] from a `skeleton-depth` skeleton on a webcam frame.
-/// The skeleton lives in the segmenter's square mask space; map its head to the
-/// source frame per-axis (the model uses an aspect-distorting resize), then
-/// triangulate Z from the *shoulder breadth* against a nominal 400 mm — the
-/// webcam analogue of the head-box-width triangulation, but steadier. Falls back
-/// to a nominal distance when the shoulders weren't found.
-fn skeleton_head_webcam(
-    skel: &skeleton_depth::Skeleton,
-    frame_w: u32,
-    frame_h: u32,
-    side: usize,
-) -> Option<HeadPixel> {
-    const SHOULDER_WIDTH_MM: f32 = 400.0;
-    const FALLBACK_MM: f32 = 800.0;
-    let head = skel.head?;
-    let (sx, sy) = (frame_w as f32 / side as f32, frame_h as f32 / side as f32);
-    let u = head.x as f32 * sx;
-    let v = head.y as f32 * sy;
-    let fx = 0.85 * frame_w as f32;
-    let fy = fx;
-    let cx = frame_w as f32 / 2.0;
-    let cy = frame_h as f32 / 2.0;
-    let depth_mm = match (skel.left_shoulder, skel.right_shoulder) {
-        (Some(l), Some(r)) => {
-            let dx = ((l.x - r.x) as f32 * sx).abs().max(1.0);
-            SHOULDER_WIDTH_MM * fx / dx
-        }
-        _ => FALLBACK_MM,
-    };
-    let x_mm = (u - cx) * depth_mm / fx;
-    let y_mm = (v - cy) * depth_mm / fy;
-    Some(HeadPixel {
-        u: u.max(0.0) as u32,
-        v: v.max(0.0) as u32,
-        depth_mm,
-        x_mm,
-        y_mm,
-    })
-}
-
-/// Head pose from a Kinect depth skeleton: deproject the head joint (full-res
-/// depth pixel + z) to camera-space millimetres through the depth intrinsics.
-/// The connectivity-aware counterpart to `head_from_depth_blob`'s nearest cone
-/// blob — both feed the same `HeadPixel`, so they're interchangeable behind a
-/// toggle.
-fn skeleton_head_kinect(skel: &skeleton_depth::Skeleton, intr: &Intrinsics) -> Option<HeadPixel> {
-    let head = skel.head?;
-    if head.z_mm == 0 {
-        return None; // no depth at the head pixel → no pose (honest miss)
-    }
-    let si = skeleton_depth::Intrinsics {
-        fx: intr.fx,
-        fy: intr.fy,
-        cx: intr.cx,
-        cy: intr.cy,
-    };
-    let m = head.to_metric(&si);
-    Some(HeadPixel {
-        u: head.x.max(0) as u32,
-        v: head.y.max(0) as u32,
-        depth_mm: m[2],
-        x_mm: m[0],
-        y_mm: m[1],
-    })
-}
-
-/// Map a Kinect v2 depth-grid pixel (`u`, `v`, `z_mm`) onto the 1920×1080 color
-/// frame through libfreenect2's Registration (built lazily the first time — the
-/// camera params are only valid once the device streams). This corrects the
-/// IR-vs-RGB sensor parallax; the fallback (until the registration yields a
-/// finite mapping) is a plain resolution scale, which sits visibly off the
-/// skull. Shared by the cone-blob and the skeleton depth-head paths.
-fn map_depth_to_rgb(
-    reg: &mut Option<freenect2::Registration>,
-    device: &freenect2::Device,
-    u: u32,
-    v: u32,
-    z_mm: f32,
-    dw: u32,
-    dh: u32,
-) -> (f32, f32) {
-    if reg.is_none() {
-        *reg = Some(device.registration());
-    }
-    reg.as_ref()
-        .and_then(|r| r.map_depth_to_color(u, v, z_mm))
-        .unwrap_or((u as f32 * 1920.0 / dw as f32, v as f32 * 1080.0 / dh as f32))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3491,10 +3032,6 @@ impl App {
             head_filter_beta: 0.4,
             head_detect_hz: 15.0,
             bypass_filters: false,
-            depth_head: true,
-            last_depth_head: None,
-            skeleton_webcam: false,
-            skeleton_kinect: false,
             contribute_open: false,
             consent_checked: false,
             uploader: contribute::Uploader::spawn(),
@@ -3676,36 +3213,13 @@ impl App {
                 },
                 _ => None,
             });
-        // Webcam has no depth; its dataset analog is the bgremover
-        // (person-segmentation) mask. Run the segmenter on demand on the last
-        // frame so the capture carries it regardless of the skeleton toggle.
-        let seg_mask = self.active.as_mut().and_then(|active| {
-            if !matches!(active.inner, Inner::Webcam { .. }) {
-                return None;
-            }
-            let (w, h, raw) = active.last_rgb_frame.as_ref()?.clone();
-            if active.seg.is_none() {
-                match personseg::Segmenter::new() {
-                    Ok(s) => active.seg = Some(s),
-                    Err(e) => {
-                        warn!("contribution: personseg load failed: {e}");
-                        return None;
-                    }
-                }
-            }
-            let sil = active
-                .seg
-                .as_ref()?
-                .silhouette(&raw, w, h, personseg::DEFAULT_THRESHOLD);
-            Some((sil.side as u32, sil.side as u32, sil.data))
-        });
         let payload = self.active.as_ref().and_then(|active| {
             active.last_rgb_frame.as_ref().map(|(w, h, raw)| {
                 let det = bake_overlays(
                     *w,
                     *h,
                     raw,
-                    &active.last_heads,
+                    active.last_pose.as_ref(),
                     active.last_lockbar.as_ref(),
                 );
                 (
@@ -3769,13 +3283,6 @@ impl App {
                 Err(e) => warn!("contribution: irview png encode failed: {e}"),
             }
         }
-        // Webcam bgremover mask (person segmentation), 8-bit gray.
-        if let Some((sw, sh, mask)) = seg_mask.as_ref() {
-            match png_gray8_bytes(*sw, *sh, mask) {
-                Ok(bytes) => files.push((format!("{stem}_seg.png"), bytes)),
-                Err(e) => warn!("contribution: seg png encode failed: {e}"),
-            }
-        }
         for (name, bytes) in files {
             if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
                 warn!(name, "contribution: local save failed: {e}");
@@ -3804,56 +3311,33 @@ impl App {
         } else {
             0
         };
-        active.head_worker.set_min_interval_ms(head_ms);
-        // Debug bypass: raw pose, largest-head picker, relaxed depth gate.
+        // Rate-cap the pose inference (0 Hz slider = flat-out).
+        active.blaze_worker.set_min_interval_ms(head_ms);
+        // Debug bypass: raw pose, relaxed depth gate.
         let bypass = self.bypass_filters;
         let depth_min = if bypass { 4 } else { 16 };
-        let depth_head = self.depth_head;
-        let skeleton_kinect = self.skeleton_kinect;
-        // Both depth-only Kinect paths (cone-blob and skeleton) skip the RGB
-        // head net; the U worker still runs until it locks the lockbar.
-        let rgb_net_off = depth_head || skeleton_kinect;
         match &mut active.inner {
             Inner::KinectV2 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
                     active.metrics.note_input_frame();
-                    // BGRX→RGB888 (the detectors' input) is only worth doing
-                    // while a detector still consumes it: the head net (off in
-                    // depth-head mode) or the U worker (until it locks). Once
-                    // it's depth-head *and* U-locked we skip that whole 2 MP
-                    // pass — only the display conversion below remains.
-                    let u_locked = active.u_worker.is_locked();
-                    let img = if !rgb_net_off || !u_locked {
-                        let rgb888 = bgrx_to_rgb888(&rgb.data);
-                        if rgb_net_off {
-                            active.last_heads.clear();
-                        } else {
-                            active
-                                .head_worker
-                                .submit(rgb888.clone(), rgb.width, rgb.height);
-                            let head_out = active.head_worker.snapshot();
-                            active.last_heads = head_out.heads;
-                            if head_out.head_ms > 0.0 {
-                                active.metrics.note_head_ms(head_out.head_ms);
-                            }
-                        }
-                        if !u_locked {
-                            active
-                                .u_worker
-                                .submit(rgb888.clone(), rgb.width, rgb.height);
-                        }
-                        // Reuse the RGB we already built for the display texture
-                        // (a cheap opaque add-alpha) instead of a second full
-                        // BGRX pass.
-                        let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb888);
-                        active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
-                        img
-                    } else {
-                        // Nothing needs RGB888 → the one BGRX→RGBA pass for
-                        // display is all that's left.
-                        active.last_heads.clear();
-                        bgrx_to_color_image(rgb.width, rgb.height, &rgb.data)
-                    };
+                    // RGB888 feeds BlazePose (every frame) and the U worker
+                    // (until it locks); reused for the display texture.
+                    let rgb888 = bgrx_to_rgb888(&rgb.data);
+                    active
+                        .blaze_worker
+                        .submit(rgb888.clone(), rgb.width, rgb.height);
+                    let pose_out = active.blaze_worker.snapshot();
+                    active.last_pose = pose_out.pose;
+                    if pose_out.ms > 0.0 {
+                        active.metrics.note_head_ms(pose_out.ms);
+                    }
+                    if !active.u_worker.is_locked() {
+                        active
+                            .u_worker
+                            .submit(rgb888.clone(), rgb.width, rgb.height);
+                    }
+                    let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb888);
+                    active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
                     let u_out = active.u_worker.snapshot();
                     active.last_u = u_out.u;
                     active.last_lockbar = u_out.lockbar;
@@ -3881,89 +3365,18 @@ impl App {
                         depth.height,
                         depth.data.iter().map(|&z| z as u16).collect(),
                     ));
-                    // Prefer head-anchored depth sampling: the head detector
-                    // tells us *where* the head is on RGB; we just read the
-                    // depth there. No head → no pose this frame. The old
-                    // closest-blob fallback was unreliable enough that
-                    // having no pose is more honest than having a wrong
-                    // one.
-                    let head = if skeleton_kinect {
-                        // Connectivity-aware skeleton over the whole depth frame;
-                        // take its head joint. A/B against the cone-blob below.
-                        let t = Instant::now();
-                        if active.skel_tracker.is_none() {
-                            active.skel_tracker = Some(skeleton_depth::Tracker::new(
-                                depth.width as usize,
-                                depth.height as usize,
-                                skeleton_depth::Config::default(),
-                            ));
-                        }
-                        // libfreenect2 depth is f32 mm; skeleton-depth wants u16 mm.
-                        let depth_u16: Vec<u16> = depth.data.iter().map(|&z| z as u16).collect();
-                        let skel = *active.skel_tracker.as_mut().unwrap().track(&depth_u16);
-                        active.last_skeleton = Some(skel);
-                        active
-                            .metrics
-                            .note_head_ms(t.elapsed().as_secs_f32() * 1000.0);
-                        let hp = skeleton_head_kinect(&skel, &active.intrinsics);
-                        self.last_depth_head = skel.head.map(|h| {
-                            map_depth_to_rgb(
-                                &mut active.depth_registration,
-                                device,
-                                h.x as u32,
-                                h.y as u32,
-                                h.z_mm as f32,
-                                depth.width,
-                                depth.height,
-                            )
-                        });
-                        hp
-                    } else if depth_head {
-                        active.last_skeleton = None;
-                        let hp = head_from_depth_blob(
+                    // Head = BlazePose nose sampled in the depth frame (the
+                    // pose comes from the RGB block above, async).
+                    let head = active.last_pose.as_ref().and_then(|p| {
+                        head_pixel_from_pose_depth(
+                            p,
+                            (1920, 1080),
                             &depth.data,
-                            depth.width,
-                            depth.height,
+                            (depth.width, depth.height),
                             &active.intrinsics,
-                            active.last_lockbar.as_ref(),
-                            1920,
-                            1080,
-                        );
-                        self.last_depth_head = hp.map(|h| {
-                            map_depth_to_rgb(
-                                &mut active.depth_registration,
-                                device,
-                                h.u,
-                                h.v,
-                                h.depth_mm,
-                                depth.width,
-                                depth.height,
-                            )
-                        });
-                        hp
-                    } else {
-                        active.last_skeleton = None;
-                        self.last_depth_head = None;
-                        let preferred = active
-                            .last_lockbar
-                            .as_ref()
-                            .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
-                        let picked = if bypass {
-                            pick_largest_head(&active.last_heads)
-                        } else {
-                            pick_player_head(&active.last_heads, 1920, preferred)
-                        };
-                        picked.and_then(|anchor| {
-                            head_pixel_from_depth(
-                                anchor,
-                                (1920, 1080),
-                                &depth.data,
-                                (depth.width, depth.height),
-                                &active.intrinsics,
-                                depth_min,
-                            )
-                        })
-                    };
+                            depth_min,
+                        )
+                    });
                     let smoothed =
                         smooth_head(head, &mut active.pose_filter, active.started_at, bypass);
                     capture_baseline(&mut active.baseline, smoothed);
@@ -3976,18 +3389,13 @@ impl App {
             Inner::KinectV1 { device, .. } => {
                 if let Some(rgb) = device.poll_rgb() {
                     active.metrics.note_input_frame();
-                    // See the v2 branch: both depth-only paths skip the RGB net.
-                    if rgb_net_off {
-                        active.last_heads.clear();
-                    } else {
-                        active
-                            .head_worker
-                            .submit(rgb.data.clone(), rgb.width, rgb.height);
-                        let head_out = active.head_worker.snapshot();
-                        active.last_heads = head_out.heads;
-                        if head_out.head_ms > 0.0 {
-                            active.metrics.note_head_ms(head_out.head_ms);
-                        }
+                    active
+                        .blaze_worker
+                        .submit(rgb.data.clone(), rgb.width, rgb.height);
+                    let pose_out = active.blaze_worker.snapshot();
+                    active.last_pose = pose_out.pose;
+                    if pose_out.ms > 0.0 {
+                        active.metrics.note_head_ms(pose_out.ms);
                     }
                     if !active.u_worker.is_locked() {
                         active
@@ -4008,73 +3416,19 @@ impl App {
                     // Keep the latest depth (native u16 mm) for the "Share a
                     // capture" export.
                     active.last_depth = Some((depth.width, depth.height, depth.data.clone()));
-                    // libfreenect ships u16 mm; widen for the shared algo.
+                    // libfreenect ships u16 mm; widen for the depth sampler.
                     let f32_data: Vec<f32> = depth.data.iter().map(|&v| f32::from(v)).collect();
-                    // Depth→RGB overlay is a plain resolution scale on v1 (no
-                    // libfreenect2-style registration; the sensors are close and
-                    // the crosshair is only a validation aid here).
-                    let to_rgb = |u: u32, v: u32| {
-                        (
-                            u as f32 * 640.0 / depth.width as f32,
-                            v as f32 * 480.0 / depth.height as f32,
-                        )
-                    };
-                    let head = if skeleton_kinect {
-                        let t = Instant::now();
-                        if active.skel_tracker.is_none() {
-                            active.skel_tracker = Some(skeleton_depth::Tracker::new(
-                                depth.width as usize,
-                                depth.height as usize,
-                                skeleton_depth::Config::default(),
-                            ));
-                        }
-                        // libfreenect ships u16 mm — exactly what skeleton-depth wants.
-                        let skel = *active.skel_tracker.as_mut().unwrap().track(&depth.data);
-                        active.last_skeleton = Some(skel);
-                        active
-                            .metrics
-                            .note_head_ms(t.elapsed().as_secs_f32() * 1000.0);
-                        let hp = skeleton_head_kinect(&skel, &active.intrinsics);
-                        self.last_depth_head = skel
-                            .head
-                            .map(|h| to_rgb(h.x.max(0) as u32, h.y.max(0) as u32));
-                        hp
-                    } else if depth_head {
-                        active.last_skeleton = None;
-                        let hp = head_from_depth_blob(
+                    // Head = BlazePose nose sampled in the depth frame.
+                    let head = active.last_pose.as_ref().and_then(|p| {
+                        head_pixel_from_pose_depth(
+                            p,
+                            (640, 480),
                             &f32_data,
-                            depth.width,
-                            depth.height,
+                            (depth.width, depth.height),
                             &active.intrinsics,
-                            active.last_lockbar.as_ref(),
-                            640,
-                            480,
-                        );
-                        self.last_depth_head = hp.map(|h| to_rgb(h.u, h.v));
-                        hp
-                    } else {
-                        active.last_skeleton = None;
-                        self.last_depth_head = None;
-                        let preferred = active
-                            .last_lockbar
-                            .as_ref()
-                            .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
-                        let picked = if bypass {
-                            pick_largest_head(&active.last_heads)
-                        } else {
-                            pick_player_head(&active.last_heads, 640, preferred)
-                        };
-                        picked.and_then(|anchor| {
-                            head_pixel_from_depth(
-                                anchor,
-                                (640, 480),
-                                &f32_data,
-                                (depth.width, depth.height),
-                                &active.intrinsics,
-                                depth_min,
-                            )
-                        })
-                    };
+                            depth_min,
+                        )
+                    });
                     let smoothed =
                         smooth_head(head, &mut active.pose_filter, active.started_at, bypass);
                     capture_baseline(&mut active.baseline, smoothed);
@@ -4087,82 +3441,20 @@ impl App {
             Inner::Webcam { camera } => {
                 if let Some(rgb) = camera.poll_rgb() {
                     active.metrics.note_input_frame();
-                    let head = if self.skeleton_webcam {
-                        // Silhouette-skeleton path: person segmentation → the
-                        // same `skeleton-depth` tracker the Kinect uses, so the
-                        // webcam works on any background. The YOLO head net is
-                        // skipped (its boxes cleared) while this is on.
-                        active.last_heads.clear();
-                        if active.seg.is_none() {
-                            match personseg::Segmenter::new() {
-                                Ok(s) => active.seg = Some(s),
-                                Err(e) => tracing::warn!("personseg load failed: {e}"),
-                            }
-                        }
-                        if active.skel_tracker.is_none() {
-                            active.skel_tracker = Some(skeleton_depth::Tracker::new(
-                                personseg::MODEL_SIDE,
-                                personseg::MODEL_SIDE,
-                                skeleton_depth::Config {
-                                    subsample: 1,
-                                    ..Default::default()
-                                },
-                            ));
-                        }
-                        let skel = match (active.seg.as_ref(), active.skel_tracker.as_mut()) {
-                            (Some(seg), Some(tracker)) => {
-                                let t = Instant::now();
-                                let sil = seg.silhouette(
-                                    &rgb.data,
-                                    rgb.width,
-                                    rgb.height,
-                                    personseg::DEFAULT_THRESHOLD,
-                                );
-                                let mask = skeleton_depth::mask::Mask {
-                                    w: sil.side,
-                                    h: sil.side,
-                                    data: sil.data,
-                                };
-                                let s = *tracker.track_mask(mask, None);
-                                active
-                                    .metrics
-                                    .note_head_ms(t.elapsed().as_secs_f32() * 1000.0);
-                                Some(s)
-                            }
-                            _ => None,
-                        };
-                        active.last_skeleton = skel;
-                        let hp = skel.and_then(|s| {
-                            skeleton_head_webcam(&s, rgb.width, rgb.height, personseg::MODEL_SIDE)
-                        });
-                        // Magenta crosshair on the head, like the Kinect paths —
-                        // skeleton_head_webcam already returns RGB-frame pixels.
-                        self.last_depth_head = hp.map(|h| (h.u as f32, h.v as f32));
-                        hp
-                    } else {
-                        active.last_skeleton = None;
-                        self.last_depth_head = None;
-                        // RGB head detector on its own thread; triangulate Z from
-                        // the head-box width (see `head_to_pixel_webcam`).
-                        active
-                            .head_worker
-                            .submit(rgb.data.clone(), rgb.width, rgb.height);
-                        let head_out = active.head_worker.snapshot();
-                        active.last_heads = head_out.heads;
-                        if head_out.head_ms > 0.0 {
-                            active.metrics.note_head_ms(head_out.head_ms);
-                        }
-                        let preferred = active
-                            .last_lockbar
-                            .as_ref()
-                            .map(|q| (q.corners[0].0 + q.corners[1].0) as f32 * 0.5);
-                        let picked = if bypass {
-                            pick_largest_head(&active.last_heads)
-                        } else {
-                            pick_player_head(&active.last_heads, rgb.width, preferred)
-                        };
-                        picked.map(|anchor| head_to_pixel_webcam(anchor, rgb.width, rgb.height))
-                    };
+                    active
+                        .blaze_worker
+                        .submit(rgb.data.clone(), rgb.width, rgb.height);
+                    let pose_out = active.blaze_worker.snapshot();
+                    active.last_pose = pose_out.pose;
+                    if pose_out.ms > 0.0 {
+                        active.metrics.note_head_ms(pose_out.ms);
+                    }
+                    // Webcam has no depth: triangulate the head distance from
+                    // the pose's shoulder width.
+                    let head = active
+                        .last_pose
+                        .as_ref()
+                        .and_then(|p| head_pixel_from_pose_webcam(p, &active.intrinsics));
                     let smoothed =
                         smooth_head(head, &mut active.pose_filter, active.started_at, bypass);
                     capture_baseline(&mut active.baseline, smoothed);
@@ -4480,7 +3772,7 @@ impl App {
                         *w,
                         *h,
                         bytes,
-                        &active.last_heads,
+                        active.last_pose.as_ref(),
                         active.last_lockbar.as_ref(),
                     ));
                     match &self.screenshot_status {
@@ -4990,47 +4282,14 @@ impl App {
                 // place (or off-screen). The texture was built from
                 // the same buffer the detector saw, so its size is
                 // authoritative.
+                // BlazePose skeleton overlay: landmarks are in frame pixels,
+                // mapped onto the view rect (same space for every backend).
                 let src_size = tex.size_vec2();
-                for head in &active.last_heads {
-                    draw_head_bbox(ui.painter(), rect, head, src_size);
-                }
-                // Depth-blob head marker (magenta crosshair) — what the
-                // Kinect depth path picked, drawn in the same RGB→screen space.
-                if let Some((u, v)) = self.last_depth_head
+                if let Some(p) = &active.last_pose
                     && src_size.x > 0.0
                     && src_size.y > 0.0
                 {
-                    let p = Pos2::new(
-                        rect.left() + u / src_size.x * rect.width(),
-                        rect.top() + v / src_size.y * rect.height(),
-                    );
-                    let col = Color32::from_rgb(0xff, 0x30, 0xd0);
-                    ui.painter().circle_stroke(p, 11.0, Stroke::new(2.5, col));
-                    ui.painter().line_segment(
-                        [p - Vec2::X * 16.0, p + Vec2::X * 16.0],
-                        Stroke::new(1.5, col),
-                    );
-                    ui.painter().line_segment(
-                        [p - Vec2::Y * 16.0, p + Vec2::Y * 16.0],
-                        Stroke::new(1.5, col),
-                    );
-                }
-                // Full skeleton overlay for the webcam path: joints live in the
-                // personseg 256² mask space, which maps linearly onto the whole
-                // view (the aspect-distorting resize cancels the frame size). The
-                // Kinect skeleton shows only the head crosshair above — mapping
-                // its depth-space joints to the color image needs registration.
-                if matches!(active.inner, Inner::Webcam { .. })
-                    && let Some(skel) = active.last_skeleton
-                {
-                    let side = personseg::MODEL_SIDE as f32;
-                    let to_screen = |j: skeleton_depth::Joint| {
-                        Pos2::new(
-                            rect.left() + (j.x as f32 / side) * rect.width(),
-                            rect.top() + (j.y as f32 / side) * rect.height(),
-                        )
-                    };
-                    draw_skeleton_overlay(ui.painter(), &skel, to_screen);
+                    draw_pose_overlay(ui.painter(), rect, p, src_size);
                 }
             } else {
                 centered(ui, rect, "waiting for first RGB frame…");
@@ -5118,25 +4377,6 @@ impl App {
                 ui.separator();
                 ui.toggle_value(&mut self.bypass_filters, "no filters")
                     .on_hover_text("Bypass 1€ filter + picker scoring + most of the depth gate");
-                ui.separator();
-                ui.toggle_value(&mut self.depth_head, "depth head")
-                    .on_hover_text(
-                        "Kinect: find the head from the depth image (nearest blob above the \
-                         lockbar) instead of the RGB neural net. Magenta crosshair = pick.",
-                    );
-                ui.separator();
-                ui.toggle_value(&mut self.skeleton_kinect, "skeleton (kinect)")
-                    .on_hover_text(
-                        "Kinect: feed the depth frame to skeleton-depth (connectivity-aware \
-                         upper body) and take its head joint instead of the nearest cone blob. \
-                         Magenta crosshair = pick — toggle against \"depth head\" to compare.",
-                    );
-                ui.separator();
-                ui.toggle_value(&mut self.skeleton_webcam, "skeleton (cam)")
-                    .on_hover_text(
-                        "Webcam: derive the head from a person-segmentation silhouette fed to \
-                         skeleton-depth (any background) instead of the RGB head net.",
-                    );
             });
         }
 
@@ -5325,80 +4565,39 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
     );
 }
 
-/// Draw a head bbox on top of the displayed image. The bbox is in the
-/// frame's pixel coordinates, scaled by the source frame size for the
-/// active backend (RGB sensor resolution: 1920×1080 for v2, 640×480 for
-/// v1, native cam res for webcam — the texture in `rect` already encodes
-/// the right aspect, we just need source dimensions to normalise).
-/// `src_size` is the actual pixel dimensions of the frame the detector
-/// processed (= the texture's size, not the camera spec). Passing the
-/// wrong source size mis-projects the bbox; cf. the macOS AVFoundation
-/// vs SDL3 camera-format mismatch the demo hit on the FaceTime cam.
-fn draw_head_bbox(painter: &egui::Painter, rect: Rect, head: &head::HeadAnchor, src_size: Vec2) {
-    let frame_w = src_size.x;
-    let frame_h = src_size.y;
-    if frame_w <= 0.0 || frame_h <= 0.0 {
-        return;
+/// Draw the BlazePose skeleton (bones + joints) over the camera view. The 33
+/// landmarks are in frame pixels; `src` is the texture size they map onto.
+fn draw_pose_overlay(painter: &egui::Painter, rect: Rect, pose: &blazepose::Pose, src: Vec2) {
+    use blazepose::idx::{
+        LEFT_ELBOW, LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_ELBOW, RIGHT_SHOULDER, RIGHT_WRIST,
+    };
+    let to_screen = |i: usize| {
+        let l = &pose.landmarks[i];
+        Pos2::new(
+            rect.left() + l.x / src.x * rect.width(),
+            rect.top() + l.y / src.y * rect.height(),
+        )
+    };
+    let bone = Color32::from_gray(0xcc);
+    for (a, b) in [
+        (LEFT_SHOULDER, RIGHT_SHOULDER),
+        (LEFT_SHOULDER, LEFT_ELBOW),
+        (LEFT_ELBOW, LEFT_WRIST),
+        (RIGHT_SHOULDER, RIGHT_ELBOW),
+        (RIGHT_ELBOW, RIGHT_WRIST),
+        (NOSE, LEFT_SHOULDER),
+        (NOSE, RIGHT_SHOULDER),
+    ] {
+        painter.line_segment([to_screen(a), to_screen(b)], Stroke::new(2.0, bone));
     }
-    let to_screen = |x: f32, y: f32| -> Pos2 {
-        rect.left_top() + Vec2::new((x / frame_w) * rect.width(), (y / frame_h) * rect.height())
-    };
-    // HeadAnchor is centre-based: derive the four corners from cx/cy ± half.
-    let x0 = head.cx - head.width * 0.5;
-    let y0 = head.cy - head.height * 0.5;
-    let x1 = head.cx + head.width * 0.5;
-    let y1 = head.cy + head.height * 0.5;
-    let p1 = to_screen(x0, y0);
-    let p2 = to_screen(x1, y0);
-    let p3 = to_screen(x1, y1);
-    let p4 = to_screen(x0, y1);
-    painter.line_segment([p1, p2], Stroke::new(2.0_f32, HEAD_COLOR));
-    painter.line_segment([p2, p3], Stroke::new(2.0_f32, HEAD_COLOR));
-    painter.line_segment([p3, p4], Stroke::new(2.0_f32, HEAD_COLOR));
-    painter.line_segment([p4, p1], Stroke::new(2.0_f32, HEAD_COLOR));
-    painter.text(
-        p1 + Vec2::new(2.0, -14.0),
-        egui::Align2::LEFT_BOTTOM,
-        format!("{:.0}%", head.confidence * 100.0),
-        egui::FontId::monospace(11.0),
-        HEAD_COLOR,
-    );
-}
-
-/// Draw the detected skeleton (bones + joints) over the RGB view. `to_screen`
-/// maps a joint's source-space pixel to screen coords — the caller owns the
-/// source→screen transform (webcam: 256² mask space; Kinect: depth space).
-fn draw_skeleton_overlay(
-    painter: &egui::Painter,
-    skel: &skeleton_depth::Skeleton,
-    to_screen: impl Fn(skeleton_depth::Joint) -> Pos2,
-) {
-    let bone_col = Color32::from_rgb(C_BONE[0], C_BONE[1], C_BONE[2]);
-    let bone = |a: Option<skeleton_depth::Joint>, b: Option<skeleton_depth::Joint>| {
-        if let (Some(a), Some(b)) = (a, b) {
-            painter.line_segment([to_screen(a), to_screen(b)], Stroke::new(2.0, bone_col));
-        }
-    };
-    bone(skel.head, skel.left_shoulder);
-    bone(skel.head, skel.right_shoulder);
-    bone(skel.left_shoulder, skel.right_shoulder);
-    bone(skel.left_shoulder, skel.left_elbow);
-    bone(skel.left_elbow, skel.left_hand);
-    bone(skel.right_shoulder, skel.right_elbow);
-    bone(skel.right_elbow, skel.right_hand);
-    let dot = |j: Option<skeleton_depth::Joint>, c: [u8; 3]| {
-        if let Some(j) = j {
-            painter.circle_filled(to_screen(j), 5.0, Color32::from_rgb(c[0], c[1], c[2]));
-        }
-    };
-    dot(skel.center, C_CENTER);
-    dot(skel.left_elbow, C_ELBOW);
-    dot(skel.right_elbow, C_ELBOW);
-    dot(skel.left_shoulder, C_SHOULDER);
-    dot(skel.right_shoulder, C_SHOULDER);
-    dot(skel.left_hand, C_HAND);
-    dot(skel.right_hand, C_HAND);
-    dot(skel.head, C_HEAD);
+    for i in 0..33 {
+        let c = if (11..=16).contains(&i) {
+            Color32::from_rgb(0xff, 0x96, 0x00)
+        } else {
+            Color32::from_rgb(0x00, 0xdc, 0x3c)
+        };
+        painter.circle_filled(to_screen(i), 4.0, c);
+    }
 }
 
 fn draw_lockbar(
@@ -5495,15 +4694,11 @@ fn open_kinect_v2() -> Result<Active, String> {
         last_lockbar: None,
         last_u: None,
         u_worker: UWorker::spawn(),
-        head_worker: HeadWorker::spawn("kinect-v2"),
-        last_heads: Vec::new(),
+        blaze_worker: BlazePoseWorker::spawn(),
+        last_pose: None,
         last_rgb_frame: None,
         last_depth: None,
         last_ir: None,
-        depth_registration: None,
-        seg: None,
-        skel_tracker: None,
-        last_skeleton: None,
         metrics: Metrics::new(),
     })
 }
@@ -5565,37 +4760,13 @@ fn open_kinect_v1() -> Result<Active, String> {
         last_lockbar: None,
         last_u: None,
         u_worker: UWorker::spawn(),
-        head_worker: HeadWorker::spawn("kinect-v1"),
-        last_heads: Vec::new(),
+        blaze_worker: BlazePoseWorker::spawn(),
+        last_pose: None,
         last_rgb_frame: None,
         last_depth: None,
         last_ir: None,
-        depth_registration: None,
-        seg: None,
-        skel_tracker: None,
-        last_skeleton: None,
         metrics: Metrics::new(),
     })
-}
-
-fn init_head_detector(backend_name: &'static str) -> Option<head::Detector> {
-    match head::Detector::new() {
-        Ok(d) => {
-            info!(
-                backend = backend_name,
-                "head detector initialised (SCUT-HEAD nano)"
-            );
-            Some(d)
-        }
-        Err(e) => {
-            warn!(
-                backend = backend_name,
-                ?e,
-                "head detector failed to initialise; running without it"
-            );
-            None
-        }
-    }
 }
 
 fn open_webcam(index: u32) -> Result<Active, String> {
@@ -5638,15 +4809,11 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         last_lockbar: None,
         last_u: None,
         u_worker: UWorker::spawn(),
-        head_worker: HeadWorker::spawn("webcam"),
-        last_heads: Vec::new(),
+        blaze_worker: BlazePoseWorker::spawn(),
+        last_pose: None,
         last_rgb_frame: None,
         last_depth: None,
         last_ir: None,
-        depth_registration: None,
-        seg: None,
-        skel_tracker: None,
-        last_skeleton: None,
         metrics: Metrics::new(),
     })
 }
@@ -5665,14 +4832,6 @@ fn bgrx_to_rgb888(bgrx: &[u8]) -> Vec<u8> {
         out.push(chunk[0]); // B
     }
     out
-}
-
-fn bgrx_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
-    debug_assert_eq!(data.len(), (width * height * 4) as usize);
-    // libfreenect2 ships pixels as B, G, R, X — repack to RGB888 first
-    // (egui 0.34's ColorImage::from_rgb wants tight RGB).
-    let rgb = bgrx_to_rgb888(data);
-    ColorImage::from_rgb([width as usize, height as usize], &rgb)
 }
 
 fn rgb888_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
@@ -5925,119 +5084,73 @@ fn format_utc_stamp(secs: u64) -> String {
     format!("{y:04}{month_civil:02}{d:02}-{h:02}{m:02}{s:02}")
 }
 
-/// Paint a single pixel into a row-major RGB888 buffer. No-op when
-/// out of bounds — callers can clip downstream without checking.
-fn put_pixel(buf: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 3]) {
-    if x < 0 || y < 0 || (x as u32) >= width || (y as u32) >= height {
-        return;
-    }
-    let i = ((y as u32 * width + x as u32) as usize) * 3;
-    buf[i] = color[0];
-    buf[i + 1] = color[1];
-    buf[i + 2] = color[2];
-}
-
-/// Bresenham line, thickened by `radius` (Chebyshev). `radius = 0`
-/// paints a single-pixel line; `radius = 1` paints a 3-px-thick line.
-fn draw_line(
-    buf: &mut [u8],
-    width: u32,
-    height: u32,
-    (mut x0, mut y0): (i32, i32),
-    (x1, y1): (i32, i32),
-    color: [u8; 3],
-    radius: i32,
-) {
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    loop {
-        for ox in -radius..=radius {
-            for oy in -radius..=radius {
-                put_pixel(buf, width, height, x0 + ox, y0 + oy, color);
-            }
-        }
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
-/// Draw the outline of an axis-aligned rectangle (head bbox).
-fn draw_rect_outline(
-    buf: &mut [u8],
-    width: u32,
-    height: u32,
-    (x0, y0): (i32, i32),
-    (x1, y1): (i32, i32),
-    color: [u8; 3],
-    radius: i32,
-) {
-    draw_line(buf, width, height, (x0, y0), (x1, y0), color, radius);
-    draw_line(buf, width, height, (x1, y0), (x1, y1), color, radius);
-    draw_line(buf, width, height, (x1, y1), (x0, y1), color, radius);
-    draw_line(buf, width, height, (x0, y1), (x0, y0), color, radius);
-}
-
 /// Bake the same overlays the GUI draws (U mask tint, head bbox in red,
 /// derived lockbar quad in cyan) directly into a copy of the RGB888
 /// buffer. Used by the screenshot path so users can read back what the
 /// algorithms saw, not just the raw frame.
+/// Draw the BlazePose skeleton (bones + joints) and the lockbar contour onto a
+/// copy of an RGB888 frame. Shared by the contribution `_det` export and the
+/// headless screenshot.
 fn bake_overlays(
     width: u32,
     height: u32,
     rgb888: &[u8],
-    heads: &[head::HeadAnchor],
+    pose: Option<&blazepose::Pose>,
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
 ) -> Vec<u8> {
-    const HEAD_RGB: [u8; 3] = [0xff, 0x60, 0x60];
-    const LOCKBAR_RGB: [u8; 3] = [0x00, 0xe5, 0xff]; // cyan — the lockbar contour
-    const RAIL_RGB: [u8; 3] = [0xff, 0x9a, 0x00]; // orange — the sidebars
+    use blazepose::idx::{
+        LEFT_ELBOW, LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_ELBOW, RIGHT_SHOULDER, RIGHT_WRIST,
+    };
+    const LOCKBAR_RGB: [u8; 3] = [0x00, 0xe5, 0xff]; // cyan
+    const RAIL_RGB: [u8; 3] = [0xff, 0x9a, 0x00]; // orange
+    const ARM_RGB: [u8; 3] = [0xff, 0x96, 0x00]; // shoulders/elbows/wrists
+    const FACE_RGB: [u8; 3] = [0x00, 0xdc, 0x3c]; // everything else
     let mut out = rgb888.to_vec();
-    for head in heads {
-        // HeadAnchor is centre-based; expand to corners.
-        let x0 = (head.cx - head.width * 0.5).round() as i32;
-        let y0 = (head.cy - head.height * 0.5).round() as i32;
-        let x1 = (head.cx + head.width * 0.5).round() as i32;
-        let y1 = (head.cy + head.height * 0.5).round() as i32;
-        draw_rect_outline(&mut out, width, height, (x0, y0), (x1, y1), HEAD_RGB, 1);
+    let (wu, hu) = (width as usize, height as usize);
+    if let Some(p) = pose {
+        let g = |i: usize| (p.landmarks[i].x as i32, p.landmarks[i].y as i32);
+        for (a, b) in [
+            (LEFT_SHOULDER, RIGHT_SHOULDER),
+            (LEFT_SHOULDER, LEFT_ELBOW),
+            (LEFT_ELBOW, LEFT_WRIST),
+            (RIGHT_SHOULDER, RIGHT_ELBOW),
+            (RIGHT_ELBOW, RIGHT_WRIST),
+            (NOSE, LEFT_SHOULDER),
+            (NOSE, RIGHT_SHOULDER),
+        ] {
+            draw_line_rgb(&mut out, wu, hu, g(a), g(b), C_BONE);
+        }
+        let r = (width / 220).max(4) as i32;
+        for (i, l) in p.landmarks.iter().enumerate() {
+            let c = if (11..=16).contains(&i) {
+                ARM_RGB
+            } else {
+                FACE_RGB
+            };
+            draw_disc_rgb(&mut out, wu, hu, l.x as i32, l.y as i32, r, c);
+        }
     }
     if let Some(bar) = lockbar {
-        // Lockbar contour (cyan) — no more translucent mask fog.
         for w in 0..4 {
             let a = bar.corners[w];
             let b = bar.corners[(w + 1) % 4];
-            draw_line(
+            draw_line_rgb(
                 &mut out,
-                width,
-                height,
+                wu,
+                hu,
                 (a.0 as i32, a.1 as i32),
                 (b.0 as i32, b.1 as i32),
                 LOCKBAR_RGB,
-                1,
             );
         }
-        // Sidebars (orange), fitted straight segments.
         for rail in [bar.left_rail, bar.right_rail].into_iter().flatten() {
-            draw_line(
+            draw_line_rgb(
                 &mut out,
-                width,
-                height,
+                wu,
+                hu,
                 (rail[0].0 as i32, rail[0].1 as i32),
                 (rail[1].0 as i32, rail[1].1 as i32),
                 RAIL_RGB,
-                1,
             );
         }
     }
@@ -6055,96 +5168,7 @@ fn bake_overlays(
 // Each renders a PNG with the detected joints drawn over the input and prints
 // the joint coordinates, so a remote `ssh` run can eyeball the result.
 
-const C_HEAD: [u8; 3] = [0xff, 0xd0, 0x30]; // amber
-const C_SHOULDER: [u8; 3] = [0x30, 0xd0, 0xff]; // cyan
-const C_ELBOW: [u8; 3] = [0x60, 0xff, 0x60]; // green
-const C_HAND: [u8; 3] = [0xff, 0x30, 0xd0]; // magenta
-const C_CENTER: [u8; 3] = [0xff, 0xff, 0xff]; // white
 const C_BONE: [u8; 3] = [0x88, 0x88, 0x88]; // grey
-
-/// Directory of the running binary (falls back to CWD), for the self-test PNGs.
-fn exe_dir() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
-/// Distance from point `(px, py)` to the segment `a`–`b` (for arm capsules).
-fn point_seg_dist(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let l2 = dx * dx + dy * dy;
-    let t = if l2 > 0.0 {
-        (((px - a.0) * dx + (py - a.1) * dy) / l2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
-    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
-}
-
-/// True if pixel `(x, y)` lies inside a synthetic upper body drawn in an
-/// `fw × fh` frame: head disc, shoulder bar, torso, and two arms (capsules to
-/// hands) reaching out laterally so the hands are the outermost extremities.
-fn upper_body_covered(x: f32, y: f32, fw: f32, fh: f32) -> bool {
-    let cx = fw * 0.5;
-    // Head.
-    if (x - cx).powi(2) + (y - fh * 0.20).powi(2) <= (fh * 0.11).powi(2) {
-        return true;
-    }
-    let sh_y = fh * 0.32;
-    // Neck: bridge head → shoulders so the silhouette is a single connected
-    // region (else keep_largest_region drops the floating head and the head
-    // joint snaps to the neck).
-    if y >= fh * 0.15 && y <= sh_y + fh * 0.02 && (x - cx).abs() <= fw * 0.06 {
-        return true;
-    }
-    // Shoulder bar + torso.
-    if y >= sh_y && y <= sh_y + fh * 0.07 && (x - cx).abs() <= fw * 0.23 {
-        return true;
-    }
-    if y >= sh_y && y <= fh * 0.98 && (x - cx).abs() <= fw * 0.13 {
-        return true;
-    }
-    // Arms (shoulder → hand) + hand discs.
-    let l_sh = (cx - fw * 0.19, sh_y + fh * 0.02);
-    let r_sh = (cx + fw * 0.19, sh_y + fh * 0.02);
-    let l_hand = (cx - fw * 0.40, sh_y + fh * 0.34);
-    let r_hand = (cx + fw * 0.40, sh_y + fh * 0.34);
-    let arm_r = fw * 0.045;
-    let hand_r = fh * 0.055;
-    point_seg_dist(x, y, l_sh, l_hand) <= arm_r
-        || point_seg_dist(x, y, r_sh, r_hand) <= arm_r
-        || (x - l_hand.0).powi(2) + (y - l_hand.1).powi(2) <= hand_r * hand_r
-        || (x - r_hand.0).powi(2) + (y - r_hand.1).powi(2) <= hand_r * hand_r
-}
-
-/// Synthetic depth frame (`w*h` u16 mm): the body at `person_mm`, everything
-/// else a flat wall at `far_mm` — the near slab isolates the body cleanly.
-fn synth_depth(w: usize, h: usize, person_mm: u16, far_mm: u16) -> Vec<u16> {
-    let (fw, fh) = (w as f32, h as f32);
-    (0..w * h)
-        .map(|i| {
-            let (x, y) = ((i % w) as f32, (i / w) as f32);
-            if upper_body_covered(x, y, fw, fh) {
-                person_mm
-            } else {
-                far_mm
-            }
-        })
-        .collect()
-}
-
-/// Synthetic binary silhouette mask (`w*h`, 255 = body / 0 = background).
-fn synth_mask(w: usize, h: usize) -> Vec<u8> {
-    let (fw, fh) = (w as f32, h as f32);
-    (0..w * h)
-        .map(|i| {
-            let (x, y) = ((i % w) as f32, (i / w) as f32);
-            u8::from(upper_body_covered(x, y, fw, fh)) * 255
-        })
-        .collect()
-}
 
 fn put_rgb(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, c: [u8; 3]) {
     if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
@@ -6186,177 +5210,6 @@ fn draw_line_rgb(buf: &mut [u8], w: usize, h: usize, a: (i32, i32), b: (i32, i32
             y0 += sy;
         }
     }
-}
-
-fn print_skeleton(s: &skeleton_depth::Skeleton) {
-    let row = |name: &str, j: Option<skeleton_depth::Joint>| match j {
-        Some(j) => println!("  {name:<12} x={:<4} y={:<4} z={}mm", j.x, j.y, j.z_mm),
-        None => println!("  {name:<12} — (not found)"),
-    };
-    row("head", s.head);
-    row("l_shoulder", s.left_shoulder);
-    row("r_shoulder", s.right_shoulder);
-    row("l_elbow", s.left_elbow);
-    row("r_elbow", s.right_elbow);
-    row("l_hand", s.left_hand);
-    row("r_hand", s.right_hand);
-    row("center", s.center);
-}
-
-/// Draw the detected skeleton (bones then joints) over `bg` and save a PNG.
-fn render_skeleton_png(
-    path: &std::path::Path,
-    w: u32,
-    h: u32,
-    mut bg: Vec<u8>,
-    s: &skeleton_depth::Skeleton,
-) -> Result<(), String> {
-    let (wu, hu) = (w as usize, h as usize);
-    let bone =
-        |bg: &mut [u8], a: Option<skeleton_depth::Joint>, b: Option<skeleton_depth::Joint>| {
-            if let (Some(a), Some(b)) = (a, b) {
-                draw_line_rgb(bg, wu, hu, (a.x, a.y), (b.x, b.y), C_BONE);
-            }
-        };
-    bone(&mut bg, s.head, s.left_shoulder);
-    bone(&mut bg, s.head, s.right_shoulder);
-    bone(&mut bg, s.left_shoulder, s.right_shoulder);
-    bone(&mut bg, s.left_shoulder, s.left_elbow);
-    bone(&mut bg, s.left_elbow, s.left_hand);
-    bone(&mut bg, s.right_shoulder, s.right_elbow);
-    bone(&mut bg, s.right_elbow, s.right_hand);
-    let joint = |bg: &mut [u8], j: Option<skeleton_depth::Joint>, c: [u8; 3]| {
-        if let Some(j) = j {
-            draw_disc_rgb(bg, wu, hu, j.x, j.y, 5, c);
-        }
-    };
-    joint(&mut bg, s.center, C_CENTER);
-    joint(&mut bg, s.left_elbow, C_ELBOW);
-    joint(&mut bg, s.right_elbow, C_ELBOW);
-    joint(&mut bg, s.left_shoulder, C_SHOULDER);
-    joint(&mut bg, s.right_shoulder, C_SHOULDER);
-    joint(&mut bg, s.left_hand, C_HAND);
-    joint(&mut bg, s.right_hand, C_HAND);
-    joint(&mut bg, s.head, C_HEAD);
-    save_png_rgb(path, w, h, &bg)
-}
-
-fn save_png_rgb(path: &std::path::Path, w: u32, h: u32, rgb: &[u8]) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.write_header()
-        .map_err(|e| format!("png header: {e}"))?
-        .write_image_data(rgb)
-        .map_err(|e| format!("png write: {e}"))
-}
-
-/// Grey background from a synthetic depth frame (near body = bright).
-fn depth_to_gray(depth: &[u16], threshold: u16) -> Vec<u8> {
-    depth
-        .iter()
-        .flat_map(|&z| {
-            let g = if z <= threshold { 170 } else { 45 };
-            [g, g, g]
-        })
-        .collect()
-}
-
-/// Grey background from a binary mask (body = bright).
-fn mask_to_gray(mask: &[u8]) -> Vec<u8> {
-    mask.iter()
-        .flat_map(|&m| {
-            let g = if m > 0 { 150 } else { 40 };
-            [g, g, g]
-        })
-        .collect()
-}
-
-/// Scale every joint of a skeleton by `(sx, sy)` (source-space → another space),
-/// keeping depth. Used to lift 256²-mask joints onto a full webcam frame.
-fn scale_skeleton(s: &skeleton_depth::Skeleton, sx: f32, sy: f32) -> skeleton_depth::Skeleton {
-    let sc = |j: Option<skeleton_depth::Joint>| {
-        j.map(|j| skeleton_depth::Joint {
-            x: (j.x as f32 * sx) as i32,
-            y: (j.y as f32 * sy) as i32,
-            z_mm: j.z_mm,
-        })
-    };
-    skeleton_depth::Skeleton {
-        head: sc(s.head),
-        left_shoulder: sc(s.left_shoulder),
-        right_shoulder: sc(s.right_shoulder),
-        left_elbow: sc(s.left_elbow),
-        right_elbow: sc(s.right_elbow),
-        left_hand: sc(s.left_hand),
-        right_hand: sc(s.right_hand),
-        center: sc(s.center),
-    }
-}
-
-/// Grab one live webcam frame, run it through `personseg` → `track_mask`, and
-/// render the detected skeleton over BOTH the real frame and the silhouette.
-/// Validates the full webcam path on the actual camera, headless.
-fn run_selftest_webcam(dir: &std::path::Path) -> Result<(), String> {
-    let cams = webcam::list().map_err(|e| format!("camera list: {e}"))?;
-    if cams.is_empty() {
-        return Err("no cameras found (SDL enumerated 0 devices)".to_string());
-    }
-    let cam = webcam::Camera::open(cams[0].id).map_err(|e| format!("camera open: {e}"))?;
-    let mut frame = None;
-    for _ in 0..200 {
-        if let Some(f) = cam.poll_rgb() {
-            frame = Some(f);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let frame = frame.ok_or("no webcam frame within 4s")?;
-    let (w, h) = (frame.width, frame.height);
-    let seg = personseg::Segmenter::new().map_err(|e| format!("personseg: {e}"))?;
-    let sil = seg.silhouette(&frame.data, w, h, personseg::DEFAULT_THRESHOLD);
-    let mut tr = skeleton_depth::Tracker::new(
-        sil.side,
-        sil.side,
-        skeleton_depth::Config {
-            subsample: 1,
-            ..Default::default()
-        },
-    );
-    let skel = *tr.track_mask(
-        skeleton_depth::mask::Mask {
-            w: sil.side,
-            h: sil.side,
-            data: sil.data.clone(),
-        },
-        None,
-    );
-    println!(
-        "== self-test: LIVE WEBCAM {w}x{h} → personseg {}² → track_mask ==",
-        sil.side
-    );
-    print_skeleton(&skel);
-    // Skeleton over the real frame (lift 256² joints to frame space).
-    let scaled = scale_skeleton(
-        &skel,
-        w as f32 / sil.side as f32,
-        h as f32 / sil.side as f32,
-    );
-    let pl = dir.join("selftest-webcam-live.png");
-    render_skeleton_png(&pl, w, h, frame.data.clone(), &scaled)?;
-    println!("  → {}", pl.display());
-    // Skeleton over the raw silhouette (shows personseg mask quality).
-    let pm = dir.join("selftest-webcam-mask.png");
-    render_skeleton_png(
-        &pm,
-        sil.side as u32,
-        sil.side as u32,
-        mask_to_gray(&sil.data),
-        &skel,
-    )?;
-    println!("  → {}", pm.display());
-    Ok(())
 }
 
 /// Run the headless skeleton self-test. `image` (optional, JPEG) additionally
@@ -6472,108 +5325,15 @@ fn run_pose_test(
     Ok(())
 }
 
-fn run_selftest(image: Option<std::path::PathBuf>, webcam: bool) -> Result<(), String> {
-    let dir = exe_dir();
-
-    // 1) Kinect path — synthetic depth → track().
-    let (dw, dh) = (512usize, 424usize);
-    let (person, far) = (1500u16, 3500u16);
-    let depth = synth_depth(dw, dh, person, far);
-    let mut tr = skeleton_depth::Tracker::new(dw, dh, skeleton_depth::Config::default());
-    let skel = *tr.track(&depth);
-    println!("== self-test: synthetic DEPTH {dw}x{dh}, body @ {person}mm (Kinect track) ==");
-    print_skeleton(&skel);
-    let p = dir.join("selftest-depth.png");
-    render_skeleton_png(
-        &p,
-        dw as u32,
-        dh as u32,
-        depth_to_gray(&depth, (person + far) / 2),
-        &skel,
-    )?;
-    println!("  → {}", p.display());
-
-    // 2) Webcam skeleton stage — synthetic mask → track_mask() with the exact
-    //    config the live webcam wiring uses (256², subsample 1).
-    let (mw, mh) = (256usize, 256usize);
-    let mask = synth_mask(mw, mh);
-    let mut trm = skeleton_depth::Tracker::new(
-        mw,
-        mh,
-        skeleton_depth::Config {
-            subsample: 1,
-            ..Default::default()
-        },
-    );
-    let sk2 = *trm.track_mask(
-        skeleton_depth::mask::Mask {
-            w: mw,
-            h: mh,
-            data: mask.clone(),
-        },
-        None,
-    );
-    println!("== self-test: synthetic MASK {mw}x{mh} (webcam track_mask, subsample 1) ==");
-    print_skeleton(&sk2);
-    let p2 = dir.join("selftest-mask.png");
-    render_skeleton_png(&p2, mw as u32, mh as u32, mask_to_gray(&mask), &sk2)?;
-    println!("  → {}", p2.display());
-
-    // 3) Optional full webcam path — real JPEG → personseg → track_mask().
-    if let Some(img) = image {
-        let dynimg = image::open(&img).map_err(|e| format!("open {img:?}: {e}"))?;
-        let rgb = dynimg.to_rgb8();
-        let (iw, ih) = (rgb.width(), rgb.height());
-        let seg = personseg::Segmenter::new().map_err(|e| format!("personseg: {e}"))?;
-        let sil = seg.silhouette(rgb.as_raw(), iw, ih, personseg::DEFAULT_THRESHOLD);
-        let mut trp = skeleton_depth::Tracker::new(
-            sil.side,
-            sil.side,
-            skeleton_depth::Config {
-                subsample: 1,
-                ..Default::default()
-            },
-        );
-        let sk3 = *trp.track_mask(
-            skeleton_depth::mask::Mask {
-                w: sil.side,
-                h: sil.side,
-                data: sil.data.clone(),
-            },
-            None,
-        );
-        println!(
-            "== self-test: IMAGE {img:?} → personseg {}² → track_mask ==",
-            sil.side
-        );
-        print_skeleton(&sk3);
-        let p3 = dir.join("selftest-webcam.png");
-        render_skeleton_png(
-            &p3,
-            sil.side as u32,
-            sil.side as u32,
-            mask_to_gray(&sil.data),
-            &sk3,
-        )?;
-        println!("  → {}", p3.display());
-    }
-
-    // 4) Optional live webcam path — grab a real frame → personseg → track_mask.
-    if webcam {
-        run_selftest_webcam(&dir)?;
-    }
-    Ok(())
-}
-
 fn save_rgb_screenshot_at(
     path: &std::path::Path,
     width: u32,
     height: u32,
     rgb888: &[u8],
-    heads: &[head::HeadAnchor],
+    pose: Option<&blazepose::Pose>,
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
 ) -> Result<(), String> {
-    let painted = bake_overlays(width, height, rgb888, heads, lockbar);
+    let painted = bake_overlays(width, height, rgb888, pose, lockbar);
     let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
     let writer = std::io::BufWriter::new(file);
     let mut encoder = png::Encoder::new(writer, width, height);
@@ -6596,7 +5356,7 @@ fn save_rgb_screenshot(
     width: u32,
     height: u32,
     rgb888: &[u8],
-    heads: &[head::HeadAnchor],
+    pose: Option<&blazepose::Pose>,
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
 ) -> Result<std::path::PathBuf, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -6610,7 +5370,7 @@ fn save_rgb_screenshot(
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = dir.join(format!("{slug}_{stamp}.png"));
-    save_rgb_screenshot_at(&path, width, height, rgb888, heads, lockbar)?;
+    save_rgb_screenshot_at(&path, width, height, rgb888, pose, lockbar)?;
     Ok(path)
 }
 

@@ -11,12 +11,9 @@ name = "headtracking-demo"
 path = "src/main.rs"
 
 [dependencies]
-head = { path = "../../crates/head" }
 freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
 u-onnx = { path = "../../crates/u-onnx" }
-personseg = { path = "../../crates/personseg" }
-skeleton-depth = "0.3"
 blazepose = { path = "../../crates/blazepose" }
 webcam = { path = "../../crates/webcam" }
 headtracking = { path = "../.." }

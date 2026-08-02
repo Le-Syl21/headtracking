@@ -1390,15 +1390,12 @@ dependencies = [
  "glow",
  "glutin",
  "glutin-winit",
- "head",
  "headtracking",
  "image",
  "nalgebra",
  "os_info",
  "parking_lot",
- "personseg",
  "png",
- "skeleton-depth",
  "tracing",
  "tracing-subscriber",
  "u-onnx",
@@ -2651,16 +2648,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "personseg"
-version = "0.1.0"
-dependencies = [
- "image",
- "thiserror 2.0.19",
- "tracing",
- "tract-onnx",
-]
-
-[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3324,12 +3311,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "skeleton-depth"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "716d07fb33926beaf21ec2759d9b79341857f81887c09195df62aa7a5d736348"
 
 [[package]]
 name = "skrifa"
