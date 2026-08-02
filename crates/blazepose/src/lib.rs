@@ -386,17 +386,27 @@ impl BlazePose {
 fn letterbox_nhwc(rgb: &[u8], w: u32, h: u32, side: u32) -> Vec<f32> {
     let img =
         image::RgbImage::from_raw(w, h, rgb.to_vec()).expect("rgb buffer length must be w*h*3");
-    let long = w.max(h);
-    let mut square = image::RgbImage::from_pixel(long, long, image::Rgb([0, 0, 0]));
-    let ox = ((long - w) / 2) as i64;
-    let oy = ((long - h) / 2) as i64;
-    image::imageops::overlay(&mut square, &img, ox, oy);
-    let resized =
-        image::imageops::resize(&square, side, side, image::imageops::FilterType::Triangle);
-    let mut out = Vec::with_capacity((side * side * 3) as usize);
-    for p in resized.pixels() {
-        for c in 0..3 {
-            out.push(f32::from(p.0[c]) / 127.5 - 1.0);
+    // Fit the frame into `side` preserving aspect, then centre-pad to a square.
+    // Same geometry as padding to `long²` first (the decoder undoes it with
+    // `long`), but WITHOUT allocating/overlaying/resizing that huge square —
+    // for a 1080p frame the old path built an 1920² (~11 MB) buffer every call.
+    let long = w.max(h) as f32;
+    let scale = side as f32 / long;
+    let nw = ((w as f32 * scale).round() as u32).clamp(1, side);
+    let nh = ((h as f32 * scale).round() as u32).clamp(1, side);
+    let small = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    // Black padding (Rgb 0) normalises to -1.0.
+    let mut out = vec![-1.0f32; (side * side * 3) as usize];
+    let ox = (side - nw) / 2;
+    let oy = (side - nh) / 2;
+    for y in 0..nh {
+        let row = ((oy + y) * side + ox) as usize * 3;
+        for x in 0..nw {
+            let p = small.get_pixel(x, y).0;
+            let di = row + x as usize * 3;
+            out[di] = f32::from(p[0]) / 127.5 - 1.0;
+            out[di + 1] = f32::from(p[1]) / 127.5 - 1.0;
+            out[di + 2] = f32::from(p[2]) / 127.5 - 1.0;
         }
     }
     out
