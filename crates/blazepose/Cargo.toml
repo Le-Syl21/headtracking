@@ -1,0 +1,17 @@
+[package]
+name = "blazepose"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "MediaPipe BlazePose (pose detection + 33 landmarks) via ONNX Runtime (ort)"
+
+[dependencies]
+ort = { version = "=2.0.0-rc.13", features = ["download-binaries"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+thiserror = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[build-dependencies]
+ureq = "2"

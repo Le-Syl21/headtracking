@@ -10,6 +10,7 @@ members = [
     "crates/libusb-sys",
     "crates/u-onnx",
     "crates/personseg",
+    "crates/blazepose",
     "crates/webcam",
     "tools/headtracking-demo",
 ]
