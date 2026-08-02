@@ -14,6 +14,7 @@
 // the module on the same union so `--no-default-features` still
 // compiles (only loses the lockbar-from-hands path).
 #[cfg(any(feature = "kinect-v2", feature = "kinect-v1", feature = "webcam"))]
+pub mod autocalib;
 pub mod hand_fiducial;
 pub mod lockbar;
 
