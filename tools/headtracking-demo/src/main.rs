@@ -3252,21 +3252,34 @@ impl App {
                     det,
                     active.last_depth.clone(),
                     active.last_ir.clone(),
+                    active.last_head,
+                    active.last_pose.clone(),
                 )
             })
         });
-        let Some((backend, w, h, raw, det, depth, ir_v2)) = payload else {
+        let Some((backend, w, h, raw, det, depth, ir_v2, head, pose)) = payload else {
             return;
         };
         let stem = contribution_stem(backend);
         let dir = contributions_dir();
         let _ = std::fs::create_dir_all(&dir);
+        // Tracking read-out shared by both colour planes — embedded as PNG
+        // tEXt so the capture is self-describing (head Z per backend, etc.).
+        let meta = capture_meta(
+            backend,
+            w,
+            h,
+            &stem,
+            self.table_incl_deg,
+            head,
+            pose.as_ref(),
+        );
         // Collect every image this capture produced, then save + queue them
         // in one pass. RGB planes are 8-bit colour; depth is 16-bit gray in
         // raw mm; v2 IR is 16-bit gray intensity; v1 IR is 8-bit gray.
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         for (kind, src) in [("raw", &raw), ("det", &det)] {
-            match png_bytes(w, h, src) {
+            match png_bytes_meta(w, h, src, &meta) {
                 Ok(bytes) => files.push((format!("{stem}_{kind}.png"), bytes)),
                 Err(e) => warn!("contribution: {kind} png encode failed: {e}"),
             }
@@ -4961,11 +4974,27 @@ fn contribution_stem(backend: Backend) -> String {
 /// Encode an RGB888 buffer to PNG bytes in memory (for the contribution
 /// upload — the screenshot path writes straight to a file instead).
 fn png_bytes(width: u32, height: u32, rgb888: &[u8]) -> Result<Vec<u8>, String> {
+    png_bytes_meta(width, height, rgb888, &[])
+}
+
+/// Like [`png_bytes`] but embeds `meta` as PNG `tEXt` chunks, so a contribution
+/// image carries its own tracking read-out (backend, head X/Y/Z mm, pose…) and
+/// captures stay comparable across v1/v2/webcam without a side file.
+fn png_bytes_meta(
+    width: u32,
+    height: u32,
+    rgb888: &[u8],
+    meta: &[(String, String)],
+) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut buf, width, height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
+        for (k, v) in meta {
+            // PNG keywords are Latin-1, ≤79 chars; values are free text.
+            let _ = encoder.add_text_chunk(k.clone(), v.clone());
+        }
         let mut wr = encoder
             .write_header()
             .map_err(|e| format!("png header: {e}"))?;
@@ -4973,6 +5002,75 @@ fn png_bytes(width: u32, height: u32, rgb888: &[u8]) -> Result<Vec<u8>, String> 
             .map_err(|e| format!("png write: {e}"))?;
     }
     Ok(buf)
+}
+
+/// Build the tracking read-out embedded into a contribution capture as PNG
+/// `tEXt` chunks. Lets us line up v1/v2/webcam shots of the same scene and
+/// compare what each backend recovered — head **Z** above all (depth-sampled
+/// on the Kinects, shoulder-width-triangulated on the webcam). Keys are
+/// `ht_`-prefixed so they don't clash with generic viewer metadata.
+fn capture_meta(
+    backend: Backend,
+    w: u32,
+    h: u32,
+    stem: &str,
+    table_incl_deg: f32,
+    head: Option<HeadPixel>,
+    pose: Option<&blazepose::Pose>,
+) -> Vec<(String, String)> {
+    let mut m: Vec<(String, String)> = Vec::new();
+    let mut push = |k: &str, v: String| m.push((k.to_string(), v));
+    push("ht_stem", stem.to_string());
+    push(
+        "ht_backend",
+        match backend {
+            Backend::None => "none".to_string(),
+            Backend::KinectV1 => "kinect-v1".to_string(),
+            Backend::KinectV2 => "kinect-v2".to_string(),
+            Backend::Webcam(i) => format!("webcam-{i}"),
+        },
+    );
+    push("ht_frame", format!("{w}x{h}"));
+    push("ht_table_incl_deg", format!("{table_incl_deg:.2}"));
+    // How the head Z was obtained differs by sensor — record it so a mm value
+    // is never read out of context.
+    push(
+        "ht_z_source",
+        match backend {
+            Backend::KinectV1 | Backend::KinectV2 => "depth@nose".to_string(),
+            Backend::Webcam(_) => "shoulder-width".to_string(),
+            Backend::None => "none".to_string(),
+        },
+    );
+    match head {
+        Some(hp) => {
+            push("ht_head_x_mm", format!("{:.1}", hp.x_mm));
+            push("ht_head_y_mm", format!("{:.1}", hp.y_mm));
+            push("ht_head_z_mm", format!("{:.1}", hp.depth_mm));
+            push("ht_head_px", format!("{},{}", hp.u, hp.v));
+        }
+        None => push("ht_head", "none".to_string()),
+    }
+    match pose {
+        Some(p) => {
+            push("ht_pose_presence", format!("{:.3}", p.presence));
+            let lm = |i: usize| -> String {
+                let l = p.landmarks[i];
+                format!("{:.0},{:.0} v{:.2}", l.x, l.y, l.visibility)
+            };
+            push("ht_nose", lm(blazepose::idx::NOSE));
+            push("ht_l_shoulder", lm(blazepose::idx::LEFT_SHOULDER));
+            push("ht_r_shoulder", lm(blazepose::idx::RIGHT_SHOULDER));
+            push("ht_l_wrist", lm(blazepose::idx::LEFT_WRIST));
+            push("ht_r_wrist", lm(blazepose::idx::RIGHT_WRIST));
+            let ls = p.landmarks[blazepose::idx::LEFT_SHOULDER];
+            let rs = p.landmarks[blazepose::idx::RIGHT_SHOULDER];
+            let sw = ((ls.x - rs.x).powi(2) + (ls.y - rs.y).powi(2)).sqrt();
+            push("ht_shoulder_width_px", format!("{sw:.1}"));
+        }
+        None => push("ht_pose", "none".to_string()),
+    }
+    m
 }
 
 /// Encode an 8-bit single-channel buffer (e.g. Kinect v1 IR) to a grayscale
