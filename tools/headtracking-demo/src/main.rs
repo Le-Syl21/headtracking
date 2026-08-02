@@ -1430,10 +1430,12 @@ fn detect_backends() -> Vec<BackendEntry> {
         Ok(cams) => {
             info!(count = cams.len(), "scan: SDL3 enumerated cameras");
             for cam in cams {
+                // Always tag the SDL id so two cameras with the same name
+                // (or no name) stay distinguishable in the dropdown.
                 let label = if cam.name.is_empty() {
                     format!("Webcam #{}", cam.id)
                 } else {
-                    format!("Webcam: {}", cam.name)
+                    format!("Webcam: {} [{}]", cam.name, cam.id)
                 };
                 info!(index = cam.id, name = %cam.name, "scan: webcam entry");
                 out.push(BackendEntry {
@@ -1899,6 +1901,11 @@ struct App {
     /// `camera/mapping.rs`, not a product calibration step).
     parallax_gain: f32,
     parallax_invert: [bool; 3],
+    /// Playfield inclination (degrees from horizontal), a key input alongside
+    /// the sidebar width: the VPX screen is the near-flat playfield, so the
+    /// head motion is tilted by `90° − inclination` for a truthful parallax
+    /// (see `update_parallax_eye`). VPX exposes this per table.
+    table_incl_deg: f32,
     /// Last parallax panel rect (egui logical px) so Mouse mode can map the
     /// pointer. Logical space = post-egui-rotate, so the mouse "rotates" with
     /// the window for free.
@@ -2857,8 +2864,15 @@ fn head_pixel_from_pose_depth(
 /// triangulate distance from the shoulder width — a stable ~0.40 m span, so
 /// `Z = fx · W / w_px` — then deproject the nose. `None` if the shoulders
 /// aren't confidently seen.
-fn head_pixel_from_pose_webcam(pose: &blazepose::Pose, intr: &Intrinsics) -> Option<HeadPixel> {
+fn head_pixel_from_pose_webcam(
+    pose: &blazepose::Pose,
+    rgb_w: u32,
+    rgb_h: u32,
+) -> Option<HeadPixel> {
     use blazepose::idx::{LEFT_SHOULDER, NOSE, RIGHT_SHOULDER};
+    if rgb_w == 0 || rgb_h == 0 {
+        return None;
+    }
     let (ls, rs, nose) = (
         &pose.landmarks[LEFT_SHOULDER],
         &pose.landmarks[RIGHT_SHOULDER],
@@ -2871,15 +2885,22 @@ fn head_pixel_from_pose_webcam(pose: &blazepose::Pose, intr: &Intrinsics) -> Opt
     if w_px < 1.0 {
         return None;
     }
+    // Webcams report no intrinsics (fx = 0), so assume a nominal focal from
+    // the frame width (~55° horizontal FOV, typical for a webcam). Distance
+    // then triangulates from the shoulder width (~0.40 m), and the nose
+    // deprojects with the same nominal pinhole.
+    let fx = rgb_w as f32 * 0.9;
+    let cx = rgb_w as f32 * 0.5;
+    let cy = rgb_h as f32 * 0.5;
     const SHOULDER_W_MM: f32 = 400.0;
-    let depth_mm = intr.fx * SHOULDER_W_MM / w_px;
+    let depth_mm = fx * SHOULDER_W_MM / w_px;
     let zf = f64::from(depth_mm);
     Some(HeadPixel {
         u: nose.x.max(0.0) as u32,
         v: nose.y.max(0.0) as u32,
         depth_mm,
-        x_mm: (f64::from(nose.x - intr.cx) * zf / f64::from(intr.fx)) as f32,
-        y_mm: (f64::from(nose.y - intr.cy) * zf / f64::from(intr.fy)) as f32,
+        x_mm: (f64::from(nose.x - cx) * zf / f64::from(fx)) as f32,
+        y_mm: (f64::from(nose.y - cy) * zf / f64::from(fx)) as f32,
     })
 }
 
@@ -3045,6 +3066,7 @@ impl App {
             parallax_eye_mode: ParallaxEye::Live,
             parallax_eye: [0.0, 0.0, PX_DVIEW_MM],
             parallax_gain: 1.0,
+            table_incl_deg: 6.5,
             // Y flipped by default: Kinect Y points down, the eye's Y is up.
             parallax_invert: [false, true, false],
             parallax_panel_rect: None,
@@ -3367,16 +3389,27 @@ impl App {
                     ));
                     // Head = BlazePose nose sampled in the depth frame (the
                     // pose comes from the RGB block above, async).
-                    let head = active.last_pose.as_ref().and_then(|p| {
-                        head_pixel_from_pose_depth(
-                            p,
-                            (1920, 1080),
-                            &depth.data,
-                            (depth.width, depth.height),
-                            &active.intrinsics,
-                            depth_min,
-                        )
-                    });
+                    let head = active
+                        .last_pose
+                        .as_ref()
+                        .and_then(|p| {
+                            head_pixel_from_pose_depth(
+                                p,
+                                (1920, 1080),
+                                &depth.data,
+                                (depth.width, depth.height),
+                                &active.intrinsics,
+                                depth_min,
+                            )
+                        })
+                        .map(|mut h| {
+                            // The Kinect v2 colour frame is horizontally mirrored
+                            // (text reads backwards), so the deprojected head X is
+                            // flipped vs the real world — negate it so the
+                            // left/right POV travelling matches v1.
+                            h.x_mm = -h.x_mm;
+                            h
+                        });
                     let smoothed =
                         smooth_head(head, &mut active.pose_filter, active.started_at, bypass);
                     capture_baseline(&mut active.baseline, smoothed);
@@ -3454,7 +3487,7 @@ impl App {
                     let head = active
                         .last_pose
                         .as_ref()
-                        .and_then(|p| head_pixel_from_pose_webcam(p, &active.intrinsics));
+                        .and_then(|p| head_pixel_from_pose_webcam(p, rgb.width, rgb.height));
                     let smoothed =
                         smooth_head(head, &mut active.pose_filter, active.started_at, bypass);
                     capture_baseline(&mut active.baseline, smoothed);
@@ -3687,10 +3720,19 @@ impl App {
                     let dx = head.x_mm - base.x_mm;
                     let dy = head.y_mm - base.y_mm;
                     let dz = head.depth_mm - base.z_mm;
+                    // The camera faces the standing player (~vertical), but the
+                    // VPX screen is the near-flat playfield at the bottom. Tilt
+                    // the head's vertical/depth motion by (90° − table
+                    // inclination) so the parallax feels right on the laid-flat
+                    // screen. X (left/right) is unaffected.
+                    let theta = (90.0 - self.table_incl_deg).to_radians();
+                    let (ct, st) = (theta.cos(), theta.sin());
+                    let dy_t = dy * ct + dz * st;
+                    let dz_t = -dy * st + dz * ct;
                     self.parallax_eye = [
                         sign(0) * dx * g,
-                        sign(1) * dy * g,
-                        (PX_DVIEW_MM + sign(2) * dz * g).clamp(150.0, 1500.0),
+                        sign(1) * dy_t * g,
+                        (PX_DVIEW_MM + sign(2) * dz_t * g).clamp(150.0, 1500.0),
                     ];
                 } else {
                     self.parallax_eye = [0.0, 0.0, PX_DVIEW_MM];
@@ -3738,8 +3780,13 @@ impl App {
                 // Room for the checkmark gutter + dropdown arrow + padding;
                 // clamp so a pathological device name can't overflow the row.
                 let combo_w = (longest as f32 * glyph_w + 48.0).clamp(140.0, 520.0);
+                // Popup tall enough to show every entry without an inner
+                // vertical scroll (the taller cab fonts made the default clip
+                // rows). Sized to the entry count with generous per-row height.
+                let popup_h = (self.available.len().max(1) as f32) * 38.0 + 12.0;
                 ComboBox::from_id_salt("backend")
                     .width(combo_w)
+                    .height(popup_h)
                     .selected_text(selected_label)
                     .show_ui(ui, |ui| {
                         // Keep each entry on a single line; the popup then
@@ -3912,7 +3959,7 @@ impl App {
                                 .color(amber)
                                 .strong(),
                         );
-                        ui.label(RichText::new(detail).monospace().size(12.0));
+                        ui.label(RichText::new(detail).monospace().size(15.0));
                     }
                 }
                 ui.add_space(3.0);
@@ -3958,7 +4005,7 @@ impl App {
                             let logs = self.logs.lock();
                             ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
                                 for line in logs.iter() {
-                                    ui.label(RichText::new(line).monospace().size(12.0));
+                                    ui.label(RichText::new(line).monospace().size(15.0));
                                 }
                             });
                         });
@@ -4021,7 +4068,7 @@ impl App {
                                         vz,
                                     ))
                                     .monospace()
-                                    .size(12.0),
+                                    .size(15.0),
                                 );
                             }
                             _ => {
@@ -4073,19 +4120,36 @@ impl App {
             self.active.as_ref().map(|a| a.backend),
             Some(Backend::Webcam(_))
         );
-        if !is_webcam {
-            return;
+        // Sidebar/lockbar physical width — the scale reference (webcam only;
+        // the Kinect gets scale from depth).
+        if is_webcam {
+            ui.separator();
+            ui.label("Sidebar:");
+            ui.add(
+                egui::DragValue::new(&mut self.lockbar_width_mm)
+                    .speed(1.0)
+                    .range(200.0..=1200.0)
+                    .suffix(" mm"),
+            );
+            let inches = self.lockbar_width_mm / 25.4;
+            ui.label(RichText::new(format!("({inches:.1} in)")).weak());
         }
+        // Table inclination — the second key input. The VPX screen is the
+        // near-flat playfield, so the parallax tilts head motion by
+        // 90° − inclination. Shown for every backend.
         ui.separator();
-        ui.label("Lockbar:");
+        ui.label("Incl:");
         ui.add(
-            egui::DragValue::new(&mut self.lockbar_width_mm)
-                .speed(1.0)
-                .range(200.0..=1200.0)
-                .suffix(" mm"),
+            egui::DragValue::new(&mut self.table_incl_deg)
+                .speed(0.5)
+                .range(0.0..=30.0)
+                .suffix("°"),
+        )
+        .on_hover_text(
+            "Playfield inclination from horizontal (VPX gives this per table). \
+             The parallax tilts head motion by 90° − this angle, since the VPX \
+             screen is the laid-flat playfield.",
         );
-        let inches = self.lockbar_width_mm / 25.4;
-        ui.label(RichText::new(format!("({inches:.1} in)")).weak());
     }
 
     /// Camera-placement guidance shown at the top of the central panel, above
@@ -4110,7 +4174,7 @@ impl App {
                 load_thumb(
                     &ctx,
                     "ht_cam_view",
-                    include_bytes!("../assets/skillshot.jpg"),
+                    include_bytes!("../assets/cam_view.jpg"),
                 ),
             ]
         });
@@ -4121,23 +4185,21 @@ impl App {
         ];
         ui.add_space(2.0);
         ui.label(
-            RichText::new(
-                "Camera placement: top of the backglass or topper, centred, facing the \
-                 playfield and the player. A good frame shows the lockbar, a bit of the \
-                 sidebars, and the head.",
-            )
-            .size(12.0),
+            "Camera placement: top of the backglass or topper, centred, facing the \
+             playfield and the player. A good frame shows the lockbar, a bit of the \
+             sidebars, and the head.",
         );
         ui.add_space(3.0);
         // One column per thumbnail: the image fills the whole column width,
-        // its caption wraps underneath (no centred sub-box, so the row uses
-        // all the space).
+        // its caption bold + centred underneath.
         ui.columns(3, |cols| {
             for (i, tex) in thumbs.iter().enumerate() {
                 let w = cols[i].available_width();
                 show_thumb(&mut cols[i], tex, w);
                 cols[i].add_space(2.0);
-                cols[i].label(RichText::new(CAPTIONS[i]).size(11.0));
+                cols[i].vertical_centered(|ui| {
+                    ui.label(RichText::new(CAPTIONS[i]).strong());
+                });
             }
         });
     }
@@ -4150,7 +4212,7 @@ impl App {
         egui::Window::new("🎁 Share a capture")
             .open(&mut open)
             .resizable(true)
-            .default_width(440.0)
+            .default_width(500.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(RichText::new("Please read before accepting").strong());
@@ -4173,12 +4235,18 @@ impl App {
                         }
                     });
                 ui.add_space(6.0);
-                // Explicit opt-in as a highlight toggle (blue when on), for
-                // visual consistency with the rest of the UI — still an
+                // Make the click-to-authorise action unmistakable: a call-out
+                // above the toggle so it's obvious the upload is gated on it.
+                ui.label(
+                    RichText::new("👉 Click the box below to authorise sending your image:")
+                        .strong()
+                        .color(Color32::from_rgb(0xff, 0xcc, 0x33)),
+                );
+                // Explicit opt-in as a highlight toggle (blue when on) — an
                 // affirmative, deliberate action before any upload is allowed.
                 ui.toggle_value(
                     &mut self.consent_checked,
-                    "I have read the above and I freely give my informed consent to share \
+                    "☐ I have read the above and I freely give my informed consent to share \
                      these images under these terms.",
                 );
                 ui.add_space(6.0);
@@ -4218,6 +4286,13 @@ impl App {
                     ui.label("Shared — note this if you may want it removed:");
                     ui.monospace(format!("{stem}_raw.png · {stem}_det.png"));
                 }
+                ui.add_space(4.0);
+                // Where captures land on this machine (also queued for upload).
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label("Also saved locally in:");
+                    ui.monospace(contributions_dir().display().to_string());
+                });
                 ui.separator();
                 ui.label(RichText::new("Before you capture").strong());
                 ui.label(
@@ -4289,7 +4364,12 @@ impl App {
                     && src_size.x > 0.0
                     && src_size.y > 0.0
                 {
-                    draw_pose_overlay(ui.painter(), rect, p, src_size);
+                    // Clip to the camera rect: BlazePose extrapolates off-frame
+                    // joints (knees/feet), so keep them for tracking but never
+                    // paint them outside the RGB view (they'd spill onto the
+                    // parallax scene below).
+                    let clipped = ui.painter().with_clip_rect(rect);
+                    draw_pose_overlay(&clipped, rect, p, src_size);
                 }
             } else {
                 centered(ui, rect, "waiting for first RGB frame…");
@@ -4345,7 +4425,7 @@ impl App {
             ui.label(
                 RichText::new(format!("pe ({ex:+.0}, {ey:+.0}, {ez:.0}) mm"))
                     .monospace()
-                    .size(12.0)
+                    .size(15.0)
                     .color(LOCKBAR_COLOR),
             );
         });
@@ -4471,7 +4551,7 @@ impl App {
                         RichText::new(format!("U seg {:.0}%", u.confidence * 100.0))
                             .color(LOCKBAR_COLOR)
                             .monospace()
-                            .size(12.0),
+                            .size(15.0),
                     );
                 }
                 if let Some(bar) = active.last_lockbar {
@@ -4488,7 +4568,7 @@ impl App {
                         ))
                         .color(LOCKBAR_COLOR)
                         .monospace()
-                        .size(12.0),
+                        .size(15.0),
                     );
                 }
             });
@@ -4560,7 +4640,7 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
-        egui::FontId::proportional(16.0),
+        egui::FontId::proportional(18.0),
         Color32::LIGHT_GRAY,
     );
 }
@@ -5025,17 +5105,25 @@ fn apply_cab_style(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         style
             .text_styles
-            .insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
+            .insert(TextStyle::Body, FontId::new(18.0, FontFamily::Proportional));
         style.text_styles.insert(
             TextStyle::Button,
-            FontId::new(16.0, FontFamily::Proportional),
+            FontId::new(19.0, FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Monospace,
-            FontId::new(13.0, FontFamily::Monospace),
+            FontId::new(15.0, FontFamily::Monospace),
         );
-        style.spacing.button_padding = egui::vec2(8.0, 5.0);
-        style.spacing.interact_size.y = 28.0;
+        style.text_styles.insert(
+            TextStyle::Heading,
+            FontId::new(24.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Small,
+            FontId::new(15.0, FontFamily::Proportional),
+        );
+        style.spacing.button_padding = egui::vec2(9.0, 6.0);
+        style.spacing.interact_size.y = 32.0;
         for w in [
             &mut style.visuals.widgets.inactive,
             &mut style.visuals.widgets.hovered,
