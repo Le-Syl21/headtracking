@@ -307,10 +307,12 @@ Quand un détail d'API est ambigu, **lire le code de VPX est la source de vérit
 - [ ] UI calibration in-game (overlay via API plugin si possible)
 - [ ] Profils par table (override dans `<table>.headtracking.toml`)
 - [ ] Compatibilité protocole BAM (lecture du shared memory existant comme backend)
+- [ ] Fenêtre parallaxe de validation (fish-tank VR à la Johnny Lee) dans `headtracking-demo` — valide le tracking hors VPX (cf. `docs/parallax-validation-window.md`)
 
 ### P3
 - [ ] Multi-camera fusion
 - [ ] Prédiction (compensation latence affichage)
+- [ ] Backend Wiimote (caméra IR de la Wii Remote + LEDs IR sur casquette/lunettes) — alternative cheap à la Kinect. **Bas de pile**, à faire tout à la fin.
 
 ---
 
