@@ -3254,10 +3254,11 @@ impl App {
                     active.last_ir.clone(),
                     active.last_head,
                     active.last_pose.clone(),
+                    active.last_lockbar,
                 )
             })
         });
-        let Some((backend, w, h, raw, det, depth, ir_v2, head, pose)) = payload else {
+        let Some((backend, w, h, raw, det, depth, ir_v2, head, pose, lockbar)) = payload else {
             return;
         };
         let stem = contribution_stem(backend);
@@ -3267,12 +3268,12 @@ impl App {
         // tEXt so the capture is self-describing (head Z per backend, etc.).
         let meta = capture_meta(
             backend,
-            w,
-            h,
+            (w, h),
             &stem,
             self.table_incl_deg,
             head,
             pose.as_ref(),
+            lockbar.as_ref(),
         );
         // Collect every image this capture produced, then save + queue them
         // in one pass. RGB planes are 8-bit colour; depth is 16-bit gray in
@@ -5011,12 +5012,12 @@ fn png_bytes_meta(
 /// `ht_`-prefixed so they don't clash with generic viewer metadata.
 fn capture_meta(
     backend: Backend,
-    w: u32,
-    h: u32,
+    dims: (u32, u32),
     stem: &str,
     table_incl_deg: f32,
     head: Option<HeadPixel>,
     pose: Option<&blazepose::Pose>,
+    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
 ) -> Vec<(String, String)> {
     let mut m: Vec<(String, String)> = Vec::new();
     let mut push = |k: &str, v: String| m.push((k.to_string(), v));
@@ -5030,6 +5031,7 @@ fn capture_meta(
             Backend::Webcam(i) => format!("webcam-{i}"),
         },
     );
+    let (w, h) = dims;
     push("ht_frame", format!("{w}x{h}"));
     push("ht_table_incl_deg", format!("{table_incl_deg:.2}"));
     // How the head Z was obtained differs by sensor — record it so a mm value
@@ -5069,6 +5071,42 @@ fn capture_meta(
             push("ht_shoulder_width_px", format!("{sw:.1}"));
         }
         None => push("ht_pose", "none".to_string()),
+    }
+    // Lockbar-derived geometry: apparent width → estimated distance (the 610 mm
+    // bar seen through a nominal focal `fx = frame_w × 0.9`), and the bar centre's
+    // pixel offset → camera lateral/vertical offset off the playfield centreline
+    // at that distance. Same nominal-focal placeholder as the webcam Z; the
+    // autocalib homography will replace `fx` with the real one. See
+    // [[headtracking-autocalib-vision]].
+    match lockbar {
+        Some(lb) => {
+            let [tl, tr, br, bl] = lb.corners.map(|(u, v)| (u as f32, v as f32));
+            let edge = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+            let width_px = 0.5 * (edge(tl, tr) + edge(bl, br));
+            let fx = lb.frame_width as f32 * 0.9;
+            let dist_mm = if width_px > 1.0 {
+                fx * headtracking::calibration::LOCKBAR_WIDTH_MM / width_px
+            } else {
+                0.0
+            };
+            let cx = 0.25 * (tl.0 + tr.0 + br.0 + bl.0);
+            let cy = 0.25 * (tl.1 + tr.1 + br.1 + bl.1);
+            let frame_cx = lb.frame_width as f32 * 0.5;
+            let frame_cy = lb.frame_height as f32 * 0.5;
+            // Bar centred on the playfield: if it sits right of frame centre the
+            // camera is left of the centreline, hence the flipped sign. +X = cam
+            // to the right, +Y = cam above the bar centre.
+            let off_x_mm = (frame_cx - cx) * dist_mm / fx;
+            let off_y_mm = (frame_cy - cy) * dist_mm / fx;
+            push("ht_lockbar_width_px", format!("{width_px:.1}"));
+            push("ht_lockbar_dist_mm", format!("{dist_mm:.0}"));
+            push("ht_lockbar_center_px", format!("{cx:.0},{cy:.0}"));
+            push("ht_cam_offset_x_mm", format!("{off_x_mm:.0}"));
+            push("ht_cam_offset_y_mm", format!("{off_y_mm:.0}"));
+            push("ht_lockbar_slope_deg", format!("{:.2}", lb.slope_deg));
+            push("ht_lockbar_thickness_px", lb.thickness_px.to_string());
+        }
+        None => push("ht_lockbar", "none".to_string()),
     }
     m
 }
