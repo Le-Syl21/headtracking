@@ -1,0 +1,23 @@
+# Training scratch
+runs/
+dataset/
+dataset_*/
+
+# Local training data flow (never committed):
+# input  -> symlink to the maintainer's Nextcloud sync of contributed captures
+# output -> annotated inputs with fixed points, consumed by train.sh / validation
+input
+output/
+
+# Proof-of-pipeline model (trained on 3 images, does NOT generalize).
+# The production model, trained on a real annotated set, goes to
+# crates/anchor/models/ and IS committed (like the other model crates).
+models/anchor_rgb_proof.onnx
+models/anchor_rgb.onnx
+
+# Python bytecode from the helper scripts
+__pycache__/
+
+# Ultralytics base weights (auto-downloaded by train.sh) + local train logs
+*.pt
+*_train.log

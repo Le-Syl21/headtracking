@@ -8,7 +8,7 @@ members = [
     "crates/freenect2-sys",
     "crates/freenect2",
     "crates/libusb-sys",
-    "crates/u-onnx",
+    "crates/anchor",
     "crates/blazepose",
     "crates/webcam",
     "tools/headtracking-demo",

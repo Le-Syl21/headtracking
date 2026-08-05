@@ -1,0 +1,17 @@
+[package]
+name = "anchor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Cabinet anchor detector — YOLO-pose (6 keypoints: lockbar corners + sidebar bottoms) via ONNX Runtime (ort). Feeds RGB auto-calibration (lateral placement, depth vanishing point, lockbar width)."
+publish = false
+
+[dependencies]
+# Same ONNX Runtime as `blazepose` (already shipped for the skeleton model).
+ort = { version = "=2.0.0-rc.13", features = ["download-binaries"] }
+image = { version = "0.25", default-features = false }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

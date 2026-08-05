@@ -1,0 +1,343 @@
+<meta charset="utf-8">
+<title>Anchor line annotator</title>
+<style>
+  :root{
+    --bg:#14171c; --panel:#1c2128; --panel2:#232a33; --border:#333c48;
+    --txt:#e6ebf1; --muted:#8b97a6; --accent:#4aa3ff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif;overflow:hidden}
+  #app{display:grid;grid-template-columns:1fr 300px;grid-template-rows:auto 1fr;height:100vh}
+  header{grid-column:1/3;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+    padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--border)}
+  header .sp{flex:1}
+  button,select,label.btn{background:var(--panel2);color:var(--txt);border:1px solid var(--border);
+    border-radius:7px;padding:6px 11px;cursor:pointer;font-size:13px}
+  button:hover,label.btn:hover{border-color:var(--accent)}
+  button:disabled{opacity:.4;cursor:default}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#08121f;font-weight:600}
+  #stagewrap{position:relative;overflow:hidden;background:#0c0e12}
+  canvas{position:absolute;inset:0;cursor:crosshair}
+  aside{background:var(--panel);border-left:1px solid var(--border);padding:14px;overflow:auto}
+  aside h3{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .line-row{display:flex;align-items:center;gap:9px;padding:8px 9px;border:1px solid var(--border);
+    border-radius:8px;margin-bottom:7px;cursor:pointer;background:var(--panel2)}
+  .line-row.active{outline:2px solid var(--accent);outline-offset:-1px}
+  .swatch{width:16px;height:16px;border-radius:4px;flex:none;border:1px solid #0006}
+  .line-row .k{flex:1;font-weight:600}
+  .line-row .st{font-size:12px;color:var(--muted)}
+  .line-row.done .st{color:#5fd08a}
+  .hint{color:var(--muted);font-size:12.5px;margin:14px 0}
+  .hint b{color:var(--txt)}
+  kbd{background:#0d1014;border:1px solid var(--border);border-bottom-width:2px;border-radius:5px;
+    padding:1px 6px;font:12px ui-monospace,monospace}
+  #status{font:12px ui-monospace,monospace;color:var(--muted)}
+  #drop{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    text-align:center;color:var(--muted);pointer-events:none;font-size:15px}
+  .pill{font:12px ui-monospace,monospace;background:var(--panel2);border:1px solid var(--border);
+    border-radius:20px;padding:3px 10px}
+</style>
+
+<div id="app">
+  <header>
+    <label class="btn">📁 Dossier d'images
+      <input id="dir" type="file" accept="image/*" multiple webkitdirectory hidden>
+    </label>
+    <label class="btn">🖼️ Fichiers
+      <input id="files" type="file" accept="image/*" multiple hidden>
+    </label>
+    <button id="prev">◀ Préc</button>
+    <select id="imgsel" title="Image courante"></select>
+    <button id="next">Suiv ▶</button>
+    <span class="pill" id="progress">0 / 0</span>
+    <span class="sp"></span>
+    <span id="status">—</span>
+    <span class="sp"></span>
+    <label class="btn">⤴ Importer JSON<input id="imp" type="file" accept="application/json,.json" hidden></label>
+    <button id="exp" class="primary">⤓ Exporter JSON</button>
+  </header>
+
+  <div id="stagewrap">
+    <canvas id="cv"></canvas>
+    <div id="drop">Glisse un dossier / des images ici — ou « 📁 Dossier d'images »</div>
+  </div>
+
+  <aside>
+    <h3>Les 4 droites</h3>
+    <div id="lines"></div>
+    <button id="clearimg" style="width:100%;margin-top:4px">✗ Effacer cette image</button>
+
+    <div class="hint">
+      <b>Tracer une droite :</b><br>
+      1. clic sur un point de l'arête (pivot)<br>
+      2. la droite pivote — aligne-la sur toute l'arête<br>
+      3. 2ᵉ clic fige l'angle → extrémités snappées au bord<br>
+      Elle passe à la droite suivante toute seule.
+    </div>
+    <div class="hint">
+      <kbd>1</kbd>–<kbd>4</kbd> choisir la droite · <kbd>Échap</kbd>/clic-droit annuler le pivot<br>
+      <kbd>Z</kbd> refaire la dernière · <kbd>N</kbd>/<kbd>P</kbd> image suiv/préc<br>
+      molette = zoom · <kbd>Espace</kbd>+glisser = déplacer · <kbd>F</kbd> recadrer
+    </div>
+    <div class="hint" style="color:#c9a24a">
+      Astuce précision : place le pivot pile sur l'arête et sers-toi de la droite
+      infinie pour l'aligner sur <b>toute</b> la longueur visible — pas besoin de
+      viser les bords, ils sont calculés.
+    </div>
+  </aside>
+</div>
+
+<script>
+"use strict";
+// ---- config: the 4 lines of the cabinet reference frame ----
+const LINES = [
+  {key:'sideleft',       color:'#3cb44b'},
+  {key:'sideright',      color:'#4363d8'},
+  {key:'lockbar_player', color:'#e6194b'},
+  {key:'lockbar_screen', color:'#ffe119'},
+];
+const LS_KEY = 'anchorAnnotatorV1';
+
+// ---- state ----
+let images = [];            // {name, img, w, h}
+let idx = -1;              // current image index
+let store = load();        // { [name]: { width,height, annotations:{key:{p1,p2,pivot,angle_deg}} } }
+let active = 0;            // active line index (0..3)
+let pivot = null;         // {x,y} in image coords while setting angle
+let mouseImg = null;      // current mouse position in image coords
+let lastKey = null;       // last placed line key (for redo)
+// view transform (CSS px): screen = img*scale + pan
+let scale = 1, panX = 0, panY = 0, panning = false, spaceDown = false, panStart = null;
+
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const stage = document.getElementById('stagewrap');
+const dpr = () => window.devicePixelRatio || 1;
+
+// ---------- persistence ----------
+function load(){ try{ return JSON.parse(localStorage.getItem(LS_KEY)) || {}; }catch(e){ return {}; } }
+function save(){ localStorage.setItem(LS_KEY, JSON.stringify(store)); }
+function rec(){ // record for current image
+  const name = images[idx]?.name; if(!name) return null;
+  if(!store[name]) store[name] = {width:images[idx].w, height:images[idx].h, annotations:{}};
+  return store[name];
+}
+
+// ---------- geometry ----------
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+// intersections of the infinite line (through P, direction d) with the image rect
+function lineRect(px,py,dx,dy,w,h){
+  const pts=[], e=1e-6;
+  if(Math.abs(dx)>e){ for(const X of [0,w]){ const t=(X-px)/dx, y=py+t*dy;
+    if(y>=-e && y<=h+e) pts.push({x:X, y:clamp(y,0,h)}); } }
+  if(Math.abs(dy)>e){ for(const Y of [0,h]){ const t=(Y-py)/dy, x=px+t*dx;
+    if(x>=-e && x<=w+e) pts.push({x:clamp(x,0,w), y:Y}); } }
+  const u=[]; for(const p of pts){ if(!u.some(q=>Math.hypot(q.x-p.x,q.y-p.y)<0.5)) u.push(p); }
+  return u.slice(0,2);
+}
+// consistent ordering: rails (near-vertical) top->bottom ; lockbar edges (near-horiz) left->right
+function order(p1,p2){
+  const dx=Math.abs(p2.x-p1.x), dy=Math.abs(p2.y-p1.y);
+  if(dy>=dx) return (p1.y<=p2.y)?[p1,p2]:[p2,p1];
+  return (p1.x<=p2.x)?[p1,p2]:[p2,p1];
+}
+
+// ---------- coords ----------
+function toImg(sx,sy){ return {x:(sx-panX)/scale, y:(sy-panY)/scale}; }
+function toScr(ix,iy){ return {x:ix*scale+panX, y:iy*scale+panY}; }
+function fit(){
+  const im=images[idx]; if(!im) return;
+  const W=stage.clientWidth, H=stage.clientHeight;
+  scale = Math.min(W/im.w, H/im.h)*0.96;
+  panX = (W - im.w*scale)/2; panY = (H - im.h*scale)/2;
+  draw();
+}
+
+// ---------- rendering ----------
+function resize(){
+  const W=stage.clientWidth, H=stage.clientHeight, r=dpr();
+  cv.width=W*r; cv.height=H*r; cv.style.width=W+'px'; cv.style.height=H+'px';
+  draw();
+}
+function drawLine(p1,p2,color,width,dash){
+  const a=toScr(p1.x,p1.y), b=toScr(p2.x,p2.y);
+  ctx.save(); ctx.strokeStyle=color; ctx.lineWidth=width; ctx.setLineDash(dash||[]);
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); ctx.restore();
+}
+function dot(p,color,r=4){ const s=toScr(p.x,p.y); ctx.save(); ctx.fillStyle=color;
+  ctx.beginPath(); ctx.arc(s.x,s.y,r,0,7); ctx.fill(); ctx.strokeStyle='#000a'; ctx.stroke(); ctx.restore(); }
+function draw(){
+  ctx.setTransform(dpr(),0,0,dpr(),0,0);
+  ctx.clearRect(0,0,cv.width,cv.height);
+  const im=images[idx]; if(!im) return;
+  // image
+  ctx.imageSmoothingEnabled = scale<3;
+  ctx.drawImage(im.img, panX, panY, im.w*scale, im.h*scale);
+  // image border
+  const tl=toScr(0,0), br=toScr(im.w,im.h);
+  ctx.strokeStyle='#ffffff22'; ctx.lineWidth=1; ctx.strokeRect(tl.x,tl.y,br.x-tl.x,br.y-tl.y);
+  // stored lines
+  const an = store[im.name]?.annotations || {};
+  for(const L of LINES){ const a=an[L.key]; if(a){ drawLine(a.p1,a.p2,L.color,2.2);
+    dot(a.p1,L.color,3.2); dot(a.p2,L.color,3.2); } }
+  // live preview while setting angle
+  if(pivot && mouseImg){
+    const dx=mouseImg.x-pivot.x, dy=mouseImg.y-pivot.y;
+    if(Math.hypot(dx,dy)>1e-3){
+      const pts=lineRect(pivot.x,pivot.y,dx,dy,im.w,im.h);
+      if(pts.length===2) drawLine(pts[0],pts[1],LINES[active].color,1.6,[7,5]);
+    }
+    dot(pivot,LINES[active].color,5);
+  }
+  syncStatus();
+}
+
+// ---------- interaction ----------
+function place(clickImg){
+  const im=images[idx]; if(!im) return;
+  if(!pivot){ pivot={x:clickImg.x,y:clickImg.y}; draw(); return; }
+  const dx=clickImg.x-pivot.x, dy=clickImg.y-pivot.y;
+  if(Math.hypot(dx,dy)<1){ return; } // ignore zero-length
+  const pts=lineRect(pivot.x,pivot.y,dx,dy,im.w,im.h);
+  if(pts.length===2){
+    const [p1,p2]=order(pts[0],pts[1]);
+    const r=rec();
+    r.annotations[LINES[active].key]={
+      p1:{x:+p1.x.toFixed(2),y:+p1.y.toFixed(2)},
+      p2:{x:+p2.x.toFixed(2),y:+p2.y.toFixed(2)},
+      pivot:{x:+pivot.x.toFixed(2),y:+pivot.y.toFixed(2)},
+      angle_deg:+(Math.atan2(dy,dx)*180/Math.PI).toFixed(3)
+    };
+    lastKey=LINES[active].key; save();
+  }
+  pivot=null;
+  advance();
+  renderLegend(); draw();
+}
+function advance(){ // move to next not-done line
+  const an=store[images[idx].name]?.annotations||{};
+  for(let i=1;i<=LINES.length;i++){ const j=(active+i)%LINES.length;
+    if(!an[LINES[j].key]){ active=j; return; } }
+  // all done -> keep active on last for easy redo
+}
+function cancelPivot(){ if(pivot){ pivot=null; draw(); } }
+
+// ---------- events: canvas ----------
+cv.addEventListener('mousedown',e=>{
+  if(e.button===1 || (e.button===0 && spaceDown)){ panning=true; panStart={x:e.clientX-panX,y:e.clientY-panY}; e.preventDefault(); return; }
+  if(e.button===2){ cancelPivot(); return; }
+  if(e.button!==0) return;
+  const im=images[idx]; if(!im) return;
+  const r=cv.getBoundingClientRect(), p=toImg(e.clientX-r.left,e.clientY-r.top);
+  if(p.x<0||p.y<0||p.x>im.w||p.y>im.h){ return; } // clicks outside image do nothing
+  place(p);
+});
+cv.addEventListener('mousemove',e=>{
+  const r=cv.getBoundingClientRect(), sx=e.clientX-r.left, sy=e.clientY-r.top;
+  if(panning && panStart){ panX=e.clientX-panStart.x; panY=e.clientY-panStart.y; draw(); return; }
+  mouseImg=toImg(sx,sy);
+  if(pivot) draw(); else syncStatus();
+});
+window.addEventListener('mouseup',()=>{ panning=false; });
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('wheel',e=>{
+  e.preventDefault(); const r=cv.getBoundingClientRect(), sx=e.clientX-r.left, sy=e.clientY-r.top;
+  const before=toImg(sx,sy); const f=e.deltaY<0?1.15:1/1.15; scale=clamp(scale*f,0.05,60);
+  panX=sx-before.x*scale; panY=sy-before.y*scale; draw();
+},{passive:false});
+
+// ---------- events: keyboard ----------
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){ spaceDown=true; cv.style.cursor='grab'; e.preventDefault(); return; }
+  if(e.key>='1'&&e.key<='4'){ active=+e.key-1; pivot=null; renderLegend(); draw(); return; }
+  if(e.key==='Escape'){ cancelPivot(); return; }
+  if(e.key==='f'||e.key==='F'){ fit(); return; }
+  if(e.key==='n'||e.key==='N'){ go(1); return; }
+  if(e.key==='p'||e.key==='P'){ go(-1); return; }
+  if(e.key==='z'||e.key==='Z'){ redo(); return; }
+});
+window.addEventListener('keyup',e=>{ if(e.code==='Space'){ spaceDown=false; cv.style.cursor='crosshair'; } });
+function redo(){ // clear last placed line and re-activate it
+  const key=lastKey; if(!key) return; const r=rec(); if(r&&r.annotations[key]){ delete r.annotations[key]; save(); }
+  active=LINES.findIndex(l=>l.key===key); pivot=null; renderLegend(); draw();
+}
+
+// ---------- image loading ----------
+function loadFiles(fileList){
+  const arr=[...fileList].filter(f=>/^image\//.test(f.type)||/\.(png|jpe?g|bmp|webp)$/i.test(f.name));
+  arr.sort((a,b)=>a.name.localeCompare(b.name));
+  let pending=arr.length; if(!pending) return;
+  const loaded=[];
+  arr.forEach(f=>{ const img=new Image(); img.onload=()=>{ loaded.push({name:f.name,img,w:img.naturalWidth,h:img.naturalHeight});
+    if(--pending===0){ loaded.sort((a,b)=>a.name.localeCompare(b.name)); images=loaded; idx=0;
+      document.getElementById('drop').style.display='none'; buildSelect(); fit(); renderLegend(); }
+  }; img.onerror=()=>{ if(--pending===0){ if(loaded.length){ images=loaded; idx=0; buildSelect(); fit(); renderLegend(); } } };
+    img.src=URL.createObjectURL(f); });
+}
+document.getElementById('dir').addEventListener('change',e=>loadFiles(e.target.files));
+document.getElementById('files').addEventListener('change',e=>loadFiles(e.target.files));
+stage.addEventListener('dragover',e=>{e.preventDefault();});
+stage.addEventListener('drop',e=>{ e.preventDefault();
+  const items=e.dataTransfer.files; if(items&&items.length) loadFiles(items); });
+
+// ---------- navigation ----------
+function go(d){ if(!images.length) return; idx=clamp(idx+d,0,images.length-1);
+  active=0; pivot=null; advance2first(); buildSelect(true); fit(); renderLegend(); }
+function advance2first(){ const an=store[images[idx].name]?.annotations||{};
+  active=0; for(let i=0;i<LINES.length;i++){ if(!an[LINES[i].key]){ active=i; break; } } }
+document.getElementById('prev').onclick=()=>go(-1);
+document.getElementById('next').onclick=()=>go(1);
+function buildSelect(justValue){
+  const sel=document.getElementById('imgsel');
+  if(!justValue){ sel.innerHTML=''; images.forEach((im,i)=>{ const o=document.createElement('option');
+    o.value=i; sel.appendChild(o); }); }
+  images.forEach((im,i)=>{ const done=Object.keys(store[im.name]?.annotations||{}).length;
+    sel.options[i].textContent=`${done===4?'✓':(done? '•':'○')} ${im.name}`; });
+  sel.value=idx;
+  document.getElementById('progress').textContent=`${idx+1} / ${images.length}`;
+}
+document.getElementById('imgsel').onchange=e=>{ idx=+e.target.value; active=0; pivot=null; advance2first(); fit(); renderLegend(); buildSelect(true); };
+
+// ---------- legend / right panel ----------
+function renderLegend(){
+  const el=document.getElementById('lines'); el.innerHTML='';
+  const an = images[idx] ? (store[images[idx].name]?.annotations||{}) : {};
+  LINES.forEach((L,i)=>{ const done=!!an[L.key];
+    const row=document.createElement('div'); row.className='line-row'+(i===active?' active':'')+(done?' done':'');
+    row.innerHTML=`<span class="swatch" style="background:${L.color}"></span>
+      <span class="k">${L.key}</span><span class="st">${done?'✓ tracée':'—'}</span>`;
+    row.onclick=()=>{ active=i; pivot=null; renderLegend(); draw(); };
+    el.appendChild(row); });
+  if(images[idx]) buildSelect(true);
+}
+document.getElementById('clearimg').onclick=()=>{ if(!images[idx])return;
+  if(store[images[idx].name]) store[images[idx].name].annotations={};
+  save(); pivot=null; renderLegend(); draw(); };
+
+// ---------- status ----------
+function syncStatus(){
+  const s=document.getElementById('status'); if(!images[idx]){ s.textContent='—'; return; }
+  let t=`${images[idx].w}×${images[idx].h}  zoom ${(scale).toFixed(2)}×`;
+  if(mouseImg) t+=`  (${mouseImg.x.toFixed(0)}, ${mouseImg.y.toFixed(0)})`;
+  if(pivot&&mouseImg){ const a=Math.atan2(mouseImg.y-pivot.y,mouseImg.x-pivot.x)*180/Math.PI;
+    t+=`  angle ${a.toFixed(2)}°`; }
+  s.textContent=t;
+}
+
+// ---------- import / export ----------
+document.getElementById('exp').onclick=()=>{
+  const out={ schema:'anchor-lines-v1', lines:LINES.map(l=>l.key), images:store };
+  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='anchor-lines.json'; a.click();
+};
+document.getElementById('imp').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return;
+  const rd=new FileReader(); rd.onload=()=>{ try{ const j=JSON.parse(rd.result);
+    const data=j.images||j; Object.assign(store,data); save(); renderLegend(); draw(); buildSelect();
+    alert('Import OK : '+Object.keys(data).length+' images fusionnées.'); }catch(err){ alert('JSON invalide'); } };
+  rd.readAsText(f); });
+
+// ---------- boot ----------
+new ResizeObserver(resize).observe(stage);
+resize();
+</script>
