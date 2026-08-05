@@ -14,5 +14,6 @@ pub mod calibration;
 pub mod camera;
 pub mod config;
 pub mod filter;
+pub mod hwlock;
 pub mod plugin;
 pub mod tracker;

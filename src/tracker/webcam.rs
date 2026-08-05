@@ -414,6 +414,8 @@ pub struct WebcamBackend {
     cx: f32,
     cy: f32,
     started_at: Instant,
+    /// Declared last: released only after the camera handle above closes.
+    _hwlock: crate::hwlock::HwLock,
 }
 
 /// Smoothing weight on focal-length updates from hand fiducial
@@ -430,6 +432,9 @@ const HAND_TILT_REJECT_RAD: f32 = 0.175; // ~10°
 
 impl WebcamBackend {
     pub fn open(index: usize) -> Result<Self, Error> {
+        // One "webcam" slug for every index: SDL ids aren't stable across
+        // processes, and a cab has one webcam. Same policy as the demo.
+        let hwlock = crate::hwlock::HwLock::acquire("webcam").map_err(Error::Busy)?;
         let api = sdl3()?;
         let camera = OpenedCamera::open(api, index)?;
         let detector = face::Detector::new()?;
@@ -459,6 +464,7 @@ impl WebcamBackend {
             cx,
             cy,
             started_at: Instant::now(),
+            _hwlock: hwlock,
         })
     }
 
@@ -607,6 +613,8 @@ pub enum Error {
     NoDevice,
     #[error("face detector init: {0}")]
     Face(String),
+    #[error("{0}")]
+    Busy(String),
 }
 
 impl From<face::Error> for Error {

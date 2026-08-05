@@ -39,6 +39,8 @@ pub struct KinectV2Backend {
     detector: head::Detector,
     last_heads: Vec<head::HeadAnchor>,
     started_at: Instant,
+    /// Declared last: released only after the device handle above closes.
+    _hwlock: crate::hwlock::HwLock,
 }
 
 impl KinectV2Backend {
@@ -46,6 +48,9 @@ impl KinectV2Backend {
     /// streams. Returns an error if no device is connected, libfreenect2
     /// fails to start, or the head ONNX model can't be loaded into tract.
     pub fn open() -> Result<Self, Error> {
+        // Cross-process exclusivity (demo, cron capture, second VPX): fail
+        // fast with a readable message instead of a USB-level fight.
+        let hwlock = crate::hwlock::HwLock::acquire("kinect-v2").map_err(Error::Busy)?;
         let ctx = Context::new()?;
         let count = ctx.enumerate();
         if count <= 0 {
@@ -76,6 +81,7 @@ impl KinectV2Backend {
             detector,
             last_heads: Vec::new(),
             started_at: Instant::now(),
+            _hwlock: hwlock,
         })
     }
 
@@ -137,4 +143,6 @@ pub enum Error {
     Freenect2(#[from] freenect2::Error),
     #[error("head detector init: {0}")]
     Head(#[from] head::Error),
+    #[error("{0}")]
+    Busy(String),
 }
