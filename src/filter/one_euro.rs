@@ -151,6 +151,15 @@ impl OneEuroPose3D {
         }
     }
 
+    /// Live-retune each axis independently, preserving filter state — the
+    /// per-axis counterpart of [`Self::set_params`], for callers that keep a
+    /// different noise profile on Z (see [`Self::new_per_axis`]).
+    pub fn set_params_per_axis(&mut self, params: [OneEuroParams; 3]) {
+        for (a, p) in self.axes.iter_mut().zip(params) {
+            a.set_params(p);
+        }
+    }
+
     pub fn update(&mut self, position_mm: [f32; 3], t_us: u64) -> [f32; 3] {
         [
             self.axes[0].update(position_mm[0], t_us),

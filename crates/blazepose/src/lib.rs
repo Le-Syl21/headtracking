@@ -173,20 +173,81 @@ fn iou(a: &Detection, b: &Detection) -> f32 {
     }
 }
 
+/// Below this landmark presence, tracking is considered lost and we re-run the
+/// detector (MediaPipe's detect-once-then-track).
+const TRACK_MIN_PRESENCE: f32 = 0.5;
+
+/// A decoded pose plus its two auxiliary ROI points (landmarks 33 & 34, frame
+/// px) that seed the next frame's tracking ROI.
+type TrackedPose = (Pose, [f32; 2], [f32; 2]);
+
+/// ROI (centre, square size, rotation) from two alignment points — the exact
+/// MediaPipe pose `AlignmentPointsRects` math: centre = `c`, box = 2·|c→a|·1.25,
+/// rotate so `c→a` points "up" (90°). Shared by the detector path and tracking.
+fn roi_from_points(c: [f32; 2], a: [f32; 2]) -> ([f32; 2], f32, f32) {
+    let (dx, dy) = (a[0] - c[0], a[1] - c[1]);
+    let dist = (dx * dx + dy * dy).sqrt();
+    let box_size = 2.0 * dist * 1.25;
+    let angle = std::f32::consts::FRAC_PI_2 - (-dy).atan2(dx);
+    (c, box_size, angle)
+}
+
+// NOTE on smoothing: this crate deliberately ships NO landmark smoothing
+// (MediaPipe's `smooth_landmarks` was ported here once, then removed). The
+// consumer applies a single tunable One-Euro filter on its derived output
+// (head position in mm, Z included — which never went through 2D landmark
+// smoothing anyway). Two cascaded One-Euro stages doubled the latency and
+// made the UI filter knobs control only half the smoothing. Landmarks
+// returned by [`BlazePose::poll`] are the raw model output; ROI-jump jitter
+// is already killed by detect-once-then-track below.
+
 pub struct BlazePose {
     detector: Session,
     landmark: Session,
     anchors: Vec<Anchor>,
+    /// The two auxiliary ROI points (landmarks 33 & 34) from the last successful
+    /// frame — the seed for the next frame's ROI so we track without re-detecting.
+    last_aux: Option<([f32; 2], [f32; 2])>,
 }
 
 impl BlazePose {
     pub fn new() -> Result<Self, Error> {
-        let detector = Session::builder()?.commit_from_memory(DETECTOR_ONNX)?;
-        let landmark = Session::builder()?.commit_from_memory(LANDMARK_ONNX)?;
+        // Cap the thread pools and disable spinning: ort's defaults build one
+        // pool per session sized to every physical core AND busy-spin workers
+        // between runs — three sessions in this process would burn cores doing
+        // nothing. The end goal is a VPX plugin sharing the machine with the
+        // game, so the model budget is "a couple of quiet threads", not "all
+        // cores, hot". ~7 ms inference grows a little; still far inside a
+        // 33 ms camera frame.
+        // `.unwrap_or_else(|e| e.recover())` is ort's own idiom for config
+        // options: on failure the error hands the builder back, so an
+        // unsupported option degrades to the default instead of aborting —
+        // acceptable here since these knobs only affect CPU footprint.
+        let detector = Session::builder()?
+            .with_intra_threads(2)
+            .unwrap_or_else(|e| e.recover())
+            .with_inter_threads(1)
+            .unwrap_or_else(|e| e.recover())
+            .with_intra_op_spinning(false)
+            .unwrap_or_else(|e| e.recover())
+            .with_inter_op_spinning(false)
+            .unwrap_or_else(|e| e.recover())
+            .commit_from_memory(DETECTOR_ONNX)?;
+        let landmark = Session::builder()?
+            .with_intra_threads(2)
+            .unwrap_or_else(|e| e.recover())
+            .with_inter_threads(1)
+            .unwrap_or_else(|e| e.recover())
+            .with_intra_op_spinning(false)
+            .unwrap_or_else(|e| e.recover())
+            .with_inter_op_spinning(false)
+            .unwrap_or_else(|e| e.recover())
+            .commit_from_memory(LANDMARK_ONNX)?;
         Ok(Self {
             detector,
             landmark,
             anchors: generate_anchors(),
+            last_aux: None,
         })
     }
 
@@ -256,22 +317,78 @@ impl BlazePose {
         Ok(kept.into_iter().next())
     }
 
-    /// Full pipeline: detect the person, build the rotated ROI, run the
-    /// landmark model, and return the 33 body landmarks in **frame pixels**.
-    /// `None` if no person is detected.
+    /// One-shot pipeline: detect the person, build the ROI, run the landmark
+    /// model, return the 33 body landmarks in **frame pixels** (`None` if no
+    /// person). Re-detects on every call — use [`BlazePose::poll`] for a live
+    /// stream (it tracks and only re-detects when the subject is lost).
     pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Option<Pose>, Error> {
+        match self.detect_full(rgb, w, h)? {
+            Some((pose, a0, a1)) => {
+                self.last_aux = Some((a0, a1));
+                Ok(Some(pose))
+            }
+            None => {
+                self.last_aux = None;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Live entry point — MediaPipe's **detect-once-then-track**. While a subject
+    /// is tracked we skip the detector entirely (its ROI jitter is what makes a
+    /// still skeleton tremble) and seed the ROI from the previous frame's
+    /// auxiliary landmarks; the detector re-runs only when tracking is lost.
+    /// Also faster than [`BlazePose::detect`] (no detector while tracking).
+    pub fn poll(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Option<Pose>, Error> {
+        if let Some((a0, a1)) = self.last_aux {
+            let (center, box_size, angle) = roi_from_points(a0, a1);
+            if let Some((pose, na0, na1)) =
+                self.run_landmarks(rgb, w, h, center, box_size, angle)?
+            {
+                if pose.presence >= TRACK_MIN_PRESENCE {
+                    self.last_aux = Some((na0, na1));
+                    return Ok(Some(pose));
+                }
+            }
+        }
+        // No track yet, or tracking lost → re-acquire with the detector.
+        match self.detect_full(rgb, w, h)? {
+            Some((pose, a0, a1)) => {
+                self.last_aux = Some((a0, a1));
+                Ok(Some(pose))
+            }
+            None => {
+                self.last_aux = None;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Detector → ROI → landmark model. Returns the pose plus the two auxiliary
+    /// ROI points (landmarks 33 & 34, frame px) that seed the next frame's ROI.
+    fn detect_full(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Option<TrackedPose>, Error> {
         let Some(det) = self.detect_person(rgb, w, h, 0.5)? else {
             return Ok(None);
         };
         // ROI from the detector keypoints (MediaPipe AlignmentPointsRects for
-        // pose): centre = kp0 (mid-hip), rotate so kp0→kp1 points "up" (90°),
-        // square size = 2·|kp0→kp1| scaled by 1.25.
-        let c = det.keypoints[0];
-        let a = det.keypoints[1];
-        let (dx, dy) = (a[0] - c[0], a[1] - c[1]);
-        let dist = (dx * dx + dy * dy).sqrt();
-        let box_size = 2.0 * dist * 1.25;
-        let angle = std::f32::consts::FRAC_PI_2 - (-dy).atan2(dx);
+        // pose): centre = kp0 (mid-hip), kp0→kp1 defines scale + rotation.
+        let (center, box_size, angle) = roi_from_points(det.keypoints[0], det.keypoints[1]);
+        self.run_landmarks(rgb, w, h, center, box_size, angle)
+    }
+
+    /// Warp the rotated ROI, run the landmark model, decode the 33 body
+    /// landmarks to frame pixels, and inverse-warp the two auxiliary ROI points
+    /// (landmarks 33 = centre, 34 = scale/rotation) for tracking. `None` if the
+    /// model output is too small to hold them.
+    fn run_landmarks(
+        &mut self,
+        rgb: &[u8],
+        w: u32,
+        h: u32,
+        center: [f32; 2],
+        box_size: f32,
+        angle: f32,
+    ) -> Result<Option<TrackedPose>, Error> {
         let (cos, sin) = (angle.cos(), angle.sin());
         let side = LANDMARK_SIDE as f32;
 
@@ -284,8 +401,8 @@ impl BlazePose {
                 let ny = (v as f32 + 0.5) / side - 0.5;
                 let rx = nx * box_size;
                 let ry = ny * box_size;
-                let fx = c[0] + rx * cos - ry * sin;
-                let fy = c[1] + rx * sin + ry * cos;
+                let fx = center[0] + rx * cos - ry * sin;
+                let fy = center[1] + rx * sin + ry * cos;
                 let [r, g, b] = sample_bilinear(rgb, w, h, fx, fy);
                 input[idx] = f32::from(r) / 127.5 - 1.0;
                 input[idx + 1] = f32::from(g) / 127.5 - 1.0;
@@ -300,30 +417,48 @@ impl BlazePose {
         let outputs = self.landmark.run(ort::inputs![val])?;
         let (_, ld) = outputs["Identity"].try_extract_tensor::<f32>()?;
         let (_, pres) = outputs["Identity_1"].try_extract_tensor::<f32>()?;
+        // Need 35 landmarks: 33 body + the 2 auxiliary ROI points (33 & 34).
+        if ld.len() < 35 * 5 {
+            return Ok(None);
+        }
         let presence = sigmoid(pres[0]);
 
-        // Decode the first 33 landmarks: ROI px (0..side) → inverse warp → frame.
-        let mut landmarks = [Landmark::default(); 33];
-        for (i, lm) in landmarks.iter_mut().enumerate() {
-            let lx = ld[i * 5];
-            let ly = ld[i * 5 + 1];
-            let lz = ld[i * 5 + 2];
+        // Inverse-warp a ROI-space point (px, 0..side) back to frame pixels.
+        let unwarp = |lx: f32, ly: f32| -> [f32; 2] {
             let nx = lx / side - 0.5;
             let ny = ly / side - 0.5;
             let rx = nx * box_size;
             let ry = ny * box_size;
+            [
+                center[0] + rx * cos - ry * sin,
+                center[1] + rx * sin + ry * cos,
+            ]
+        };
+
+        // Decode the 33 body landmarks.
+        let mut landmarks = [Landmark::default(); 33];
+        for (i, lm) in landmarks.iter_mut().enumerate() {
+            let [x, y] = unwarp(ld[i * 5], ld[i * 5 + 1]);
             *lm = Landmark {
-                x: c[0] + rx * cos - ry * sin,
-                y: c[1] + rx * sin + ry * cos,
-                z: lz,
+                x,
+                y,
+                z: ld[i * 5 + 2],
                 visibility: sigmoid(ld[i * 5 + 3]),
                 presence: sigmoid(ld[i * 5 + 4]),
             };
         }
-        Ok(Some(Pose {
-            landmarks,
-            presence,
-        }))
+        // Auxiliary ROI points → seed the next frame's tracking ROI.
+        let aux0 = unwarp(ld[33 * 5], ld[33 * 5 + 1]);
+        let aux1 = unwarp(ld[34 * 5], ld[34 * 5 + 1]);
+
+        Ok(Some((
+            Pose {
+                landmarks,
+                presence,
+            },
+            aux0,
+            aux1,
+        )))
     }
 
     /// Probe: run the landmark model on a blank ROI and return output
