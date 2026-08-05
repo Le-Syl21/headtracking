@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 freenect = { path = "../../crates/freenect" }
 freenect2 = { path = "../../crates/freenect2" }
-u-onnx = { path = "../../crates/u-onnx" }
 blazepose = { path = "../../crates/blazepose" }
+anchor = { path = "../../crates/anchor" }
 webcam = { path = "../../crates/webcam" }
 headtracking = { path = "../.." }
 # Linear algebra for the parallax off-axis projection (Matrix4: column-major
@@ -33,9 +33,17 @@ glow = "0.17"
 glutin = "0.32"
 glutin-winit = "0.5"
 parking_lot = "0.12"
+# Lock-free single-slot publish of the latest captured frame from the capture
+# thread to the GL thread. Tiny, pure-Rust — keeps the zero-install/static goal.
+arc-swap = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 os_info = { version = "3", default-features = false }
+# JSON parsing for the optional `anchor_fixed.json` (hand-fixed anchor
+# calibration, used while the anchor model is still weak). Already in the
+# lockfile as a transitive dep — listing it here just makes the direct
+# usage explicit, no extra build cost (same precedent as `png` below).
+serde_json = "1"
 # PNG encoder for the in-app screenshot button (saves the latest RGB
 # frame next to the binary, named after the active device + timestamp).
 # Already in the lockfile as a transitive dep — listing it here just

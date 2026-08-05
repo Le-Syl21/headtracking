@@ -21,9 +21,12 @@
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal as _, Write};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use std::num::NonZeroU32;
+
+use arc_swap::ArcSwapOption;
 
 use egui::{
     self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, Pos2, Rect, RichText,
@@ -42,6 +45,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const DEPTH_MIN_MM: f32 = 500.0;
 const DEPTH_MAX_MM: f32 = 2_500.0;
+/// Nominal webcam focal length as a fraction of the frame width (~58° HFOV).
+/// One shared guess: the same value MUST be used everywhere a webcam focal is
+/// assumed, or derived quantities (head Z vs lockbar Z) silently mix scales —
+/// three call sites used to disagree (0.85 vs 0.9), a ~6 % systematic bias on
+/// the head↔lockbar delta. Lockbar autocalibration will replace this with a
+/// measured per-camera focal.
+const WEBCAM_FX_PER_WIDTH: f32 = 0.9;
 
 const LOG_BUFFER_LINES: usize = 1_000;
 
@@ -79,13 +89,11 @@ const CONTRIB_TERMS: &[(&str, &str)] = &[
 ];
 
 // Overlay colours, kept here so the toolbar status text and the canvas
-// drawing stay in sync. Head → soft red; the U segmentation mask → a
+// drawing stay in sync. Head → soft red; the anchor geometry → a
 // translucent cyan fill, with the lockbar quad derived from its closed
 // edge drawn in solid cyan (high contrast against red, visible on both
 // bright playfield reflections and dark cabinet interiors).
 const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
-/// Sidebars (playfield rails) — orange, distinct from the cyan lockbar.
-const RAIL_COLOR: Color32 = Color32::from_rgb(0xff, 0x9a, 0x00);
 
 fn main() {
     let logs: Arc<Mutex<VecDeque<String>>> =
@@ -181,14 +189,21 @@ fn main() {
             eprintln!("error: {msg}\n\n{CLI_USAGE}");
             std::process::exit(2);
         }
-        Ok(Some(cap)) => match run_headless_capture(cap) {
-            Ok(()) => std::process::exit(0),
-            Err(e) => {
-                error!(error = %e, "headless capture failed");
-                eprintln!("capture failed: {e}");
-                std::process::exit(1);
+        Ok(Some(cap)) => {
+            let result = if cap.contribute {
+                run_headless_contribute(cap)
+            } else {
+                run_headless_capture(cap)
+            };
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    error!(error = %e, "headless capture failed");
+                    eprintln!("capture failed: {e}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         Ok(None) => {}
     }
 
@@ -297,10 +312,10 @@ impl GlutinWindowContext {
         };
         let gl_context = not_current_gl_context.make_current(&gl_surface).unwrap();
         gl_surface
-            .set_swap_interval(
-                &gl_context,
-                glutin::surface::SwapInterval::Wait(NonZeroU32::MIN),
-            )
+            // No VSync — this is a real-time tracker; we don't want the render
+            // loop (which also drives camera polling) quantised to 60/N by
+            // vblanks. Uncapped so v2's heavier frames run at their true rate.
+            .set_swap_interval(&gl_context, glutin::surface::SwapInterval::DontWait)
             .unwrap();
 
         Self {
@@ -967,6 +982,11 @@ impl DemoShell {
         }
 
         self.gl_window.as_ref().unwrap().swap_buffers().unwrap();
+        // Count this present toward the render-rate metric (every repaint, not
+        // just camera-fresh ones) so `render fps` shows the GL cadence.
+        if let Some(active) = self.app.active.as_mut() {
+            active.metrics.note_render_frame();
+        }
         // Keep the camera feed live, but pace the continuous repaint to the
         // camera cadence (set in `about_to_wait`) instead of hammering vsync —
         // a fresh frame only exists at camera rate, so faster repaints just
@@ -1036,6 +1056,20 @@ impl winit::application::ApplicationHandler for DemoShell {
         use winit::event::WindowEvent;
 
         if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+            event_loop.exit();
+            return;
+        }
+        // Escape quits the app.
+        if let WindowEvent::KeyboardInput {
+            event:
+                winit::event::KeyEvent {
+                    logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+                    state: winit::event::ElementState::Pressed,
+                    ..
+                },
+            ..
+        } = &event
+        {
             event_loop.exit();
             return;
         }
@@ -1118,10 +1152,18 @@ impl winit::application::ApplicationHandler for DemoShell {
 
 const CLI_USAGE: &str = "\
 Usage: headtracking-demo [--capture <backend> [--out <path>] [--wait <secs>]]
+                         [--contribute <backend> [--wait <secs>]]
 
   --capture <backend>   Run headless: open backend, settle for `--wait`
                         seconds, save one PNG, exit.
                         backend = kinect-v2 | kinect-v1 | webcam | webcam-<N>
+  --contribute <backend>
+                        Run headless: capture EVERY stream of the backend
+                        (raw/det/depth/ir + previews, same file set as the
+                        GUI Contribute button), save under `contributions/`
+                        next to the binary, upload to the training drop,
+                        exit. Made for unattended cron runs collecting
+                        lighting variety.
   --out <path>          Output PNG path. Default: next to the binary,
                         named `<backend>_<UTC-timestamp>.png`.
   --wait <secs>         Seconds to let the device warm up + head/lockbar
@@ -1146,6 +1188,8 @@ struct CaptureArgs {
     wait_secs: f32,
     lockbar_mm: f32,
     pf_deg: f32,
+    /// `--contribute`: full multi-stream capture + upload instead of one PNG.
+    contribute: bool,
 }
 
 fn parse_cli() -> Result<Option<CaptureArgs>, String> {
@@ -1163,12 +1207,18 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
     let mut wait_secs: f32 = 3.0;
     let mut lockbar_mm: f32 = headtracking::calibration::LOCKBAR_WIDTH_MM;
     let mut pf_deg: f32 = DEFAULT_TABLE_INCL_DEG;
+    let mut contribute = false;
     let mut iter = raw.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--capture" => {
                 let v = iter.next().ok_or("--capture needs a backend name")?;
                 backend = Some(parse_backend_arg(v)?);
+            }
+            "--contribute" => {
+                let v = iter.next().ok_or("--contribute needs a backend name")?;
+                backend = Some(parse_backend_arg(v)?);
+                contribute = true;
             }
             "--out" => {
                 let v = iter.next().ok_or("--out needs a path")?;
@@ -1195,13 +1245,15 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
             other => return Err(format!("unknown flag '{other}'")),
         }
     }
-    let backend = backend.ok_or("--capture <backend> is required for non-GUI mode")?;
+    let backend =
+        backend.ok_or("--capture or --contribute <backend> is required for non-GUI mode")?;
     Ok(Some(CaptureArgs {
         backend,
         out_path,
         wait_secs,
         lockbar_mm,
         pf_deg,
+        contribute,
     }))
 }
 
@@ -1226,14 +1278,11 @@ fn parse_backend_arg(s: &str) -> Result<Backend, String> {
 
 // ============================================================ Headless capture
 
-fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
-    info!(
-        backend = ?cap.backend,
-        wait_secs = cap.wait_secs,
-        out = ?cap.out_path,
-        "headless capture starting"
-    );
-    let mut active = open_backend(cap.backend)?;
+/// Open a backend, wait for its first RGB frame (bouncing the stream like the
+/// GUI does when a Kinect v1 opens silent), then let the pipeline settle for
+/// `wait_secs` so the detectors lock on. Shared by `--capture`/`--contribute`.
+fn open_and_settle(backend: Backend, wait_secs: f32) -> Result<Capture, String> {
+    let mut active = open_backend(backend)?;
     // Same stream-liveness recovery as the GUI, but blocking: wait for the
     // first RGB frame and bounce the stream up to MAX_STREAM_BOUNCES times
     // (the Kinect v1 sometimes opens without ever delivering a frame).
@@ -1253,17 +1302,28 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
         if bounce == MAX_STREAM_BOUNCES {
             return Err(format!(
                 "{}: no video after {MAX_STREAM_BOUNCES} stream restarts",
-                backend_slug(cap.backend)
+                backend_slug(backend)
             ));
         }
-        warn!(backend = ?cap.backend, next = bounce + 1, "headless: no first frame, bouncing stream");
+        warn!(backend = ?backend, next = bounce + 1, "headless: no first frame, bouncing stream");
         active.bounce_stream()?;
     }
-    let deadline = Instant::now() + Duration::from_secs_f32(cap.wait_secs.max(0.1));
+    let deadline = Instant::now() + Duration::from_secs_f32(wait_secs.max(0.1));
     while Instant::now() < deadline {
         poll_active_headless(&mut active);
         std::thread::sleep(Duration::from_millis(30));
     }
+    Ok(active)
+}
+
+fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
+    info!(
+        backend = ?cap.backend,
+        wait_secs = cap.wait_secs,
+        out = ?cap.out_path,
+        "headless capture starting"
+    );
+    let active = open_and_settle(cap.backend, cap.wait_secs)?;
 
     let (w, h, rgb) = active
         .last_rgb_frame
@@ -1284,17 +1344,15 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
         active.last_pose.as_ref(),
         active.last_lockbar.as_ref(),
     );
-    // Autocalibration + depth ground-truth (the lockbar homography focal/pose,
-    // and the measured Kinect depth at the bar).
+    // Depth ground-truth (the measured Kinect depth at the bar).
     meta.extend(autocalib_meta(
         active.last_lockbar.as_ref(),
         (w, h),
-        cap.lockbar_mm,
-        active.last_depth.as_ref(),
+        active.last_depth.as_deref(),
     ));
     // Surface the lockbar-derived geometry on stdout so an SSH-driven capture
     // round can read the cam↔bar distance + camera offset without opening the
-    // PNG. `ht_lockbar` == "none" here means U-seg never locked the bar.
+    // PNG. `ht_lockbar` == "none" here means anchor never locked the bar.
     for key in [
         "ht_lockbar",
         "ht_lockbar_width_px",
@@ -1304,9 +1362,6 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
         "ht_cam_offset_x_mm",
         "ht_cam_offset_y_mm",
         "ht_lockbar_slope_deg",
-        "ht_autocalib_fx",
-        "ht_autocalib_dist_mm",
-        "ht_autocalib_vp_fx",
         "ht_lockbar_depth_mm",
     ] {
         if let Some((_, v)) = meta.iter().find(|(k, _)| k == key) {
@@ -1321,7 +1376,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             h,
             &rgb,
             active.last_pose.as_ref(),
-            active.last_lockbar.as_ref(),
+            active.last_anchor.as_ref(),
             &meta,
         )?;
         p
@@ -1332,7 +1387,7 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
             h,
             &rgb,
             active.last_pose.as_ref(),
-            active.last_lockbar.as_ref(),
+            active.last_anchor.as_ref(),
             &meta,
         )?
     };
@@ -1346,69 +1401,131 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Same as `App::poll` minus the egui texture upload (we don't render
-/// anything in headless mode) and the depth → head-pose path (the
-/// screenshot only cares about RGB + head boxes + lockbar quad).
-fn poll_active_headless(active: &mut Active) {
-    match &mut active.inner {
-        Inner::KinectV2 { device, .. } => {
-            if let Some(rgb) = device.poll_rgb() {
-                let rgb888 = bgrx_to_rgb888(&rgb.data);
-                active
-                    .blaze_worker
-                    .submit(rgb888.clone(), rgb.width, rgb.height);
-                active.last_pose = active.blaze_worker.snapshot().pose;
-                active
-                    .u_worker
-                    .submit(rgb888.clone(), rgb.width, rgb.height);
-                let u_out = active.u_worker.snapshot();
-                active.last_u = u_out.u;
-                active.last_lockbar = u_out.lockbar;
-                active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
+/// Headless `--contribute <backend>`: capture EVERY stream the camera has
+/// (same file set as the GUI Contribute button), save locally under
+/// `contributions/` and upload to the write-only drop, then exit. Built for
+/// unattended cron runs that collect training data across lighting changes.
+fn run_headless_contribute(cap: CaptureArgs) -> Result<(), String> {
+    info!(
+        backend = ?cap.backend,
+        wait_secs = cap.wait_secs,
+        "headless contribution starting"
+    );
+    let mut active = open_and_settle(cap.backend, cap.wait_secs)?;
+
+    // v1: colour and IR share one USB endpoint — grab both explicitly
+    // through the momentary mode switch, exactly like the GUI does.
+    let (rgb_v1, ir_v1) = if let Inner::KinectV1 { device, .. } = &mut active.inner {
+        let rgb = match device.capture_rgb(3) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                warn!("contribution: v1 RGB capture failed: {e}");
+                None
             }
-            // Depth too, so the capture can cross-check the lockbar distance.
-            if let Some(depth) = device.poll_depth() {
-                active.last_depth = Some((
-                    depth.width,
-                    depth.height,
-                    depth.data.iter().map(|&z| z as u16).collect(),
-                ));
+        };
+        let ir = match device.capture_ir(3) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                warn!("contribution: v1 IR capture failed: {e}");
+                None
             }
+        };
+        (rgb, ir)
+    } else {
+        (None, None)
+    };
+
+    let (w, h, raw): (u32, u32, Vec<u8>) = match rgb_v1.as_ref() {
+        Some(f) => (f.width, f.height, f.data.clone()),
+        None => {
+            let (w, h, raw) = active
+                .last_rgb_frame
+                .as_ref()
+                .ok_or_else(|| format!("no RGB frame received in {:.1}s", cap.wait_secs))?;
+            (*w, *h, raw.as_ref().clone())
         }
-        Inner::KinectV1 { device, .. } => {
-            if let Some(rgb) = device.poll_rgb() {
-                active
-                    .blaze_worker
-                    .submit(rgb.data.clone(), rgb.width, rgb.height);
-                active.last_pose = active.blaze_worker.snapshot().pose;
-                active
-                    .u_worker
-                    .submit(rgb.data.clone(), rgb.width, rgb.height);
-                let u_out = active.u_worker.snapshot();
-                active.last_u = u_out.u;
-                active.last_lockbar = u_out.lockbar;
-                active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
-            }
-            if let Some(depth) = device.poll_depth() {
-                active.last_depth = Some((depth.width, depth.height, depth.data.clone()));
-            }
-        }
-        Inner::Webcam { camera } => {
-            if let Some(rgb) = camera.poll_rgb() {
-                active
-                    .blaze_worker
-                    .submit(rgb.data.clone(), rgb.width, rgb.height);
-                active.last_pose = active.blaze_worker.snapshot().pose;
-                active
-                    .u_worker
-                    .submit(rgb.data.clone(), rgb.width, rgb.height);
-                let u_out = active.u_worker.snapshot();
-                active.last_u = u_out.u;
-                active.last_lockbar = u_out.lockbar;
-                active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
-            }
-        }
+    };
+
+    let stem = contribution_stem(active.backend);
+    let mut meta = capture_meta(
+        active.backend,
+        (w, h),
+        &stem,
+        CabGeom {
+            table_incl_deg: cap.pf_deg,
+            lockbar_mm: cap.lockbar_mm,
+        },
+        active.last_head,
+        active.last_pose.as_ref(),
+        active.last_lockbar.as_ref(),
+    );
+    meta.extend(autocalib_meta(
+        active.last_lockbar.as_ref(),
+        (w, h),
+        active.last_depth.as_deref(),
+    ));
+    let det = bake_overlays(
+        w,
+        h,
+        &raw,
+        active.last_pose.as_ref(),
+        active.last_anchor.as_ref(),
+    );
+    let files = build_contribution_files(
+        &stem,
+        active.backend,
+        (w, h),
+        &raw,
+        &det,
+        active.last_depth.as_deref(),
+        active.last_ir.as_deref(),
+        ir_v1.as_ref(),
+        &meta,
+    );
+    if files.is_empty() {
+        return Err("no image could be encoded".to_string());
     }
+
+    let dir = contributions_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let uploader = contribute::Uploader::spawn();
+    let count = files.len();
+    for (name, bytes) in files {
+        if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
+            warn!(name, "contribution: local save failed: {e}");
+        }
+        println!("contribute: queuing {name} ({} KiB)", bytes.len() / 1024);
+        uploader.submit(name, bytes);
+    }
+    // Block until the upload queue drains — cron has no UI to watch it.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let st = uploader.status();
+        if st.pending == 0 {
+            if st.uploaded == count {
+                println!("contribute: OK — {count} file(s) uploaded ({stem})");
+                return Ok(());
+            }
+            return Err(format!(
+                "only {}/{count} file(s) uploaded — last error: {:?}",
+                st.uploaded, st.last_error
+            ));
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "upload timed out with {}/{count} file(s) done",
+                st.uploaded
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Same pipeline as the live capture loop, run inline (headless mode is
+/// single-threaded — no GL thread to publish to). `compute_head = false`: the
+/// screenshot only cares about RGB + pose + lockbar, not the depth deprojection.
+fn poll_active_headless(active: &mut Capture) {
+    active.poll_once(false, false);
 }
 
 // ============================================================ Backend dropdown
@@ -1420,6 +1537,14 @@ enum Backend {
     KinectV2,
     /// Index in the enumerated webcam list.
     Webcam(u32),
+}
+
+impl Backend {
+    /// `true` when this input produces 3D head poses (head-box + depth for
+    /// Kinect, head-box width triangulation for webcam). Only `None` doesn't.
+    fn has_head_tracker(self) -> bool {
+        !matches!(self, Backend::None)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1522,6 +1647,22 @@ fn detect_backends() -> Vec<BackendEntry> {
             }
         }
         Err(e) => warn!(?e, "scan: webcam enumerate failed"),
+    }
+
+    // Dev aid: HT_FAKE_CAMS=N appends N dummy entries so dropdown layout
+    // and switching UX can be exercised on a machine with no sensor
+    // plugged in. The entries reuse `Backend::Webcam` with ids far above
+    // anything SDL hands out; selecting one just fails to open, which is
+    // fine for UI work.
+    if let Ok(n) = std::env::var("HT_FAKE_CAMS")
+        && let Ok(n) = n.parse::<u32>()
+    {
+        for i in 0..n {
+            out.push(BackendEntry {
+                backend: Backend::Webcam(90_000 + i),
+                label: format!("Fake camera #{i} (HT_FAKE_CAMS)"),
+            });
+        }
     }
 
     info!(entries = out.len() - 1, "scan: complete");
@@ -1878,15 +2019,13 @@ enum SwitchState {
     Idle,
     /// The old backend was just closed; waiting out the release settle.
     Closing(Instant),
-    /// Settle done; showing "opening" before the actual open call.
+    /// Settle done; showing "opening" before spawning the capture thread.
     Opening(Instant),
-    /// Device opened; polling for the first RGB frame. If none arrives within
-    /// [`FIRST_FRAME_WAIT`] the stream is bounced (up to [`MAX_STREAM_BOUNCES`]
-    /// times, shown as "retry n/3") before the open is declared failed.
+    /// Capture thread spawned; polling its [`Startup`] handshake (device open +
+    /// first-frame recovery all happen on that thread). Goes live on
+    /// `Startup::Live`, or errors on `Failed` / after [`STARTUP_TIMEOUT`].
     Waiting {
-        active: Box<Active>,
-        /// Bounce attempts so far (0 = first wait, no bounce yet).
-        bounces: u8,
+        worker: CaptureWorker,
         since: Instant,
     },
 }
@@ -1936,6 +2075,10 @@ struct App {
     /// filter, the lockbar-centred picker (→ largest head), and most of the
     /// depth-sample gate — to see which stage is dropping the head.
     bypass_filters: bool,
+    /// Stream shown in the camera view (info bar selection). Reset to
+    /// [`StreamKind::Rgb`] on every backend change, since not every device
+    /// offers the same streams.
+    selected_stream: StreamKind,
     /// "Share a capture" window toggle + state.
     contribute_open: bool,
     /// The informed-consent checkbox (see the privacy notice). Gates the
@@ -2021,12 +2164,14 @@ impl App {
     /// each new frame). With no active camera we fall back to 60 Hz for a
     /// smooth menu; the input-event path repaints immediately regardless.
     fn target_frame_interval(&self) -> Duration {
-        let fps = self.active.as_ref().map_or(0.0, |a| a.metrics.in_fps);
-        if fps > 1.0 {
-            Duration::from_secs_f32(1.0 / (fps * 1.3))
-        } else {
-            Duration::from_secs_f32(1.0 / 60.0)
-        }
+        // FIXED cap, NOT a feedback off the measured fps. The old
+        // `1 / (in_fps * 1.3)` was self-referential — the redraw cadence was set
+        // from the measured fps, which is itself set by the redraw cadence. That
+        // control loop oscillated and pinned every backend well below the real
+        // camera rate (the ~20 fps variable ceiling). A fixed ~60 Hz cap lets the
+        // loop poll fast enough to catch every camera frame; `in_fps` then settles
+        // at the true camera/processing rate, and we still don't spin (VSync off).
+        Duration::from_secs_f32(1.0 / 60.0)
     }
 
     fn label_for(&self, backend: Backend) -> String {
@@ -2047,261 +2192,1036 @@ struct Active {
     backend: Backend,
     intrinsics: Intrinsics,
     rgb_texture: Option<TextureHandle>,
-    /// 1€-smoothed head pose. Same shape as the raw `HeadPixel` but the
-    /// position values come out of [`OneEuroPose3D`] so the crosshair and
-    /// the VPX delta panel stop jittering at the pixel level.
+    /// Dedicated capture thread that owns the device + models + 1€ filter and
+    /// publishes the latest processed frame. The GL thread never touches the
+    /// device — it only reads [`CaptureWorker::latest`] (see [`App::poll`]).
+    worker: CaptureWorker,
+    /// UI-only Kinect v1 tilt/LED widget state (`Some` only for v1). The
+    /// device commands go to the capture thread via [`CaptureWorker::cmd_tx`];
+    /// the live tilt read-out comes from [`CaptureWorker::tilt_state`].
+    v1_ui: Option<V1Controls>,
+    /// `frame_id` of the last frame the GL thread uploaded, so a repaint that
+    /// finds no new capture skips the texture upload + OUT count.
+    last_consumed_id: u64,
+    /// Cumulative capture count last seen — the IN counter advances by the
+    /// delta so every captured frame is counted even if the GL thread, running
+    /// slower, skipped some (that's exactly the `out < in` gap we want to show).
+    last_captured: u64,
+    /// Cumulative depth / IR counts last seen, same delta trick as
+    /// [`Self::last_captured`] — these streams run at their own rate, so their
+    /// deltas per GL tick are what make `depth`/`ir` fps meaningful.
+    last_depth_count: u64,
+    last_ir_count: u64,
+    /// When each stream last delivered (from the latest snapshot). Aged at draw
+    /// time by [`App::stream_bar`], so a stalled device goes red on its own
+    /// even though no further snapshot arrives to say so.
+    last_rgb_at: Option<Instant>,
+    last_ir_at: Option<Instant>,
+    last_depth_at: Option<Instant>,
+    /// Frame dims the pose / anchor coords live in (see [`LatestFrame`]); the
+    /// overlay normalises through these, not through the displayed texture.
+    pose_src: (u32, u32),
+    /// Nominal spec of the opened webcam mode (w, h, fps), for the info bar.
+    /// `None` for the Kinects, whose specs are fixed.
+    cam_spec: Option<(u32, u32, u32)>,
+    /// 1€-smoothed head pose (computed capture-side), copied out of the latest
+    /// published frame each GL tick for the crosshair + VPX delta panel.
     last_head: Option<HeadPixel>,
     baseline: Option<Baseline>,
-    inner: Inner,
-    /// `Some` only when [`Inner::KinectV1`] — drives the motorised base.
-    v1_controls: Option<V1Controls>,
-    pose_filter: filter_alias::OneEuroPose3D,
-    started_at: Instant,
-    /// Lockbar quad consumed by the overlay + 3D-centre maths. No longer
-    /// detected directly: it's *derived* from the closed edge of the U
-    /// segmentation (see [`u_to_lockbar_quad`]) — the closed bar of the U
-    /// is the lockbar, of known physical width.
+    /// Lockbar quad consumed by the overlay + 3D-centre maths, derived from the
+    /// anchor detection (its closed bar is the lockbar, of known physical width).
     last_lockbar: Option<headtracking::calibration::LockbarQuadRgb>,
-    /// Latest raw U-seg detection (mask + box) — backs the translucent
-    /// mask overlay and the derived [`last_lockbar`]. Snapshotted from the
-    /// [`u_worker`] each poll.
-    last_u: Option<u_onnx::UDetection>,
-    /// Background thread running the heavy (~330 ms) U-seg detector off the
-    /// UI thread. The poll loop submits the latest colour frame and reads
-    /// [`last_lockbar`] / [`last_u`] back from its snapshot — so the U warmup
-    /// no longer hitches rendering (see [`UWorker`]).
-    u_worker: UWorker,
-    /// Latest RGB888 frame (width, height, bytes) — kept so the
-    /// "Screenshot" button can write it to disk without re-grabbing
-    /// from the device. `None` until the first frame arrives.
-    last_rgb_frame: Option<(u32, u32, Vec<u8>)>,
-    /// Latest depth frame (width, height, millimetres) — kept so the
-    /// "Share a capture" button can export it alongside the RGB. `None` for
-    /// the webcam backend (no depth) and until the first depth poll. Stored
-    /// as `u16` mm (v1 is native `u16`; v2's `f32` mm is rounded on capture).
-    last_depth: Option<(u32, u32, Vec<u16>)>,
-    /// Latest IR frame (width, height, intensity as `u16`) — Kinect v2 only,
-    /// where IR streams alongside depth on the same listener. `None` for v1
-    /// (its IR needs a momentary video-mode switch, done on demand in
-    /// [`DemoShell::share_capture`]) and the webcam.
-    last_ir: Option<(u32, u32, Vec<u16>)>,
-    /// BlazePose worker (pose/head) — replaces the RGB head net + depth blob +
-    /// silhouette skeleton with one model read straight off the frame. Its 33
-    /// landmarks drive the head crosshair and (later) the hands↔lockbar player
-    /// selection so only the person holding the flipper is tracked.
-    blaze_worker: BlazePoseWorker,
+    /// Latest cabinet-frame geometry from the anchor model (RGB): lockbar
+    /// corners, sidebars, depth vanishing point, lockbar width, lateral offset.
+    last_anchor: Option<anchor::AnchorGeometry>,
+    /// `true` once the anchor worker froze its best detection (calibration
+    /// locked) — gates the camera-pose read-out so we only show a settled
+    /// estimate, not the warmup's churn.
+    anchor_locked: bool,
+    /// The geometry came from `anchor_fixed.json` (hand-placed lines), not the
+    /// model — the UI tag says so.
+    anchor_fixed: bool,
+    /// Latest RGB888 frame (width, height, bytes) — kept so the "Screenshot" /
+    /// "Share a capture" buttons can write it without re-grabbing. `Arc` so
+    /// copying it out of the published frame is a refcount bump, not a memcpy.
+    last_rgb_frame: Option<(u32, u32, Arc<Vec<u8>>)>,
+    /// Latest depth frame (width, height, millimetres) — kept for the "Share a
+    /// capture" export. `None` for the webcam backend (no depth). `u16` mm (v1
+    /// native; v2's `f32` mm rounded on capture). `Arc` for cheap hand-off.
+    last_depth: Option<Arc<(u32, u32, Vec<u16>)>>,
+    /// Kinect v2 depth projected into the colour framing, published only while
+    /// the depth stream is on screen. Preferred over [`Self::last_depth`] for
+    /// the *view* (the overlay then needs no coordinate mapping); the raw
+    /// `last_depth` stays the one exported with a shared capture.
+    last_depth_color: Option<Arc<(u32, u32, Vec<u16>)>>,
+    /// Latest IR frame (width, height, intensity as `u16`). Always present on
+    /// the v2 (IR shares the depth listener); on the v1 only while its video
+    /// endpoint is switched to IR, or after the momentary switch
+    /// [`App::share_capture`] performs. Never for the webcam.
+    last_ir: Option<Arc<(u32, u32, Vec<u16>)>>,
     last_pose: Option<blazepose::Pose>,
     /// Live perf counters (inference times, CPU%, in/out FPS). Reset per
     /// backend open — each device gets a fresh measurement window.
     metrics: Metrics,
 }
 
-/// How long a U detection stays valid before the [`UWorker`] re-runs
-/// inference. The playfield doesn't move while the camera is mounted, so
-/// refreshing every ~1.5 s gives the overlay a live feel without paying
-/// the ~330 ms tract cost on every frame.
-const U_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(1500);
+impl Active {
+    /// Build the GL-side handle once the capture thread reports `Live`. The
+    /// device + models live on the worker's thread; this side only renders.
+    fn new_live(worker: CaptureWorker, intrinsics: Intrinsics) -> Self {
+        let backend = worker.backend;
+        Self {
+            backend,
+            intrinsics,
+            rgb_texture: None,
+            worker,
+            v1_ui: if backend == Backend::KinectV1 {
+                Some(V1Controls::new())
+            } else {
+                None
+            },
+            last_consumed_id: 0,
+            last_captured: 0,
+            last_depth_count: 0,
+            last_ir_count: 0,
+            last_rgb_at: None,
+            last_ir_at: None,
+            last_depth_at: None,
+            pose_src: (0, 0),
+            cam_spec: match backend {
+                Backend::Webcam(id) => webcam_nominal_spec(id),
+                _ => None,
+            },
+            last_head: None,
+            baseline: None,
+            last_lockbar: None,
+            last_anchor: None,
+            anchor_locked: false,
+            anchor_fixed: false,
+            last_rgb_frame: None,
+            last_depth: None,
+            last_depth_color: None,
+            last_ir: None,
+            last_pose: None,
+            metrics: Metrics::new(),
+        }
+    }
+}
 
-/// Window between the first successful U detection and freezing the best
-/// one — at ~1.5 s cadence we collect 3-4 candidate masks and keep the
-/// highest-confidence one. After this elapses, the [`UWorker`] stops running
-/// until a backend switch respawns it.
-const U_WARMUP_DURATION: Duration = Duration::from_millis(2500);
+// ============================================================ Capture thread
+//
+// The device (Kinect / webcam), the pose + anchor models, and the 1€ filter
+// all live on ONE dedicated thread — the device handle never crosses a thread
+// boundary (so no `Send` bound is required on it). The GL thread only reads the
+// latest processed frame through a lock-free `ArcSwapOption`, decoupling render
+// (parallax, overlays) from capture: `in` counts every captured frame, `out`
+// only the ones the GL thread actually showed, so they diverge honestly.
 
-/// Latest RGB frame handed to the [`UWorker`]. Only the most recent one
-/// matters — the worker overwrites any still-unprocessed job.
-struct UJob {
-    rgb888: Vec<u8>,
+/// Everything the device pipeline owns on the capture thread. Also used by the
+/// headless `--capture` path (single-threaded there — see `poll_active_headless`).
+struct Capture {
+    backend: Backend,
+    intrinsics: Intrinsics,
+    inner: Inner,
+    /// Cross-process exclusivity on the device — held for the capture's
+    /// lifetime so the VPX plugin / a cron capture / a second demo fail
+    /// fast instead of fighting for the USB stream. `None` only between
+    /// `new_capture` and `open_backend` finishing.
+    hwlock: Option<headtracking::hwlock::HwLock>,
+    blaze_worker: BlazePoseWorker,
+    anchor_worker: AnchorWorker,
+    pose_filter: filter_alias::OneEuroPose3D,
+    started_at: Instant,
+    baseline: Option<Baseline>,
+    last_pose: Option<blazepose::Pose>,
+    last_head: Option<HeadPixel>,
+    last_anchor: Option<anchor::AnchorGeometry>,
+    last_lockbar: Option<headtracking::calibration::LockbarQuadRgb>,
+    last_rgb_frame: Option<(u32, u32, Arc<Vec<u8>>)>,
+    last_depth: Option<Arc<(u32, u32, Vec<u16>)>>,
+    last_ir: Option<Arc<(u32, u32, Vec<u16>)>>,
+    /// Cumulative depth frames grabbed. Diagnostic only — the depth stream runs
+    /// on its own listener, independent of RGB.
+    depth_frames: u64,
+    /// Cumulative IR frames grabbed. On the v2 this is diagnostic only (IR is
+    /// exported with a shared capture, nothing else); on a v1 switched to IR it
+    /// *is* the tracking input, since that sensor can't stream colour and IR at
+    /// once. Worth measuring either way because IR is **actively illuminated**
+    /// (the sensor lights the scene itself), so unlike the auto-exposed colour
+    /// stream its rate should NOT drop in a dark room — the reference against
+    /// which a low `in` tells us the colour camera, not USB or our code, is the
+    /// bottleneck.
+    ir_frames: u64,
+    /// When each stream last delivered a frame — the info bar's green/red.
+    /// `None` until the first frame of that kind ever arrives.
+    last_rgb_at: Option<Instant>,
+    last_ir_at: Option<Instant>,
+    last_depth_at: Option<Instant>,
+    /// Kinect v2 only: libfreenect2's depth↔colour registration, plus the
+    /// colour intrinsics that go with it. `None` on every other backend (the
+    /// v1 shares one sensor framing, the webcam has no depth), and `None` on
+    /// the v2 if the model couldn't be built — see [`Capture::reg_warned`].
+    registration: Option<freenect2::Registration>,
+    color_intr: Intrinsics,
+    /// Reused `1920 × 1082` colour-space depth buffer (~8 MB) — allocated once
+    /// per v2 open so the per-frame registration never reallocates.
+    bigdepth: Vec<f32>,
+    /// Scratch BGRX plane handed to the registration. Its *contents are never
+    /// read* for the bigdepth output (libfreenect2 only samples the colour
+    /// pixels to fill the `registered` frame, which we discard), but `apply()`
+    /// hard-checks the buffer's dimensions — so a zeroed plane is enough, and
+    /// we avoid retaining the real 8 MB colour frame just to satisfy it.
+    rgb_scratch: Vec<u8>,
+    /// `true` once [`Capture::bigdepth`] holds a registration of the current
+    /// depth frame; cleared when the registration is unavailable or failed.
+    bigdepth_ok: bool,
+    /// Latest registration cost (ms) and a one-shot flag so a failing or
+    /// missing registration warns once instead of every frame.
+    reg_ms: f32,
+    reg_warned: bool,
+    /// Which stream the user is viewing. Only used capture-side to skip
+    /// building the (2 M pixel) colour-space depth view unless it's on screen.
+    selected_stream: StreamKind,
+    /// When the colour frame was last polled+converted on the v2 while
+    /// tracking on IR — throttles that path to ~2.5 Hz (see the v2 arm).
+    last_rgb_refresh: Option<Instant>,
+    /// Pending [`CaptureCmd::RefreshRgb`] ack: while `Some`, the v2 arm
+    /// bypasses the colour throttle once and fires the ack right after the
+    /// fresh conversion lands.
+    rgb_refresh_ack: Option<mpsc::Sender<()>>,
+    /// Colour-space depth view (v2 only): bigdepth cropped to the 1920×1080
+    /// colour window, in `u16` mm with `0` = no reading. `Some` only while the
+    /// depth stream is selected — it shares the colour framing, so the pose and
+    /// anchor overlays land on it without any coordinate mapping.
+    depth_color: Option<Arc<(u32, u32, Vec<u16>)>>,
+    /// Dimensions of the frame the current pose / anchor were computed on.
+    /// Travels with the snapshot so the overlay maps through the right space
+    /// whichever stream the user is looking at.
+    pose_src: (u32, u32),
+    head_ms: f32,
+    anchor_ms: f32,
+    /// The anchor geometry came from `anchor_fixed.json` (hand-placed lines)
+    /// instead of the model — the worker is pre-locked and never runs.
+    anchor_fixed: bool,
+}
+
+impl Capture {
+    /// Push the live-tunable 1€ knobs onto the filter (cheap; keeps state).
+    /// The UI values drive X/Y; Z gets both knobs halved — depth is noisier
+    /// (median over a small window jitters as the sampling point shifts a
+    /// pixel), so it stays tighter. This preserves the per-axis profile from
+    /// [`make_pose_filter`] instead of flattening all three axes to the UI
+    /// values, which silently discarded the Z tuning.
+    fn set_filter_params(&mut self, min_cutoff: f32, beta: f32) {
+        let xy = filter_alias::OneEuroParams {
+            min_cutoff_hz: min_cutoff,
+            beta,
+            derivative_cutoff_hz: 1.0,
+        };
+        let z = filter_alias::OneEuroParams {
+            min_cutoff_hz: min_cutoff * 0.5,
+            beta: beta * 0.5,
+            derivative_cutoff_hz: 1.0,
+        };
+        self.pose_filter.set_params_per_axis([xy, xy, z]);
+    }
+
+    /// Colour-stream dimensions of this backend — known at open time (the
+    /// Kinect colour formats are fixed; the webcam reports its negotiated
+    /// mode), so the hand-fixed calibration can be validated before the
+    /// first frame arrives.
+    fn stream_dims(&self) -> (u32, u32) {
+        match &self.inner {
+            Inner::KinectV2 { .. } => (1920, 1080),
+            Inner::KinectV1 { .. } => (640, 480),
+            Inner::Webcam { camera } => (camera.width(), camera.height()),
+        }
+    }
+
+    /// Hand-fixed calibration: if `anchor_fixed.json` (next to the binary)
+    /// carries an entry for this backend whose dimensions match the actual
+    /// colour stream, build the geometry from the hand-placed lines, pre-set
+    /// it, and lock the anchor worker so the (still weak) model never runs.
+    /// Any mismatch or parse problem falls back to the live model with a
+    /// precise warning — the demo must never lose its anchor over a bad file.
+    fn apply_fixed_anchor(&mut self) {
+        let slug = backend_slug(self.backend);
+        let Some(entry) = load_fixed_anchor(&slug) else {
+            return; // no file / no entry — live model path, logged by caller
+        };
+        let (w, h) = self.stream_dims();
+        if (entry.img_w, entry.img_h) != (w, h) {
+            warn!(
+                slug,
+                file_dims = format!("{}x{}", entry.img_w, entry.img_h),
+                stream_dims = format!("{w}x{h}"),
+                "anchor_fixed.json entry ignored: annotated dimensions don't \
+                 match the live stream — falling back to the anchor model"
+            );
+            return;
+        }
+        let [sideleft, sideright, lockbar_player, lockbar_screen] = entry.lines;
+        match anchor::geometry_from_lines(sideleft, sideright, lockbar_player, lockbar_screen, w, h)
+        {
+            Some(g) => {
+                self.last_anchor = Some(g);
+                self.last_lockbar = Some(anchor_to_quad(&g, w, h));
+                self.anchor_fixed = true;
+                self.anchor_worker.force_lock();
+                info!(
+                    slug,
+                    "anchor: hand-fixed calibration loaded from anchor_fixed.json \
+                     — model will not run"
+                );
+            }
+            None => warn!(
+                slug,
+                "anchor_fixed.json entry ignored: degenerate lines (a rail is \
+                 parallel to the lockbar) — falling back to the anchor model"
+            ),
+        }
+    }
+
+    /// Poll the device once. Runs BlazePose + the anchor model, deprojects the
+    /// head from depth (when `compute_head`), and refreshes every `last_*`
+    /// buffer. Returns `true` iff a new RGB frame was grabbed this call.
+    fn poll_once(&mut self, bypass: bool, compute_head: bool) -> bool {
+        let depth_min = if bypass { 4 } else { 16 };
+        let mut got_rgb = false;
+        match &mut self.inner {
+            Inner::KinectV2 { device, .. } => {
+                // Unlike the v1, both streams flow at once here, so selecting IR
+                // is a choice of *tracking input*, not a mode switch: BlazePose
+                // reads whichever the user picked. Worth having — the IR emitter
+                // lights the scene itself and holds 30 Hz in a dark cabinet,
+                // where the auto-exposed colour camera halves to 15.
+                let track_on_ir = self.selected_stream == StreamKind::Ir;
+                // While tracking on IR, the colour frame feeds nothing but the
+                // stream-bar liveness and an occasional screenshot — yet
+                // converting it costs an 8.3 MB read + 6 MB write per frame at
+                // 30 Hz. Throttle the poll+convert to ~2.5 Hz (under the 500 ms
+                // liveness window, so the RGB chip stays green). The future VPX
+                // plugin should go further and simply open with
+                // `start_streams(false, true)` — never decode colour at all.
+                let want_rgb = !track_on_ir
+                    || self.rgb_refresh_ack.is_some()
+                    || self
+                        .last_rgb_refresh
+                        .is_none_or(|t| t.elapsed() >= Duration::from_millis(400));
+                if want_rgb && let Some(rgb) = device.poll_rgb() {
+                    self.last_rgb_at = Some(Instant::now());
+                    self.last_rgb_refresh = Some(Instant::now());
+                    // A contribution capture asked for an un-throttled frame:
+                    // it just landed, let the GL thread proceed.
+                    if let Some(ack) = self.rgb_refresh_ack.take() {
+                        let _ = ack.send(());
+                    }
+                    let rgb888 = Arc::new(bgrx_to_rgb888(&rgb.data));
+                    if !track_on_ir {
+                        got_rgb = true;
+                        self.blaze_worker
+                            .submit(Arc::clone(&rgb888), rgb.width, rgb.height);
+                        self.pose_src = (rgb.width, rgb.height);
+                        let pose_out = self.blaze_worker.snapshot();
+                        self.last_pose = pose_out.pose;
+                        if pose_out.ms > 0.0 {
+                            self.head_ms = pose_out.ms;
+                        }
+                    }
+                    self.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
+                }
+                // IR streams on the same listener as depth. Keep the latest for
+                // the capture export; f32 intensity rounds into u16.
+                if let Some(ir) = device.poll_ir() {
+                    self.ir_frames += 1;
+                    self.last_ir_at = Some(Instant::now());
+                    let mm: Vec<u16> = ir.data.iter().map(|&v| v as u16).collect();
+                    if track_on_ir {
+                        // Auto-level the raw intensity before handing it over —
+                        // v2 IR is a wide-range 16-bit signal, and the untouched
+                        // high byte is nearly black.
+                        got_rgb = true;
+                        let gray = autolevel_gray8_raw(&mm, false);
+                        let rgb888 = Arc::new(gray8_to_rgb888(&gray));
+                        self.blaze_worker.submit(rgb888, ir.width, ir.height);
+                        self.pose_src = (ir.width, ir.height);
+                        let pose_out = self.blaze_worker.snapshot();
+                        self.last_pose = pose_out.pose;
+                        if pose_out.ms > 0.0 {
+                            self.head_ms = pose_out.ms;
+                        }
+                    }
+                    self.last_ir = Some(Arc::new((ir.width, ir.height, mm)));
+                }
+                if let Some(depth) = device.poll_depth() {
+                    self.depth_frames += 1;
+                    self.last_depth_at = Some(Instant::now());
+                    // Project this depth frame into colour space. The colour and
+                    // depth lenses sit ~5 cm apart with different fields of view,
+                    // so scaling a colour coordinate into the 512×424 depth grid
+                    // by resolution ratio samples the wrong pixel — worse the
+                    // closer the player is. libfreenect2's registration is the
+                    // proper correction.
+                    // Skipped while tracking on IR: the pose is already in the
+                    // depth grid there, so the colour projection buys nothing —
+                    // and those milliseconds are exactly the headroom the IR
+                    // path exists to gain.
+                    // Also gated on a pose (or the depth view being watched):
+                    // with nobody in frame there is no head to sample, so the
+                    // 2 M-point projection would be pure waste.
+                    self.bigdepth_ok = false;
+                    if !track_on_ir
+                        && (self.last_pose.is_some() || self.selected_stream == StreamKind::Depth)
+                        && let Some(reg) = self.registration.as_mut()
+                    {
+                        let t0 = Instant::now();
+                        let ok = reg.bigdepth(&self.rgb_scratch, &depth.data, &mut self.bigdepth);
+                        self.reg_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                        self.bigdepth_ok = ok;
+                        if !ok && !self.reg_warned {
+                            self.reg_warned = true;
+                            warn!(
+                                "kinect v2: depth registration failed — falling back to \
+                                 depth-grid scaling for head distance"
+                            );
+                        }
+                    }
+                    // Rebuild the colour-space depth view only while it's the
+                    // stream on screen: it's a 2 M pixel conversion per frame.
+                    self.depth_color = (self.bigdepth_ok
+                        && self.selected_stream == StreamKind::Depth)
+                        .then(|| Arc::new((1920, 1080, bigdepth_to_mm_u16(&self.bigdepth))));
+                    if compute_head {
+                        let head = self
+                            .last_pose
+                            .as_ref()
+                            .and_then(|p| {
+                                if track_on_ir {
+                                    // Tracking on IR: the pose already lives in
+                                    // the depth camera's own grid (IR and depth
+                                    // are the same sensor, same 512×424, pixel
+                                    // aligned), so sampling is exact by
+                                    // construction — no registration involved.
+                                    head_pixel_from_pose_depth(
+                                        p,
+                                        self.pose_src,
+                                        &depth.data,
+                                        (depth.width, depth.height),
+                                        &self.intrinsics,
+                                        depth_min,
+                                    )
+                                } else if self.bigdepth_ok {
+                                    head_pixel_from_bigdepth(
+                                        p,
+                                        &self.bigdepth,
+                                        &self.color_intr,
+                                        depth_min,
+                                    )
+                                } else {
+                                    head_pixel_from_pose_depth(
+                                        p,
+                                        (1920, 1080),
+                                        &depth.data,
+                                        (depth.width, depth.height),
+                                        &self.intrinsics,
+                                        depth_min,
+                                    )
+                                }
+                            })
+                            .map(|mut h| {
+                                // v2 colour frame is mirrored → negate X so the
+                                // left/right POV travel matches v1. bigdepth
+                                // inherits the same colour framing, so the
+                                // correction applies to both paths alike.
+                                h.x_mm = -h.x_mm;
+                                h
+                            });
+                        let smoothed =
+                            smooth_head(head, &mut self.pose_filter, self.started_at, bypass);
+                        capture_baseline(&mut self.baseline, smoothed);
+                        self.last_head = smoothed;
+                    }
+                    self.last_depth = Some(Arc::new((
+                        depth.width,
+                        depth.height,
+                        depth.data.iter().map(|&z| z as u16).collect(),
+                    )));
+                }
+            }
+            Inner::KinectV1 { device, .. } => {
+                // One endpoint, one image: in IR mode there is no colour frame
+                // at all, so the IR frame *becomes* the pipeline input. Gray8 is
+                // expanded to RGB888 (byte replicated across R/G/B) and fed to
+                // BlazePose and the anchor model exactly like a colour frame —
+                // worth it because the IR emitter lights the scene itself, so it
+                // holds its rate in a dark cabinet where the auto-exposed colour
+                // camera halves.
+                if device.video_stream() == freenect::VideoStream::Ir {
+                    if let Some(ir) = device.poll_ir_frame() {
+                        got_rgb = true;
+                        self.ir_frames += 1;
+                        self.last_ir_at = Some(Instant::now());
+                        let rgb888 = Arc::new(gray8_to_rgb888(&ir.data));
+                        self.blaze_worker
+                            .submit(Arc::clone(&rgb888), ir.width, ir.height);
+                        self.pose_src = (ir.width, ir.height);
+                        let pose_out = self.blaze_worker.snapshot();
+                        self.last_pose = pose_out.pose;
+                        if pose_out.ms > 0.0 {
+                            self.head_ms = pose_out.ms;
+                        }
+                        // Displayed through the IR path (16-bit widened), and
+                        // kept as the RGB-shaped frame the rest of the pipeline
+                        // (anchor submit, screenshots) expects.
+                        self.last_ir = Some(Arc::new((
+                            ir.width,
+                            ir.height,
+                            ir.data.iter().map(|&v| u16::from(v)).collect(),
+                        )));
+                        self.last_rgb_frame = Some((ir.width, ir.height, rgb888));
+                    }
+                } else if let Some(rgb) = device.poll_rgb() {
+                    got_rgb = true;
+                    self.last_rgb_at = Some(Instant::now());
+                    let rgb888 = Arc::new(rgb.data);
+                    self.blaze_worker
+                        .submit(Arc::clone(&rgb888), rgb.width, rgb.height);
+                    self.pose_src = (rgb.width, rgb.height);
+                    let pose_out = self.blaze_worker.snapshot();
+                    self.last_pose = pose_out.pose;
+                    if pose_out.ms > 0.0 {
+                        self.head_ms = pose_out.ms;
+                    }
+                    self.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
+                }
+                if let Some(depth) = device.poll_depth() {
+                    self.depth_frames += 1;
+                    self.last_depth_at = Some(Instant::now());
+                    if compute_head {
+                        // Sampled straight from the native u16 grid — the old
+                        // full-frame u16→f32 widen copied 1.2 MB per frame to
+                        // feed a 17×17 window.
+                        let head = self.last_pose.as_ref().and_then(|p| {
+                            head_pixel_from_pose_depth(
+                                p,
+                                (640, 480),
+                                &depth.data,
+                                (depth.width, depth.height),
+                                &self.intrinsics,
+                                depth_min,
+                            )
+                        });
+                        let smoothed =
+                            smooth_head(head, &mut self.pose_filter, self.started_at, bypass);
+                        capture_baseline(&mut self.baseline, smoothed);
+                        self.last_head = smoothed;
+                    }
+                    self.last_depth =
+                        Some(Arc::new((depth.width, depth.height, depth.data.clone())));
+                }
+            }
+            Inner::Webcam { camera } => {
+                if let Some(rgb) = camera.poll_rgb() {
+                    got_rgb = true;
+                    self.last_rgb_at = Some(Instant::now());
+                    let rgb888 = Arc::new(rgb.data);
+                    self.blaze_worker
+                        .submit(Arc::clone(&rgb888), rgb.width, rgb.height);
+                    self.pose_src = (rgb.width, rgb.height);
+                    let pose_out = self.blaze_worker.snapshot();
+                    self.last_pose = pose_out.pose;
+                    if pose_out.ms > 0.0 {
+                        self.head_ms = pose_out.ms;
+                    }
+                    if compute_head {
+                        let head = self
+                            .last_pose
+                            .as_ref()
+                            .and_then(|p| head_pixel_from_pose_webcam(p, rgb.width, rgb.height));
+                        let smoothed =
+                            smooth_head(head, &mut self.pose_filter, self.started_at, bypass);
+                        capture_baseline(&mut self.baseline, smoothed);
+                        self.last_head = smoothed;
+                    }
+                    self.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
+                }
+            }
+        }
+        // Anchor model (RGB): submit the freshest frame until it locks (the
+        // worker throttles internally); snapshot the result every call.
+        let anchor_frame = self.last_rgb_frame.clone(); // cheap Arc bump
+        if let Some((w, h, buf)) = anchor_frame {
+            if got_rgb && !self.anchor_worker.is_locked() {
+                // Arc bump — the warmup window used to full-frame-copy here,
+                // right when the 1280² inference is already at its priciest.
+                self.anchor_worker.submit(Arc::clone(&buf), w, h);
+            }
+            let a_out = self.anchor_worker.snapshot();
+            if let Some(g) = a_out.geom {
+                self.last_anchor = Some(g);
+                self.last_lockbar = Some(anchor_to_quad(&g, w, h));
+            }
+            if self.anchor_worker.is_locked() {
+                self.anchor_ms = 0.0;
+            } else if a_out.ms > 0.0 {
+                self.anchor_ms = a_out.ms;
+            }
+        }
+        got_rgb
+    }
+
+    /// Build an immutable snapshot for the GL thread. Only called right after
+    /// `poll_once` returned `true`, so `last_rgb_frame` is `Some`.
+    fn snapshot_frame(&self, frame_id: u64, captured: u64) -> LatestFrame {
+        let (w, h, rgb888) = self
+            .last_rgb_frame
+            .clone()
+            .expect("snapshot_frame with no RGB frame");
+        LatestFrame {
+            frame_id,
+            captured,
+            depth_captured: self.depth_frames,
+            ir_captured: self.ir_frames,
+            w,
+            h,
+            rgb888,
+            depth: self.last_depth.clone(),
+            depth_color: self.depth_color.clone(),
+            ir: self.last_ir.clone(),
+            last_rgb_at: self.last_rgb_at,
+            last_ir_at: self.last_ir_at,
+            last_depth_at: self.last_depth_at,
+            pose_src_w: self.pose_src.0,
+            pose_src_h: self.pose_src.1,
+            pose: self.last_pose.clone(),
+            head: self.last_head,
+            baseline: self.baseline,
+            anchor: self.last_anchor,
+            lockbar: self.last_lockbar,
+            head_ms: self.head_ms,
+            anchor_ms: self.anchor_ms,
+            reg_ms: self.reg_ms,
+            anchor_locked: self.anchor_worker.is_locked(),
+            anchor_fixed: self.anchor_fixed,
+        }
+    }
+}
+
+/// Which of the device's streams the camera view shows.
+///
+/// On the Kinect v2 all three flow at once and this is purely a display
+/// choice. On the Kinect v1 colour and IR share one USB endpoint, so picking
+/// [`StreamKind::Ir`] genuinely *stops* the colour stream — which is the point:
+/// the info bar turns RGB red and IR green, and the trade-off becomes obvious
+/// without a word of documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Rgb,
+    Ir,
+    Depth,
+}
+
+impl StreamKind {
+    fn label(self) -> &'static str {
+        match self {
+            StreamKind::Rgb => "RGB",
+            StreamKind::Ir => "IR",
+            StreamKind::Depth => "Depth",
+        }
+    }
+}
+
+/// A stream a backend can deliver, with its **nominal** (datasheet) spec — the
+/// measured rates live in the `perf:` line, this bar answers "what does this
+/// device offer, and am I getting it right now?".
+struct StreamSpec {
+    kind: StreamKind,
     w: u32,
     h: u32,
+    fps: u32,
 }
 
-/// What the [`UWorker`] publishes after each round it runs.
-#[derive(Clone, Default)]
-struct UOut {
-    u: Option<u_onnx::UDetection>,
+impl StreamSpec {
+    fn caption(&self) -> String {
+        format!("{} {}×{} {}p", self.kind.label(), self.w, self.h, self.fps)
+    }
+}
+
+/// Streams each backend advertises. Kinect figures are the fixed sensor modes;
+/// the webcam's come from the opened format (SDL only ever gives us one mode).
+fn stream_specs(backend: Backend, cam: Option<(u32, u32, u32)>) -> Vec<StreamSpec> {
+    let s = |kind, w, h, fps| StreamSpec { kind, w, h, fps };
+    match backend {
+        Backend::KinectV2 => vec![
+            s(StreamKind::Rgb, 1920, 1080, 30),
+            s(StreamKind::Ir, 512, 424, 30),
+            s(StreamKind::Depth, 512, 424, 30),
+        ],
+        Backend::KinectV1 => vec![
+            s(StreamKind::Rgb, 640, 480, 30),
+            s(StreamKind::Ir, 640, 480, 30),
+            s(StreamKind::Depth, 640, 480, 30),
+        ],
+        Backend::Webcam(_) => {
+            let (w, h, fps) = cam.unwrap_or((640, 480, 30));
+            vec![s(StreamKind::Rgb, w, h, fps)]
+        }
+        Backend::None => Vec::new(),
+    }
+}
+
+/// Immutable snapshot the capture thread publishes once per new RGB frame,
+/// read by the GL thread through [`CaptureWorker::latest`].
+struct LatestFrame {
+    /// Increments per published frame; the GL thread uploads only when it changes.
+    frame_id: u64,
+    /// Cumulative count of captured RGB frames (drives the IN counter delta).
+    captured: u64,
+    /// Cumulative depth / IR frame counts. Published every RGB frame but
+    /// counted independently, so their rates stay correct even when the depth
+    /// stream outruns the colour one (v2 in a dark room).
+    depth_captured: u64,
+    ir_captured: u64,
+    w: u32,
+    h: u32,
+    rgb888: Arc<Vec<u8>>,
+    depth: Option<Arc<(u32, u32, Vec<u16>)>>,
+    /// Kinect v2 only, and only while the depth stream is selected: the depth
+    /// map projected into the 1920×1080 colour framing, so the overlay lands on
+    /// it with no coordinate mapping. Falls back to `depth` when absent.
+    depth_color: Option<Arc<(u32, u32, Vec<u16>)>>,
+    ir: Option<Arc<(u32, u32, Vec<u16>)>>,
+    /// When each stream last delivered, for the green/red info bar. Published
+    /// as instants rather than pre-computed booleans so the GL thread ages them
+    /// at *draw* time: if the device stalls outright no new snapshot arrives,
+    /// and baked-in booleans would sit there claiming green over a frozen
+    /// image. Timestamps go stale on their own.
+    last_rgb_at: Option<Instant>,
+    last_ir_at: Option<Instant>,
+    last_depth_at: Option<Instant>,
+    /// Frame dimensions the pose / anchor coordinates belong to. The overlay
+    /// must normalise through these, NOT through the displayed image: showing
+    /// the 512×424 depth view while the pose came from a 1920×1080 colour
+    /// frame would otherwise scatter the skeleton across the wrong pixels.
+    pose_src_w: u32,
+    pose_src_h: u32,
+    pose: Option<blazepose::Pose>,
+    head: Option<HeadPixel>,
+    baseline: Option<Baseline>,
+    anchor: Option<anchor::AnchorGeometry>,
     lockbar: Option<headtracking::calibration::LockbarQuadRgb>,
-    /// Last U inference time (ms); `0.0` until the first round completes.
-    u_ms: f32,
+    head_ms: f32,
+    anchor_ms: f32,
+    /// Cost of the v2 depth↔colour registration for this frame (ms); `0.0`
+    /// when it isn't running.
+    reg_ms: f32,
+    anchor_locked: bool,
+    anchor_fixed: bool,
 }
 
-/// Runs the heavy (~330 ms) U-seg detector off the UI thread. The UI submits
-/// the latest colour frame each poll and reads the newest lockbar back via
-/// [`UWorker::snapshot`] without ever blocking on inference — so the U warmup
-/// no longer hitches rendering. The best-of-warmup auto-lock lives here now
-/// (the cabinet camera is fixed, so freezing the lockbar after warmup is
-/// correct and frees the core); once locked the worker just idles.
-struct UWorker {
-    job: Arc<(Mutex<Option<UJob>>, Condvar)>,
-    out: Arc<Mutex<UOut>>,
+/// Device I/O the GL thread asks the capture thread to run (things outside the
+/// steady poll): the Kinect v1 motor + LED, a baseline reset, and the v1
+/// video grabs that may need a momentary mode switch.
+enum CaptureCmd {
+    SetTilt(f32),
+    SetLed(freenect::LedState),
+    ResetBaseline,
+    /// Grab one v1 IR frame (borrows the video endpoint if RGB is live, then
+    /// restores it); reply with the frame or `None` on failure / non-v1.
+    GrabIrV1(mpsc::Sender<Option<freenect::IrFrame>>),
+    /// Grab one v1 colour frame — the mirror of [`Self::GrabIrV1`], for the
+    /// contribution capture while the IR stream is selected. A contribution
+    /// must always export every stream a camera has, whatever is on screen.
+    GrabRgbV1(mpsc::Sender<Option<freenect::RgbFrame>>),
+    /// Ask for one un-throttled colour conversion (v2 tracking-on-IR throttles
+    /// colour to ~2.5 Hz); the ack fires once a fresh frame has been converted,
+    /// or immediately when no throttle is active. Used by the contribution
+    /// capture so `_raw.png` is never ~400 ms stale.
+    RefreshRgb(mpsc::Sender<()>),
+    /// Display-stream choice. Only the Kinect v1 acts on it at the device level
+    /// (colour and IR are mutually exclusive there); every other backend keeps
+    /// all its streams running and this stays a pure display concern.
+    SelectStream(StreamKind),
+}
+
+/// How long after its last frame a stream still counts as "live" in the info
+/// bar. Longer than a frame interval at 15 fps so a slow stream reads steady
+/// green, short enough that a stopped one turns red almost at once.
+const STREAM_LIVE_FOR: Duration = Duration::from_millis(500);
+
+/// Where the capture thread's open + first-frame handshake is at. Polled by the
+/// GL thread (see [`App::ensure_active`]) so the UI never blocks on the open.
+enum Startup {
+    Pending,
+    Live(Intrinsics),
+    Failed(String),
+}
+
+/// GL-side handle to the capture thread. Dropping it stops + joins the thread,
+/// which drops the device (the only place it lives).
+struct CaptureWorker {
+    backend: Backend,
+    latest: Arc<ArcSwapOption<LatestFrame>>,
+    cmd_tx: mpsc::Sender<CaptureCmd>,
+    /// Latest Kinect v1 tilt/accel read-out (v1 only), refreshed by the loop.
+    tilt_state: Arc<Mutex<Option<freenect::TiltState>>>,
+    startup: Arc<Mutex<Startup>>,
+    filter_min_cutoff: Arc<AtomicU32>,
+    filter_beta: Arc<AtomicU32>,
+    bypass: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    /// Set once the warmup best-of lock has frozen the lockbar; the worker then
-    /// idles, so callers can stop feeding it frames (and skip the colour
-    /// conversion that only fed it).
-    locked: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl UWorker {
-    fn spawn() -> Self {
-        let job = Arc::new((Mutex::new(None::<UJob>), Condvar::new()));
-        let out = Arc::new(Mutex::new(UOut::default()));
+impl CaptureWorker {
+    fn spawn(backend: Backend) -> Self {
+        let latest = Arc::new(ArcSwapOption::empty());
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let tilt_state = Arc::new(Mutex::new(None));
+        let startup = Arc::new(Mutex::new(Startup::Pending));
+        let filter_min_cutoff = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let filter_beta = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        let bypass = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let locked = Arc::new(AtomicBool::new(false));
-        let (job_t, out_t, stop_t, lock_t) = (
-            Arc::clone(&job),
-            Arc::clone(&out),
+        let (latest_t, tilt_t, startup_t, mc_t, beta_t, byp_t, stop_t) = (
+            Arc::clone(&latest),
+            Arc::clone(&tilt_state),
+            Arc::clone(&startup),
+            Arc::clone(&filter_min_cutoff),
+            Arc::clone(&filter_beta),
+            Arc::clone(&bypass),
             Arc::clone(&stop),
-            Arc::clone(&locked),
         );
         let handle = std::thread::Builder::new()
-            .name("u-detector".into())
-            .spawn(move || u_worker_loop(&job_t, &out_t, &stop_t, &lock_t))
-            .expect("spawn u-detector thread");
+            .name("capture".into())
+            .spawn(move || {
+                capture_thread_loop(
+                    backend, cmd_rx, &latest_t, &tilt_t, &startup_t, &mc_t, &beta_t, &byp_t,
+                    &stop_t,
+                );
+            })
+            .expect("spawn capture thread");
         Self {
-            job,
-            out,
+            backend,
+            latest,
+            cmd_tx,
+            tilt_state,
+            startup,
+            filter_min_cutoff,
+            filter_beta,
+            bypass,
             stop,
-            locked,
             handle: Some(handle),
         }
     }
 
-    /// Whether the warmup lock has fired (worker now idle — no need to submit).
-    fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Acquire)
-    }
-
-    /// Hand the worker the latest colour frame, replacing any pending one.
-    fn submit(&self, rgb888: Vec<u8>, w: u32, h: u32) {
-        *self.job.0.lock() = Some(UJob { rgb888, w, h });
-        self.job.1.notify_one();
-    }
-
-    /// Newest lockbar / U-seg the worker has produced. Never blocks on
-    /// inference — returns whatever the last completed round published.
-    fn snapshot(&self) -> UOut {
-        self.out.lock().clone()
+    /// Hand the live 1€ / bypass knobs to the capture thread (cheap atomics).
+    fn set_filter(&self, min_cutoff: f32, beta: f32, bypass: bool) {
+        self.filter_min_cutoff
+            .store(min_cutoff.to_bits(), Ordering::Relaxed);
+        self.filter_beta.store(beta.to_bits(), Ordering::Relaxed);
+        self.bypass.store(bypass, Ordering::Relaxed);
     }
 }
 
-impl Drop for UWorker {
+impl Drop for CaptureWorker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.job.1.notify_one();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 }
 
-/// Body of the U-detector thread: the same best-of-warmup auto-lock as before,
-/// just off the UI thread. Waits for a frame, throttles to
-/// [`U_RECOMPUTE_INTERVAL`], runs inference, keeps the highest-confidence U,
-/// and freezes after [`U_WARMUP_DURATION`].
-fn u_worker_loop(
-    job: &Arc<(Mutex<Option<UJob>>, Condvar)>,
-    out: &Arc<Mutex<UOut>>,
-    stop: &Arc<AtomicBool>,
-    locked_flag: &Arc<AtomicBool>,
-) {
-    let mut detector: Option<u_onnx::UDetector> = None;
-    let mut last_run_at: Option<Instant> = None;
-    let mut first_detection_at: Option<Instant> = None;
-    let mut locked = false;
-    let mut best_conf = 0.0f32;
-    let mut best_score = 0.0f32;
+/// Longest the GL thread waits for the capture thread to resolve `Startup`
+/// before declaring the open failed — generous cover over the internal
+/// bounce/settle budget so a wedged thread can't hang the switch machine.
+const STARTUP_TIMEOUT: Duration =
+    Duration::from_millis(FIRST_FRAME_WAIT.as_millis() as u64 * (MAX_STREAM_BOUNCES as u64 + 2));
 
-    loop {
-        // Block until a frame arrives (or we're asked to stop).
-        let item = {
-            let (lock, cvar) = &**job;
-            let mut slot = lock.lock();
-            while slot.is_none() && !stop.load(Ordering::Acquire) {
-                cvar.wait(&mut slot);
-            }
+/// The capture thread: open the device here (so its handle never leaves this
+/// thread), confirm the stream flows, then poll → publish until stopped.
+#[allow(clippy::too_many_arguments)]
+fn capture_thread_loop(
+    backend: Backend,
+    cmd_rx: mpsc::Receiver<CaptureCmd>,
+    latest: &Arc<ArcSwapOption<LatestFrame>>,
+    tilt_state: &Arc<Mutex<Option<freenect::TiltState>>>,
+    startup: &Arc<Mutex<Startup>>,
+    filter_min_cutoff: &Arc<AtomicU32>,
+    filter_beta: &Arc<AtomicU32>,
+    bypass: &Arc<AtomicBool>,
+    stop: &Arc<AtomicBool>,
+) {
+    let mut cap = match open_backend(backend) {
+        Ok(c) => c,
+        Err(e) => {
+            *startup.lock() = Startup::Failed(e);
+            return;
+        }
+    };
+    // Hand-fixed calibration (anchor_fixed.json): applied per open, so the
+    // file can be added/edited between backend switches without a restart.
+    cap.apply_fixed_anchor();
+    if !cap.anchor_fixed {
+        info!(?backend, "anchor: live model path (no fixed calibration)");
+    }
+    // Confirm the stream actually flows before going live (Kinect v1 can open
+    // yet never deliver a frame until the stream is bounced) — same recovery as
+    // the old `SwitchState::Waiting`, but on this thread so the UI never blocks.
+    let mut live = false;
+    'bounce: for bounce in 0..=MAX_STREAM_BOUNCES {
+        let deadline = Instant::now() + FIRST_FRAME_WAIT;
+        while Instant::now() < deadline {
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            slot.take()
-        };
-        let Some(item) = item else { continue };
-        if locked {
-            continue; // calibration frozen — drop the frame.
+            if cap.poll_first_rgb() {
+                live = true;
+                break 'bounce;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        let now = Instant::now();
-        if let Some(last) = last_run_at
-            && now.duration_since(last) < U_RECOMPUTE_INTERVAL
+        if bounce == MAX_STREAM_BOUNCES {
+            break;
+        }
+        warn!(
+            ?backend,
+            next = bounce + 1,
+            "capture: no first frame, bouncing stream"
+        );
+        if let Err(e) = cap.bounce_stream() {
+            *startup.lock() = Startup::Failed(e);
+            return;
+        }
+    }
+    if !live {
+        *startup.lock() = Startup::Failed(format!(
+            "{}: no video after {MAX_STREAM_BOUNCES} stream restarts — check the cable / USB",
+            backend_slug(backend)
+        ));
+        return;
+    }
+    *startup.lock() = Startup::Live(cap.intrinsics);
+    info!(
+        ?backend,
+        fx = cap.intrinsics.fx,
+        fy = cap.intrinsics.fy,
+        "capture thread live"
+    );
+
+    // One pose inference per frame — BlazePose (~7 ms) keeps up, no rate cap.
+    cap.blaze_worker.set_min_interval_ms(0);
+    let mut frame_id = 0u64;
+    let mut captured = 0u64;
+    let mut last_tilt_refresh = Instant::now() - Duration::from_millis(600);
+    while !stop.load(Ordering::Acquire) {
+        // Device I/O commands from the UI (v1 motor/LED, baseline, IR grab).
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                CaptureCmd::SetTilt(deg) => {
+                    if let Inner::KinectV1 { device, .. } = &cap.inner
+                        && let Err(e) = device.set_tilt_degrees(deg)
+                    {
+                        warn!(?e, "set_tilt failed");
+                    }
+                }
+                CaptureCmd::SetLed(led) => {
+                    if let Inner::KinectV1 { device, .. } = &cap.inner
+                        && let Err(e) = device.set_led(led)
+                    {
+                        warn!(?e, "set_led failed");
+                    }
+                }
+                CaptureCmd::ResetBaseline => cap.baseline = None,
+                CaptureCmd::SelectStream(kind) => {
+                    // Remembered so the v2 only pays for the colour-space depth
+                    // view while it's actually on screen.
+                    cap.selected_stream = kind;
+                    // Only the v1 trades one stream for another at the device
+                    // level; everywhere else every stream keeps flowing and the
+                    // choice is purely what the GL thread draws.
+                    if let Inner::KinectV1 { device, .. } = &mut cap.inner {
+                        let want = match kind {
+                            StreamKind::Ir => freenect::VideoStream::Ir,
+                            // Depth streams on its own endpoint, so viewing it
+                            // leaves the colour stream running.
+                            StreamKind::Rgb | StreamKind::Depth => freenect::VideoStream::Rgb,
+                        };
+                        if device.video_stream() != want {
+                            match device.set_video_stream(want) {
+                                Ok(()) => info!(?want, "kinect v1: video stream switched"),
+                                Err(e) => warn!(?e, ?want, "kinect v1: video switch failed"),
+                            }
+                        }
+                    }
+                }
+                CaptureCmd::GrabIrV1(reply) => {
+                    let frame = if let Inner::KinectV1 { device, .. } = &mut cap.inner {
+                        match device.capture_ir(3) {
+                            Ok(f) => Some(f),
+                            Err(e) => {
+                                warn!("contribution: v1 IR capture failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let _ = reply.send(frame);
+                }
+                CaptureCmd::GrabRgbV1(reply) => {
+                    let frame = if let Inner::KinectV1 { device, .. } = &mut cap.inner {
+                        match device.capture_rgb(3) {
+                            Ok(f) => Some(f),
+                            Err(e) => {
+                                warn!("contribution: v1 RGB capture failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let _ = reply.send(frame);
+                }
+                CaptureCmd::RefreshRgb(reply) => {
+                    // Only the v2-tracking-on-IR path throttles colour; in every
+                    // other state the latest colour frame is already fresh, so
+                    // ack straight away instead of parking the sender.
+                    let throttled = matches!(cap.inner, Inner::KinectV2 { .. })
+                        && cap.selected_stream == StreamKind::Ir;
+                    if throttled {
+                        cap.rgb_refresh_ack = Some(reply);
+                    } else {
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        }
+        // Refresh the v1 tilt/accel read-out every 500 ms (USB roundtrip).
+        if matches!(cap.inner, Inner::KinectV1 { .. })
+            && last_tilt_refresh.elapsed() >= Duration::from_millis(500)
         {
-            continue;
-        }
-        if detector.is_none() {
-            match u_onnx::UDetector::new() {
-                Ok(mut d) => {
-                    // Below the 0.25 default so the lockbar fires on the v1
-                    // 640×480 RGB (see the score history in git); on v2 the
-                    // strong lockbar still wins the best-of.
-                    d.set_score_threshold(0.10);
-                    info!("U-seg detector initialised (score_threshold=0.10)");
-                    detector = Some(d);
-                }
-                Err(e) => {
-                    warn!(?e, "U-seg detector init failed");
-                    last_run_at = Some(now);
-                    continue;
+            if let Inner::KinectV1 { device, .. } = &cap.inner {
+                match device.tilt_state() {
+                    Ok(s) => *tilt_state.lock() = Some(s),
+                    Err(e) => warn!(?e, "kinect v1: tilt_state refresh failed"),
                 }
             }
+            last_tilt_refresh = Instant::now();
         }
-        let det = detector.as_ref().expect("init checked above");
-        last_run_at = Some(now);
-        let t0 = Instant::now();
-        let dets = det.detect(&item.rgb888, item.w, item.h);
-        let u_ms = t0.elapsed().as_secs_f32() * 1000.0;
-        if let Some(best) = dets.into_iter().next() {
-            // Derive the U geometry, then keep the frame with the best *lock
-            // score* — a full 3-axis U (lockbar + both sidebars) beats any
-            // lockbar-only frame, so a frame where an arm merely fakes the bar
-            // can never win the calibration (see `u_lock_score`).
-            let quad = u_to_lockbar_quad(&best, det.mask_threshold(), item.w, item.h);
-            let score = quad
-                .as_ref()
-                .map_or(0.0, |q| u_lock_score(q, best.confidence));
-            if score > best_score {
-                best_score = score;
-                best_conf = best.confidence;
-                let both_rails = quad
-                    .as_ref()
-                    .is_some_and(|q| q.left_rail.is_some() && q.right_rail.is_some());
-                let mut o = out.lock();
-                if let Some(quad) = quad {
-                    o.lockbar = Some(quad);
-                }
-                o.u = Some(best);
-                o.u_ms = u_ms;
-                drop(o);
-                info!(
-                    score = best_score,
-                    conf = best_conf,
-                    three_axes = both_rails,
-                    "U: new best detection"
-                );
-                // Start the warmup window from the first usable geometry, so
-                // the lock freezes a short moment after we first see the U.
-                if first_detection_at.is_none() && score > 0.0 {
-                    first_detection_at = Some(now);
-                }
-            } else {
-                out.lock().u_ms = u_ms;
-            }
+        cap.set_filter_params(
+            f32::from_bits(filter_min_cutoff.load(Ordering::Relaxed)),
+            f32::from_bits(filter_beta.load(Ordering::Relaxed)),
+        );
+        let byp = bypass.load(Ordering::Relaxed);
+        if cap.poll_once(byp, true) {
+            captured += 1;
+            frame_id += 1;
+            latest.store(Some(Arc::new(cap.snapshot_frame(frame_id, captured))));
         } else {
-            out.lock().u_ms = u_ms;
-        }
-        if let Some(first) = first_detection_at
-            && now.duration_since(first) >= U_WARMUP_DURATION
-        {
-            locked = true;
-            locked_flag.store(true, Ordering::Release);
-            info!(best_conf, "U: warmup over, calibration locked");
+            // No new camera frame — yield briefly so we don't busy-spin.
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -2309,9 +3229,12 @@ fn u_worker_loop(
 // ---------------------------------------------------------------- Head worker
 
 /// Latest RGB frame handed to the [`HeadWorker`]. Only the most recent one
-/// matters — the worker overwrites any still-unprocessed job.
+/// matters — the worker overwrites any still-unprocessed job. The buffer is
+/// shared (`Arc`), not copied: the capture thread already keeps the same
+/// frame alive for display, so a submit is a pointer bump instead of a
+/// 6 MB memcpy per frame.
 struct HeadJob {
-    rgb888: Vec<u8>,
+    rgb888: Arc<Vec<u8>>,
     w: u32,
     h: u32,
 }
@@ -2367,7 +3290,7 @@ impl BlazePoseWorker {
         self.interval_ms.store(ms, Ordering::Relaxed);
     }
 
-    fn submit(&self, rgb888: Vec<u8>, w: u32, h: u32) {
+    fn submit(&self, rgb888: Arc<Vec<u8>>, w: u32, h: u32) {
         *self.job.0.lock() = Some(HeadJob { rgb888, w, h });
         self.job.1.notify_one();
     }
@@ -2425,284 +3348,206 @@ fn blazepose_worker_loop(
         };
         last_run = Instant::now();
         let t0 = Instant::now();
-        match bp.detect(&rgb888, w, h) {
+        // `poll` = MediaPipe detect-once-then-track: skips the detector while a
+        // subject is tracked, so a still skeleton no longer trembles.
+        match bp.poll(&rgb888, w, h) {
             Ok(pose) => {
                 let ms = t0.elapsed().as_secs_f32() * 1000.0;
                 let mut o = out.lock();
                 o.pose = pose;
                 o.ms = ms;
             }
-            Err(e) => warn!("blazepose detect: {e}"),
+            Err(e) => warn!("blazepose poll: {e}"),
         }
     }
 }
 
-/// Score a candidate U for the best-of-warmup lock. The camera and lockbar
-/// are fixed, so we freeze the single best frame — and "best" must mean the
-/// most complete real-world reference, NOT the highest raw mask confidence.
-/// A full **3-axis** U (lockbar + both sidebars) dominates any partial one, so
-/// a frame where a player's arm fakes a bright bar (but yields no proper rails
-/// on the open side) can never win the calibration. Ties: total rail length,
-/// then U confidence.
-fn u_lock_score(q: &headtracking::calibration::LockbarQuadRgb, conf: f32) -> f32 {
-    // NOTE: do NOT reward rail *length* — on this overhead camera the longest
-    // "rails" are the players' bodies standing behind the bar. Rails are now
-    // band-limited + corner-attached at extraction, so their mere presence is
-    // the signal; U confidence breaks ties.
-    let axes_bonus = match (q.left_rail.is_some(), q.right_rail.is_some()) {
-        (true, true) => 10_000.0, // the 3 axes — the frame we want to lock
-        (true, false) | (false, true) => 1_000.0,
-        (false, false) => 0.0, // lockbar only
-    };
-    axes_bonus + conf * 100.0
+/// What the [`AnchorWorker`] publishes after each inference.
+#[derive(Clone, Default)]
+struct AnchorOut {
+    geom: Option<anchor::AnchorGeometry>,
+    /// Last inference time (ms); `0.0` until the first detection.
+    ms: f32,
 }
 
-/// Derive the lockbar quad — the *closed* bar of the U, of known physical
-/// width — from a U-seg detection. We don't assume it sits at a fixed
-/// image edge: with the camera mounted above the backglass the U reads as
-/// an inverted ∩, closed end near the top. So we scan the proto mask row
-/// by row; the closed bar is the band of rows that are *filled across*,
-/// sitting at one vertical extremity, while the open rails are the rows
-/// where only two thin runs survive (low fill). We pick that band and box
-/// its top + bottom edges into a (perspective) trapezoid, mapped back to
-/// original-image pixels. Returns `None` when the mask is empty or the
-/// derived bar collapses to a sliver.
-fn u_to_lockbar_quad(
-    det: &u_onnx::UDetection,
-    thr: f32,
+/// Runs the cabinet **anchor** model (YOLO-pose, 6 keypoints) off the UI thread,
+/// on RGB — same submit/snapshot pattern as [`BlazePoseWorker`]. Throttled: the
+/// cabinet is fixed, so a low rate is plenty and keeps the UI smooth.
+struct AnchorWorker {
+    job: Arc<(Mutex<Option<HeadJob>>, Condvar)>,
+    out: Arc<Mutex<AnchorOut>>,
+    stop: Arc<AtomicBool>,
+    /// Set once the best-of-warmup detection is frozen (the cabinet is fixed).
+    locked: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AnchorWorker {
+    fn spawn() -> Self {
+        let job = Arc::new((Mutex::new(None::<HeadJob>), Condvar::new()));
+        let out = Arc::new(Mutex::new(AnchorOut::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let locked = Arc::new(AtomicBool::new(false));
+        let (job_t, out_t, stop_t, locked_t) = (
+            Arc::clone(&job),
+            Arc::clone(&out),
+            Arc::clone(&stop),
+            Arc::clone(&locked),
+        );
+        let handle = std::thread::Builder::new()
+            .name("anchor".into())
+            .spawn(move || anchor_worker_loop(&job_t, &out_t, &stop_t, &locked_t))
+            .expect("spawn anchor thread");
+        Self {
+            job,
+            out,
+            stop,
+            locked,
+            handle: Some(handle),
+        }
+    }
+
+    /// True once the warmup froze the best detection (the caller stops submitting).
+    fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Acquire)
+    }
+
+    /// Hand-fixed calibration: lock immediately so the model never runs (the
+    /// caller pre-sets the geometry from `anchor_fixed.json`). Called right
+    /// after spawn — the worker loop checks the flag before loading the ONNX
+    /// session, so in the common case the model is never even built (CPU and
+    /// memory saved); if the load already started, the worker just parks
+    /// unused, which is equally correct.
+    fn force_lock(&self) {
+        self.locked.store(true, Ordering::Release);
+        self.job.1.notify_one();
+    }
+
+    fn submit(&self, rgb888: Arc<Vec<u8>>, w: u32, h: u32) {
+        *self.job.0.lock() = Some(HeadJob { rgb888, w, h });
+        self.job.1.notify_one();
+    }
+
+    fn snapshot(&self) -> AnchorOut {
+        self.out.lock().clone()
+    }
+}
+
+impl Drop for AnchorWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.job.1.notify_one();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn anchor_worker_loop(
+    job: &Arc<(Mutex<Option<HeadJob>>, Condvar)>,
+    out: &Arc<Mutex<AnchorOut>>,
+    stop: &Arc<AtomicBool>,
+    locked: &Arc<AtomicBool>,
+) {
+    // Hand-fixed calibration (`anchor_fixed.json`): the lock is set before the
+    // first frame, so skip the ONNX session build entirely — the model would
+    // never be submitted anyway. Best-effort (see `AnchorWorker::force_lock`).
+    if locked.load(Ordering::Acquire) {
+        while !stop.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        return;
+    }
+    let mut det = match anchor::AnchorDetector::new() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("anchor init failed: {e}");
+            return;
+        }
+    };
+    // Throttle inference; the cabinet is fixed so a low rate is plenty.
+    const INTERVAL: Duration = Duration::from_millis(400);
+    // Keep the best-scoring detection for this long after the first hit, then
+    // freeze it — the camera + cabinet don't move.
+    const WARMUP: Duration = Duration::from_millis(2500);
+    let mut last_run = Instant::now();
+    let mut warmup_start: Option<Instant> = None;
+    let mut best_score = 0.0f32;
+    loop {
+        while last_run.elapsed() < INTERVAL {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let job_item = {
+            let (lock, cvar) = &**job;
+            let mut slot = lock.lock();
+            while slot.is_none() && !stop.load(Ordering::Acquire) {
+                cvar.wait(&mut slot);
+            }
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            slot.take()
+        };
+        let Some(HeadJob { rgb888, w, h }) = job_item else {
+            continue;
+        };
+        last_run = Instant::now();
+        // Start the warmup clock on the first INFERENCE RUN, not the first
+        // detection. The 1280² model on CPU costs ~180 ms; the proof model
+        // detects only sporadically on a real scene, so gating the clock (and
+        // the lock) on `Some` meant the worker could re-run forever — pinning
+        // the CPU and dragging the camera down. The cabinet is fixed, so we run
+        // for a bounded warmup then FREEZE regardless.
+        let start = *warmup_start.get_or_insert_with(Instant::now);
+        let t0 = Instant::now();
+        let detn = det.detect(&rgb888, w, h);
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        match detn {
+            Some(d) => {
+                if d.score >= best_score {
+                    best_score = d.score;
+                    let mut o = out.lock();
+                    o.geom = Some(d.geometry(w, h));
+                    o.ms = ms;
+                }
+            }
+            None => out.lock().ms = ms,
+        }
+        // Freeze after the warmup — Some or None — and stop running inference
+        // for good (the caller stops submitting once `is_locked`).
+        if start.elapsed() >= WARMUP {
+            locked.store(true, Ordering::Release);
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return;
+        }
+    }
+}
+
+/// Build a [`LockbarQuadRgb`] from the anchor geometry so the existing autocalib
+/// + capture-overlay paths consume the anchor detection unchanged.
+fn anchor_to_quad(
+    geom: &anchor::AnchorGeometry,
     w: u32,
     h: u32,
-) -> Option<headtracking::calibration::LockbarQuadRgb> {
-    let n = u_onnx::PROTO_SIDE;
-    let mask = &det.proto_mask;
-    // Per proto row: leftmost / rightmost "on" column + filled-cell count.
-    let mut row_left = vec![0usize; n];
-    let mut row_right = vec![0usize; n];
-    let mut row_count = vec![0u32; n];
-    let (mut py_min, mut py_max) = (usize::MAX, 0usize);
-    for py in 0..n {
-        let base = py * n;
-        let (mut l, mut r, mut cnt) = (usize::MAX, 0usize, 0u32);
-        for px in 0..n {
-            if mask[base + px] >= thr {
-                if px < l {
-                    l = px;
-                }
-                r = px;
-                cnt += 1;
-            }
-        }
-        row_count[py] = cnt;
-        if cnt > 0 {
-            row_left[py] = l;
-            row_right[py] = r;
-            py_min = py_min.min(py);
-            py_max = py;
-        }
-    }
-    if py_min > py_max {
-        return None; // empty mask
-    }
-    let cmax = row_count.iter().copied().max().unwrap_or(0);
-    if cmax == 0 {
-        return None;
-    }
-    // "Filled across" cut — separates the closed bar (≈full width) from
-    // the two-rail region (two thin runs with a gap).
-    let fill_t = (cmax as f32 * 0.6).ceil() as u32;
-    let is_bar = |py: usize| row_count[py] >= fill_t;
-    // How many contiguous filled rows hang off the top extremity…
-    let mut top_end = py_min;
-    while top_end <= py_max && is_bar(top_end) {
-        top_end += 1;
-    }
-    let top_rows = top_end - py_min; // band = [py_min, top_end)
-    // …and off the bottom extremity.
-    let mut bot_start = py_max + 1;
-    while bot_start > py_min && is_bar(bot_start - 1) {
-        bot_start -= 1;
-    }
-    let bot_rows = (py_max + 1) - bot_start; // band = [bot_start, py_max]
-    // The lockbar is the thicker filled band; a clean U fills only one end.
-    let (bar_y0, bar_y1) = if top_rows >= bot_rows && top_rows > 0 {
-        (py_min, top_end - 1)
-    } else if bot_rows > 0 {
-        (bot_start, py_max)
-    } else {
-        // No filled band at all (degenerate) — fall back to the single
-        // widest row so we still emit a usable quad.
-        let py = (0..n).max_by_key(|&py| row_count[py]).unwrap_or(py_min);
-        (py, py)
-    };
-    let edge = |py: usize| -> Option<(usize, usize)> {
-        (row_count[py] > 0).then_some((row_left[py], row_right[py]))
-    };
-    let (tl_px, tr_px) = edge(bar_y0)?;
-    let (bl_px, br_px) = edge(bar_y1)?;
-    let clamp = |(x, y): (f32, f32)| -> (u32, u32) {
-        (
-            x.round().clamp(0.0, (w.saturating_sub(1)) as f32) as u32,
-            y.round().clamp(0.0, (h.saturating_sub(1)) as f32) as u32,
-        )
-    };
-    let tl = clamp(det.proto_to_image(tl_px, bar_y0));
-    let tr = clamp(det.proto_to_image(tr_px, bar_y0));
-    let br = clamp(det.proto_to_image(br_px, bar_y1));
-    let bl = clamp(det.proto_to_image(bl_px, bar_y1));
-    let mean_w = (tr.0.saturating_sub(tl.0) + br.0.saturating_sub(bl.0)) / 2;
-    if mean_w < 4 {
-        return None;
-    }
-    let slope_deg = (tr.1 as f32 - tl.1 as f32)
-        .atan2(tr.0 as f32 - tl.0 as f32)
-        .to_degrees();
-    let thickness_px = (((bl.1 + br.1) as f32 - (tl.1 + tr.1) as f32) * 0.5).abs() as u32;
-    let n_inliers = (det.confidence * 100.0).clamp(0.0, 1_000.0) as u32;
-
-    // --- Sidebars (the rails of the U). Only the part *near* the lockbar is a
-    //     real rail; further out on the open side is the receding playfield —
-    //     or, from this overhead camera, the players standing behind the bar.
-    //     So: (1) open side only, never past the bar; (2) a short band right
-    //     next to the bar (a body read as a long rail is cut off); (3) each
-    //     rail must *start at* the matching lockbar corner (attachment). Fit a
-    //     straight line to each rail-row's outer edge, with outlier rejection
-    //     so a forearm laid across it does not bend it. Emitted `[near, far]`.
-    const RAIL_ATTACH_TOL: f32 = 6.0; // proto px: rail base must meet the corner
-    // The rails follow the PLAYFIELD, which is the side of the lockbar carrying
-    // the most mask (the bright lit table) — NOT the sparse player side. Using
-    // raw fill instead of "which extremity is the bar" stops the rails from
-    // shooting up a player standing right behind the bar. `bar_at_top` here
-    // means "playfield is below the bar → rails go down (large py)". The rails
-    // then span the WHOLE playfield side: from the lockbar corner down to the
-    // near/bottom edge of the visible playfield.
-    let fill_below: u64 = if bar_y1 < py_max {
-        row_count[bar_y1 + 1..=py_max]
-            .iter()
-            .map(|&c| u64::from(c))
-            .sum()
-    } else {
-        0
-    };
-    let fill_above: u64 = if bar_y0 > py_min {
-        row_count[py_min..bar_y0]
-            .iter()
-            .map(|&c| u64::from(c))
-            .sum()
-    } else {
-        0
-    };
-    let bar_at_top = fill_below >= fill_above;
-    let (band_lo, band_hi) = if bar_at_top {
-        ((bar_y1 + 1).min(py_max), py_max)
-    } else {
-        (py_min, bar_y0.saturating_sub(1).max(py_min))
-    };
-    // Lockbar edge on the open side — where the rails must attach.
-    let open_bar_row = if bar_at_top { bar_y1 } else { bar_y0 };
-    let bar_left_x = row_left[open_bar_row] as f32;
-    let bar_right_x = row_right[open_bar_row] as f32;
-    let mut left_pts: Vec<(f32, f32)> = Vec::new();
-    let mut right_pts: Vec<(f32, f32)> = Vec::new();
-    let (mut rail_lo, mut rail_hi) = (usize::MAX, 0usize);
-    if band_lo <= band_hi {
-        for py in band_lo..=band_hi {
-            if row_count[py] == 0 {
-                continue; // empty row — nothing to attach a rail to
-            }
-            // The two rails are the LEFT and RIGHT edges of the mask on this
-            // row — whether or not the row is "filled across" (a bright solid
-            // playfield fills the near-lockbar rows, and its two side edges ARE
-            // the rails). Fitting each edge over the band gives one rail per
-            // side; band + attachment keep them short and at the corners.
-            left_pts.push((row_left[py] as f32, py as f32));
-            right_pts.push((row_right[py] as f32, py as f32));
-            rail_lo = rail_lo.min(py);
-            rail_hi = rail_hi.max(py);
-        }
-    }
-    let make_rail = |pts: &[(f32, f32)], bar_edge_x: f32| -> Option<[(u32, u32); 2]> {
-        let (a, b, _) = fit_rail(pts)?;
-        // near = lockbar-adjacent extremity, far = open extremity.
-        let (y_near, y_far) = if bar_at_top {
-            (rail_lo, rail_hi)
-        } else {
-            (rail_hi, rail_lo)
-        };
-        let near_x = a * y_near as f32 + b;
-        // The rail base must meet the lockbar corner, else it is not a rail.
-        if (near_x - bar_edge_x).abs() > RAIL_ATTACH_TOL {
-            return None;
-        }
-        let at = |x: f32, y: usize| -> (u32, u32) {
-            let xc = x.round().clamp(0.0, (n.saturating_sub(1)) as f32) as usize;
-            clamp(det.proto_to_image(xc, y))
-        };
-        Some([at(near_x, y_near), at(a * y_far as f32 + b, y_far)])
-    };
-    let (left_rail, right_rail) = if rail_lo <= rail_hi {
-        (
-            make_rail(&left_pts, bar_left_x),
-            make_rail(&right_pts, bar_right_x),
-        )
-    } else {
-        (None, None)
-    };
-
-    Some(headtracking::calibration::LockbarQuadRgb {
+) -> headtracking::calibration::LockbarQuadRgb {
+    let px = |p: (f32, f32)| (p.0.max(0.0) as u32, p.1.max(0.0) as u32);
+    let c = geom.corners; // [player_L, player_R, screen_R, screen_L]
+    headtracking::calibration::LockbarQuadRgb {
         frame_width: w,
         frame_height: h,
-        corners: [tl, tr, br, bl],
-        slope_deg,
-        thickness_px,
-        n_inliers_top: n_inliers,
-        n_inliers_bottom: n_inliers,
-        left_rail,
-        right_rail,
-    })
-}
-
-/// Max distance (proto-grid px, 160-side) a rail point may sit from the
-/// first-pass line and still count — a forearm laid across a rail bulges well
-/// past this, so it is dropped before the refit.
-const RAIL_OUTLIER_PX: f32 = 3.5;
-
-/// Least-squares fit of a near-vertical rail as `x = a*y + b`, with one refit
-/// after dropping points more than [`RAIL_OUTLIER_PX`] off the first line — so
-/// a forearm laid across a rail is rejected rather than bending it. Returns
-/// `(a, b, inlier_count)`, or `None` when too few points survive.
-fn fit_rail(pts: &[(f32, f32)]) -> Option<(f32, f32, usize)> {
-    const MIN_PTS: usize = 4;
-    if pts.len() < MIN_PTS {
-        return None;
+        corners: [px(c[0]), px(c[1]), px(c[2]), px(c[3])],
+        slope_deg: 0.0,
+        thickness_px: (c[0].1 - c[3].1).abs() as u32,
+        n_inliers_top: 100,
+        n_inliers_bottom: 100,
+        left_rail: Some([px(geom.left_sidebar.0), px(geom.left_sidebar.1)]),
+        right_rail: Some([px(geom.right_sidebar.0), px(geom.right_sidebar.1)]),
     }
-    let lsq = |pts: &[(f32, f32)]| -> Option<(f32, f32)> {
-        let n = pts.len() as f32;
-        let (mut sy, mut sx, mut syy, mut sxy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        for &(x, y) in pts {
-            sy += y;
-            sx += x;
-            syy += y * y;
-            sxy += x * y;
-        }
-        let den = n * syy - sy * sy;
-        if den.abs() < 1e-3 {
-            return None; // all points on one row — undefined slope
-        }
-        let a = (n * sxy - sy * sx) / den;
-        let b = (sx - a * sy) / n;
-        Some((a, b))
-    };
-    let (a, b) = lsq(pts)?;
-    let inliers: Vec<(f32, f32)> = pts
-        .iter()
-        .copied()
-        .filter(|&(x, y)| (x - (a * y + b)).abs() <= RAIL_OUTLIER_PX)
-        .collect();
-    if inliers.len() < MIN_PTS {
-        return None;
-    }
-    let (a2, b2) = lsq(&inliers)?;
-    Some((a2, b2, inliers.len()))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2718,9 +3563,9 @@ struct Vec3Mm {
 /// Returns `None` when the quad is degenerate.
 ///
 /// Webcam intrinsics are zero at construction time (no per-camera
-/// calibration yet), so we fall back to the same approximation
-/// `head_to_pixel_webcam` uses — fx ≈ 0.85 × frame_width — keyed off the
-/// frame dimensions stored in the quad itself.
+/// calibration yet), so we fall back to the shared nominal focal
+/// [`WEBCAM_FX_PER_WIDTH`], keyed off the frame dimensions stored in the
+/// quad itself.
 fn lockbar_3d_center(
     quad: &headtracking::calibration::LockbarQuadRgb,
     intr: &Intrinsics,
@@ -2732,7 +3577,7 @@ fn lockbar_3d_center(
     let fx = if intr.fx > 0.0 {
         intr.fx
     } else {
-        0.85 * quad.frame_width as f32
+        WEBCAM_FX_PER_WIDTH * quad.frame_width as f32
     };
     let fy = if intr.fy > 0.0 { intr.fy } else { fx };
     let cx = if intr.cx > 0.0 {
@@ -2785,7 +3630,9 @@ struct V1Controls {
     selected_led: freenect::LedState,
     last_sent_led: freenect::LedState,
     last_state: Option<freenect::TiltState>,
-    last_refresh: Instant,
+    /// Set once the slider has been seeded to the device's real tilt from the
+    /// first shared read-out, so it doesn't snap from 0 on first use.
+    seeded: bool,
 }
 
 impl V1Controls {
@@ -2796,8 +3643,7 @@ impl V1Controls {
             selected_led: freenect::LedState::Green,
             last_sent_led: freenect::LedState::Green,
             last_state: None,
-            // Seed with a stale instant so the first poll triggers a refresh.
-            last_refresh: Instant::now() - Duration::from_secs(60),
+            seeded: false,
         }
     }
 }
@@ -2824,18 +3670,7 @@ enum Inner {
     },
 }
 
-impl Inner {
-    /// `true` when this input pipeline produces 3D head poses (head-box +
-    /// depth for Kinect, head-box width triangulation for webcam).
-    fn has_head_tracker(&self) -> bool {
-        matches!(
-            self,
-            Inner::KinectV1 { .. } | Inner::KinectV2 { .. } | Inner::Webcam { .. }
-        )
-    }
-}
-
-impl Active {
+impl Capture {
     /// Non-blocking check for whether the RGB stream has produced a frame yet.
     /// Consumes that frame (the poll loop will get the next one) — used only to
     /// confirm the stream is alive right after opening.
@@ -2882,22 +3717,139 @@ impl Active {
 /// deproject through the IR intrinsics. Mirrors [`head_pixel_from_depth`] but
 /// keyed on the pose's nose instead of a head bbox — the depth path once
 /// BlazePose replaces the head net.
-fn head_pixel_from_pose_depth(
+/// POV "eye" position in RGB pixels — the **glabella / forehead** (between the
+/// eyebrows), a better viewpoint than the nose. `eye_mid` is the mean of the 6
+/// eye landmarks (indices 1..=6); we push up from the eye line, away from the
+/// nose, toward the brow.
+fn head_center_xy(pose: &blazepose::Pose) -> (f32, f32) {
+    let nose = &pose.landmarks[0];
+    let (mut ex, mut ey) = (0.0f32, 0.0f32);
+    for l in &pose.landmarks[1..=6] {
+        ex += l.x;
+        ey += l.y;
+    }
+    let (ex, ey) = (ex / 6.0, ey / 6.0);
+    (ex + (ex - nose.x) * 0.4, ey + (ey - nose.y) * 0.4)
+}
+
+/// Colour-space width/height of libfreenect2's `bigdepth` map, and the one-row
+/// top border it carries (`filter_height_half = 1`), so colour row `y` lives at
+/// bigdepth row `y + 1`.
+const BIGDEPTH_W: usize = 1920;
+const BIGDEPTH_H: usize = 1080;
+const BIGDEPTH_ROW_OFFSET: usize = 1;
+
+/// Head pixel from a BlazePose landmark sampled in **colour space**, using the
+/// registration's `bigdepth` map instead of the raw depth grid.
+///
+/// This is the accurate path for the Kinect v2: the landmark is already in
+/// colour pixels, `bigdepth` is depth expressed in those same pixels, so no
+/// cross-sensor mapping is needed at all. Deprojection therefore uses the
+/// **colour** intrinsics — passing the IR ones here would reintroduce the very
+/// error the registration removes.
+///
+/// Unmapped pixels come back `+inf` from libfreenect2 (not `0`), so the
+/// validity gate checks `is_finite()` before the range test.
+///
+/// Note the ±8 sampling window is in **colour** pixels here, against ±8
+/// *depth* pixels on the legacy path — the same 17×17 pixel box, but colour
+/// pixels are ~3.7× finer horizontally, so it covers a physically smaller
+/// patch of the subject. That's the point (less background bleeding into the
+/// median), but it does mean fewer contributing readings; if head distance
+/// ever starts dropping out at range, this window is the knob.
+fn head_pixel_from_bigdepth(
+    pose: &blazepose::Pose,
+    bigdepth: &[f32],
+    color: &Intrinsics,
+    min_samples: usize,
+) -> Option<HeadPixel> {
+    if bigdepth.len() < (BIGDEPTH_H + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W || color.fx <= 0.0 {
+        return None;
+    }
+    let (hx, hy) = head_center_xy(pose);
+    let (cx, cy) = (hx as i32, hy as i32);
+    let half = 8i32;
+    let mut samples: Vec<f32> = Vec::new();
+    for dv in -half..=half {
+        let v = cy + dv;
+        if v < 0 || v >= BIGDEPTH_H as i32 {
+            continue;
+        }
+        // Colour row `v` → bigdepth row `v + 1`.
+        let row = (v as usize + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W;
+        for du in -half..=half {
+            let u = cx + du;
+            if u < 0 || u >= BIGDEPTH_W as i32 {
+                continue;
+            }
+            let z = bigdepth[row + u as usize];
+            if z.is_finite() && (DEPTH_MIN_MM..=DEPTH_MAX_MM).contains(&z) {
+                samples.push(z);
+            }
+        }
+    }
+    if samples.len() < min_samples.max(1) {
+        return None;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let depth_mm = samples[samples.len() / 2];
+    let zf = f64::from(depth_mm);
+    Some(HeadPixel {
+        u: hx.max(0.0) as u32,
+        v: hy.max(0.0) as u32,
+        depth_mm,
+        x_mm: (f64::from(hx - color.cx) * zf / f64::from(color.fx)) as f32,
+        y_mm: (f64::from(hy - color.cy) * zf / f64::from(color.fy)) as f32,
+    })
+}
+
+/// Crop `bigdepth` to the 1920×1080 colour window and round to `u16`
+/// millimetres, mapping libfreenect2's `+inf` "no reading" to `0` — the same
+/// sentinel [`depth_to_turbo_rgb888`] already renders as near-black, so the
+/// colour-space depth view reuses the existing colormap unchanged.
+fn bigdepth_to_mm_u16(bigdepth: &[f32]) -> Vec<u16> {
+    let mut out = vec![0u16; BIGDEPTH_W * BIGDEPTH_H];
+    if bigdepth.len() < (BIGDEPTH_H + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W {
+        return out;
+    }
+    for y in 0..BIGDEPTH_H {
+        let src = (y + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W;
+        let dst = y * BIGDEPTH_W;
+        for x in 0..BIGDEPTH_W {
+            let z = bigdepth[src + x];
+            out[dst + x] = if z.is_finite() && z > 0.0 {
+                z.min(f32::from(u16::MAX)) as u16
+            } else {
+                0
+            };
+        }
+    }
+    out
+}
+
+/// Generic over the depth sample type so the v1's native `u16` grid is
+/// sampled in place — the 17×17 window widens per-sample instead of paying a
+/// full-frame `u16→f32` copy (1.2 MB at 30 Hz) up front. `f32: From<T>`
+/// covers both `u16` (v1) and `f32` (v2) losslessly.
+fn head_pixel_from_pose_depth<T: Copy>(
     pose: &blazepose::Pose,
     rgb: (u32, u32),
-    depth_data: &[f32],
+    depth_data: &[T],
     depth_dims: (u32, u32),
     intr: &Intrinsics,
     min_samples: usize,
-) -> Option<HeadPixel> {
+) -> Option<HeadPixel>
+where
+    f32: From<T>,
+{
     let (rgb_w, rgb_h) = rgb;
     let (depth_w, depth_h) = depth_dims;
     if rgb_w == 0 || rgb_h == 0 || depth_w == 0 || depth_h == 0 {
         return None;
     }
-    let nose = &pose.landmarks[blazepose::idx::NOSE];
-    let depth_cx = nose.x * depth_w as f32 / rgb_w as f32;
-    let depth_cy = nose.y * depth_h as f32 / rgb_h as f32;
+    let (hx, hy) = head_center_xy(pose);
+    let depth_cx = hx * depth_w as f32 / rgb_w as f32;
+    let depth_cy = hy * depth_h as f32 / rgb_h as f32;
     let (cx, cy) = (depth_cx as i32, depth_cy as i32);
     let half = 8i32;
     let mut samples: Vec<f32> = Vec::new();
@@ -2912,7 +3864,7 @@ fn head_pixel_from_pose_depth(
             if u < 0 || u >= depth_w as i32 {
                 continue;
             }
-            let z = depth_data[row + u as usize];
+            let z = f32::from(depth_data[row + u as usize]);
             if (DEPTH_MIN_MM..=DEPTH_MAX_MM).contains(&z) {
                 samples.push(z);
             }
@@ -2942,15 +3894,15 @@ fn head_pixel_from_pose_webcam(
     rgb_w: u32,
     rgb_h: u32,
 ) -> Option<HeadPixel> {
-    use blazepose::idx::{LEFT_SHOULDER, NOSE, RIGHT_SHOULDER};
+    use blazepose::idx::{LEFT_SHOULDER, RIGHT_SHOULDER};
     if rgb_w == 0 || rgb_h == 0 {
         return None;
     }
-    let (ls, rs, nose) = (
+    let (ls, rs) = (
         &pose.landmarks[LEFT_SHOULDER],
         &pose.landmarks[RIGHT_SHOULDER],
-        &pose.landmarks[NOSE],
     );
+    let (hx, hy) = head_center_xy(pose);
     if ls.visibility < 0.5 || rs.visibility < 0.5 {
         return None;
     }
@@ -2962,18 +3914,18 @@ fn head_pixel_from_pose_webcam(
     // the frame width (~55° horizontal FOV, typical for a webcam). Distance
     // then triangulates from the shoulder width (~0.40 m), and the nose
     // deprojects with the same nominal pinhole.
-    let fx = rgb_w as f32 * 0.9;
+    let fx = rgb_w as f32 * WEBCAM_FX_PER_WIDTH;
     let cx = rgb_w as f32 * 0.5;
     let cy = rgb_h as f32 * 0.5;
     const SHOULDER_W_MM: f32 = 400.0;
     let depth_mm = fx * SHOULDER_W_MM / w_px;
     let zf = f64::from(depth_mm);
     Some(HeadPixel {
-        u: nose.x.max(0.0) as u32,
-        v: nose.y.max(0.0) as u32,
+        u: hx.max(0.0) as u32,
+        v: hy.max(0.0) as u32,
         depth_mm,
-        x_mm: (f64::from(nose.x - cx) * zf / f64::from(fx)) as f32,
-        y_mm: (f64::from(nose.y - cy) * zf / f64::from(fx)) as f32,
+        x_mm: (f64::from(hx - cx) * zf / f64::from(fx)) as f32,
+        y_mm: (f64::from(hy - cy) * zf / f64::from(fx)) as f32,
     })
 }
 
@@ -3011,17 +3963,44 @@ fn read_cpu_jiffies() -> Option<u64> {
 }
 
 /// Live performance counters, shown in the toolbar and logged every ~2 s:
-/// per-model inference time (EWMA), process CPU%, and the input (camera) vs
-/// output (filtered-pose) frame rates. Detection runs inline on the UI
-/// thread, so `out_fps` is exactly the tracking rate the player feels.
+/// per-model inference time (EWMA), process CPU%, and the input vs output
+/// frame rates. Both count the **same unit** so they're comparable: `in` =
+/// camera frames driving the pipeline (on the capture thread), `out` = those
+/// same frames uploaded to the display (on the GL thread). Capture and
+/// render now run on separate threads, so `out < in` genuinely happens when
+/// rendering can't keep up — `in` advances by the cumulative-capture delta so
+/// frames the GL thread skipped are still counted (see [`App::poll`]).
+///
+/// "Camera frames" rather than "RGB frames" because a Kinect v1 switched to its
+/// IR stream has no colour frame at all — the IR frame is what feeds the models
+/// there, so `in` tracks it and reads equal to `ir`.
 struct Metrics {
     head_ms: f32,
-    u_ms: f32,
+    anchor_ms: f32,
+    /// Kinect v2 depth↔colour registration cost (ms, EWMA); `0.0` when it
+    /// isn't running. Surfaced because it's real per-frame work on the capture
+    /// thread — if it ever gets expensive we want to see it, not hide it.
+    reg_ms: f32,
     in_fps: f32,
     out_fps: f32,
+    /// Display repaints per second — the GL thread's own cadence, independent
+    /// of the camera. Decoupled from capture by the thread split, so it sits
+    /// near the ~60 Hz repaint cap even when `in`/`out` are camera-bound (e.g.
+    /// 20 fps webcam). Makes the capture/render decoupling visible.
+    render_fps: f32,
+    /// Depth / IR capture rates. Diagnostic only — neither is a display rate.
+    /// The Kinect streams them from its **own IR illuminator**, so they hold
+    /// ~30 Hz in the dark while the auto-exposed colour stream halves to 15:
+    /// `ir` staying at 30 while `in` sits at 15 is the proof the ceiling is the
+    /// colour camera, not USB bandwidth or our pipeline.
+    depth_fps: f32,
+    ir_fps: f32,
     cpu_pct: f32,
     in_frames: u32,
-    out_poses: u32,
+    out_frames: u32,
+    render_frames: u32,
+    depth_frames: u32,
+    ir_frames: u32,
     window_start: Instant,
     last_jiffies: u64,
     last_log: Instant,
@@ -3032,12 +4011,19 @@ impl Metrics {
         let now = Instant::now();
         Self {
             head_ms: 0.0,
-            u_ms: 0.0,
+            anchor_ms: 0.0,
+            reg_ms: 0.0,
             in_fps: 0.0,
             out_fps: 0.0,
+            render_fps: 0.0,
+            depth_fps: 0.0,
+            ir_fps: 0.0,
             cpu_pct: 0.0,
             in_frames: 0,
-            out_poses: 0,
+            out_frames: 0,
+            render_frames: 0,
+            depth_frames: 0,
+            ir_frames: 0,
             window_start: now,
             last_jiffies: read_cpu_jiffies().unwrap_or(0),
             last_log: now,
@@ -3052,23 +4038,54 @@ impl Metrics {
             self.head_ms * 0.8 + ms * 0.2
         };
     }
-    fn note_u_ms(&mut self, ms: f32) {
-        self.u_ms = if self.u_ms == 0.0 {
+    fn note_anchor_ms(&mut self, ms: f32) {
+        self.anchor_ms = if self.anchor_ms == 0.0 {
             ms
         } else {
-            self.u_ms * 0.8 + ms * 0.2
+            self.anchor_ms * 0.8 + ms * 0.2
         };
     }
-    /// U-seg calibration is locked → the detector no longer runs, so report
+    /// Registration cost for the latest frame. Reported as an EWMA like the
+    /// inference times; an exact `0.0` means "not running" and is passed
+    /// through so the figure drops out cleanly on v1 / webcam.
+    fn note_reg_ms(&mut self, ms: f32) {
+        self.reg_ms = if ms == 0.0 || self.reg_ms == 0.0 {
+            ms
+        } else {
+            self.reg_ms * 0.8 + ms * 0.2
+        };
+    }
+    /// anchor calibration is locked → the detector no longer runs, so report
     /// 0 ms instead of holding the last inference time.
-    fn note_u_locked(&mut self) {
-        self.u_ms = 0.0;
+    fn note_anchor_locked(&mut self) {
+        self.anchor_ms = 0.0;
     }
-    fn note_input_frame(&mut self) {
-        self.in_frames += 1;
+    /// Add `n` captured RGB frames to the IN counter. Called with the
+    /// cumulative-capture delta each time the GL thread consumes a published
+    /// frame, so frames captured but never shown are still counted.
+    fn add_input(&mut self, n: u64) {
+        self.in_frames += n as u32;
     }
-    fn note_output_pose(&mut self) {
-        self.out_poses += 1;
+    /// One captured RGB frame reached the display (texture uploaded). Counted
+    /// per shown frame — same unit as [`Self::add_input`] — so `out` measures
+    /// the display rate of captured frames.
+    fn note_output_frame(&mut self) {
+        self.out_frames += 1;
+    }
+    /// One display repaint was presented (buffers swapped). Counts every GL
+    /// present, not just those carrying a fresh camera frame — so `render`
+    /// reflects the render thread's true cadence.
+    fn note_render_frame(&mut self) {
+        self.render_frames += 1;
+    }
+    /// Add `n` depth frames grabbed by the capture thread (diagnostic).
+    fn add_depth(&mut self, n: u64) {
+        self.depth_frames += n as u32;
+    }
+    /// Add `n` IR frames grabbed by the capture thread (v2 only, diagnostic —
+    /// IR feeds no tracking, it's only exported with a shared capture).
+    fn add_ir(&mut self, n: u64) {
+        self.ir_frames += n as u32;
     }
 
     /// Called once per poll: roll the 1 s window (recompute FPS + CPU%) and
@@ -3079,20 +4096,34 @@ impl Metrics {
         let elapsed = now.duration_since(self.window_start).as_secs_f32();
         if elapsed >= 1.0 {
             self.in_fps = self.in_frames as f32 / elapsed;
-            self.out_fps = self.out_poses as f32 / elapsed;
+            self.out_fps = self.out_frames as f32 / elapsed;
+            self.render_fps = self.render_frames as f32 / elapsed;
+            self.depth_fps = self.depth_frames as f32 / elapsed;
+            self.ir_fps = self.ir_frames as f32 / elapsed;
             let jiffies = read_cpu_jiffies().unwrap_or(self.last_jiffies);
             // USER_HZ is 100 on Linux x86_64; ticks → seconds = / 100.
             let cpu_secs = jiffies.saturating_sub(self.last_jiffies) as f32 / 100.0;
             self.cpu_pct = cpu_secs / elapsed * 100.0;
             self.last_jiffies = jiffies;
             self.in_frames = 0;
-            self.out_poses = 0;
+            self.out_frames = 0;
+            self.render_frames = 0;
+            self.depth_frames = 0;
+            self.ir_frames = 0;
             self.window_start = now;
         }
         if now.duration_since(self.last_log).as_secs_f32() >= 2.0 {
             info!(
-                "perf: head {:.1}ms | U {:.1}ms | cpu {:.0}% | in {:.1} fps | out {:.1} fps",
-                self.head_ms, self.u_ms, self.cpu_pct, self.in_fps, self.out_fps
+                "perf: head {:.1}ms | anchor {:.1}ms | reg {:.1}ms | cpu {:.0}% | in {:.1} fps | out {:.1} fps | render {:.1} fps | depth {:.1} fps | ir {:.1} fps",
+                self.head_ms,
+                self.anchor_ms,
+                self.reg_ms,
+                self.cpu_pct,
+                self.in_fps,
+                self.out_fps,
+                self.render_fps,
+                self.depth_fps,
+                self.ir_fps
             );
             self.last_log = now;
         }
@@ -3100,10 +4131,22 @@ impl Metrics {
 
     /// One-line summary for the toolbar.
     fn summary(&self) -> String {
-        format!(
-            "head {:.0}ms · U {:.0}ms · cpu {:.0}% · in {:.0} / out {:.0} fps",
-            self.head_ms, self.u_ms, self.cpu_pct, self.in_fps, self.out_fps
-        )
+        // Depth / IR only exist on the Kinects — appended when they're flowing
+        // so the webcam read-out stays uncluttered.
+        let mut s = format!(
+            "head {:.0}ms · anchor {:.0}ms · cpu {:.0}% · in {:.0} / out {:.0} / render {:.0} fps",
+            self.head_ms, self.anchor_ms, self.cpu_pct, self.in_fps, self.out_fps, self.render_fps
+        );
+        if self.reg_ms > 0.0 {
+            s.push_str(&format!(" · reg {:.0}ms", self.reg_ms));
+        }
+        if self.depth_fps > 0.0 {
+            s.push_str(&format!(" · depth {:.0}", self.depth_fps));
+        }
+        if self.ir_fps > 0.0 {
+            s.push_str(&format!(" · ir {:.0}", self.ir_fps));
+        }
+        s
     }
 }
 
@@ -3128,8 +4171,12 @@ impl App {
             should_quit: false,
             lockbar_width_mm: headtracking::calibration::LOCKBAR_WIDTH_MM,
             head_filter_min_cutoff: 1.0,
-            head_filter_beta: 0.4,
+            // beta=0 would disable the 1€ filter's velocity adaptation — its
+            // whole point — and make fast head moves lag behind. Small but
+            // non-zero keeps stillness smooth AND fast moves responsive.
+            head_filter_beta: 0.03,
             bypass_filters: false,
+            selected_stream: StreamKind::Rgb,
             contribute_open: false,
             consent_checked: false,
             uploader: contribute::Uploader::spawn(),
@@ -3223,68 +4270,54 @@ impl App {
                 if matches!(self.selected, Backend::None) {
                     return; // selection changed to None during the settle → Idle
                 }
-                match open_backend(self.selected) {
-                    Ok(active) => {
+                // Spawn the capture thread — it opens the device and confirms
+                // the stream on its own thread, so this never blocks the UI. We
+                // just poll its `Startup` handshake from the `Waiting` arm.
+                info!(backend = ?self.selected, "spawning capture thread");
+                self.switch_state = SwitchState::Waiting {
+                    worker: CaptureWorker::spawn(self.selected),
+                    since: Instant::now(),
+                };
+            }
+            SwitchState::Waiting { worker, since } => {
+                // Read the handshake without holding the lock across the move.
+                let outcome = match &*worker.startup.lock() {
+                    Startup::Pending => None,
+                    Startup::Live(intr) => Some(Ok(*intr)),
+                    Startup::Failed(e) => Some(Err(e.clone())),
+                };
+                match outcome {
+                    Some(Ok(intr)) => {
                         info!(
-                            backend = ?active.backend,
-                            fx = active.intrinsics.fx,
-                            fy = active.intrinsics.fy,
-                            cx = active.intrinsics.cx,
-                            cy = active.intrinsics.cy,
-                            "backend opened"
+                            backend = ?worker.backend,
+                            fx = intr.fx,
+                            fy = intr.fy,
+                            "backend live"
                         );
-                        // Opening succeeded, but confirm the stream actually
-                        // flows before going live (Kinect v1 can open yet never
-                        // deliver a frame until the stream is bounced).
-                        self.switch_state = SwitchState::Waiting {
-                            active: Box::new(active),
-                            bounces: 0,
-                            since: Instant::now(),
-                        };
+                        // Devices don't offer the same streams (a webcam has no
+                        // depth), and a fresh capture thread always starts on
+                        // colour — so the view selection starts over too.
+                        self.selected_stream = StreamKind::Rgb;
+                        self.active = Some(Active::new_live(worker, intr)); // → Idle
                     }
-                    Err(e) => {
-                        error!(?e, "failed to open backend");
+                    Some(Err(e)) => {
+                        error!("{e}");
                         self.error = Some(e);
                         self.selected = Backend::None;
+                        drop(worker); // stop + join the thread, close the device
                     }
-                }
-            }
-            SwitchState::Waiting {
-                mut active,
-                bounces,
-                since,
-            } => {
-                if active.poll_first_rgb() {
-                    info!(backend = ?active.backend, bounces, "stream live");
-                    self.active = Some(*active); // → Idle
-                } else if since.elapsed() < FIRST_FRAME_WAIT {
-                    self.switch_state = SwitchState::Waiting {
-                        active,
-                        bounces,
-                        since,
-                    }; // keep waiting this window
-                } else if bounces >= MAX_STREAM_BOUNCES {
-                    let msg = format!(
-                        "{}: no video after {MAX_STREAM_BOUNCES} stream restarts — check the cable / USB",
-                        backend_slug(active.backend)
-                    );
-                    error!("{msg}");
-                    self.error = Some(msg);
-                    self.selected = Backend::None; // drop active → Idle
-                } else {
-                    warn!(backend = ?active.backend, next = bounces + 1, "no first frame, bouncing stream");
-                    match active.bounce_stream() {
-                        Ok(()) => {
-                            self.switch_state = SwitchState::Waiting {
-                                active,
-                                bounces: bounces + 1,
-                                since: Instant::now(),
-                            };
-                        }
-                        Err(e) => {
-                            error!("stream restart failed: {e}");
-                            self.error = Some(e);
+                    None => {
+                        if since.elapsed() >= STARTUP_TIMEOUT {
+                            let msg = format!(
+                                "{}: capture thread did not start in time",
+                                backend_slug(worker.backend)
+                            );
+                            error!("{msg}");
+                            self.error = Some(msg);
                             self.selected = Backend::None;
+                            drop(worker);
+                        } else {
+                            self.switch_state = SwitchState::Waiting { worker, since };
                         }
                     }
                 }
@@ -3296,46 +4329,85 @@ impl App {
     /// `contributions/` and queue them for the write-only upload. No-op if no
     /// frame is available. Called from the "Share a capture" button.
     fn share_capture(&mut self) {
-        // IR source differs per sensor. Kinect v2 streams IR alongside depth,
-        // so we already have `last_ir`. Kinect v1 shares one USB endpoint
-        // between RGB and IR, so there's no live IR — we briefly flip the
-        // video mode to grab one frame (3rd, once the auto-exposure settles),
-        // then flip back to RGB.
-        let ir_v1 = self
-            .active
-            .as_mut()
-            .and_then(|active| match &mut active.inner {
-                Inner::KinectV1 { device, .. } => match device.capture_ir(3) {
-                    Ok(frame) => Some(frame),
-                    Err(e) => {
-                        warn!("contribution: v1 IR capture failed: {e}");
+        // A contribution must export EVERY stream the camera has, whatever is
+        // selected on screen. The v1's colour and IR share one USB endpoint,
+        // so we always request BOTH from the capture thread: whichever is
+        // already live costs one frame, the other borrows the endpoint through
+        // a momentary mode switch and hands it back to the user's selected
+        // stream (~500 ms). The GL thread never needs to know which mode the
+        // device is in. A brief block here is fine (manual button); 2 s covers
+        // the warmup + switch round-trip of each grab.
+        let (rgb_v1, ir_v1) = match self.active.as_ref() {
+            Some(active) if active.backend == Backend::KinectV1 => {
+                let rgb = {
+                    let (tx, rx) = mpsc::channel();
+                    if active.worker.cmd_tx.send(CaptureCmd::GrabRgbV1(tx)).is_ok() {
+                        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
+                    } else {
                         None
                     }
-                },
-                _ => None,
-            });
+                };
+                let ir = {
+                    let (tx, rx) = mpsc::channel();
+                    if active.worker.cmd_tx.send(CaptureCmd::GrabIrV1(tx)).is_ok() {
+                        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
+                    } else {
+                        None
+                    }
+                };
+                (rgb, ir)
+            }
+            _ => (None, None),
+        };
+        // The v2 throttles colour conversion to ~2.5 Hz while tracking on IR —
+        // ask for one un-throttled conversion so `_raw.png` isn't ~400 ms
+        // stale. Acks immediately when no throttle is active.
+        if let Some(active) = self.active.as_ref()
+            && active.backend == Backend::KinectV2
+        {
+            let (tx, rx) = mpsc::channel();
+            if active
+                .worker
+                .cmd_tx
+                .send(CaptureCmd::RefreshRgb(tx))
+                .is_ok()
+            {
+                let _ = rx.recv_timeout(Duration::from_secs(1));
+            }
+        }
         let payload = self.active.as_ref().and_then(|active| {
-            active.last_rgb_frame.as_ref().map(|(w, h, raw)| {
-                let det = bake_overlays(
-                    *w,
-                    *h,
-                    raw,
-                    active.last_pose.as_ref(),
-                    active.last_lockbar.as_ref(),
-                );
-                (
-                    active.backend,
-                    *w,
-                    *h,
-                    raw.clone(),
-                    det,
-                    active.last_depth.clone(),
-                    active.last_ir.clone(),
-                    active.last_head,
-                    active.last_pose.clone(),
-                    active.last_lockbar,
-                )
-            })
+            // v1: prefer the freshly grabbed colour frame — while the IR
+            // stream is selected, `last_rgb_frame` holds the gray-expanded IR
+            // the pipeline tracked on, not true colour. Overlays stay
+            // geometrically valid on the grab: the v1's colour and IR share
+            // one sensor framing (same 640×480), so a pose computed on IR
+            // lands on the right pixels of the colour frame.
+            let (w, h, raw): (u32, u32, Arc<Vec<u8>>) = match rgb_v1.as_ref() {
+                Some(f) => (f.width, f.height, Arc::new(f.data.clone())),
+                None => {
+                    let (w, h, raw) = active.last_rgb_frame.as_ref()?;
+                    (*w, *h, Arc::clone(raw))
+                }
+            };
+            let det = bake_overlays(
+                w,
+                h,
+                &raw,
+                active.last_pose.as_ref(),
+                active.last_anchor.as_ref(),
+            );
+            Some((
+                active.backend,
+                w,
+                h,
+                raw,
+                det,
+                active.last_depth.clone(),
+                active.last_ir.clone(),
+                active.last_head,
+                active.last_pose.clone(),
+                active.last_lockbar,
+            ))
         });
         let Some((backend, w, h, raw, det, depth, ir_v2, head, pose, lockbar)) = payload else {
             return;
@@ -3357,56 +4429,18 @@ impl App {
             pose.as_ref(),
             lockbar.as_ref(),
         );
-        meta.extend(autocalib_meta(
-            lockbar.as_ref(),
+        meta.extend(autocalib_meta(lockbar.as_ref(), (w, h), depth.as_deref()));
+        let files = build_contribution_files(
+            &stem,
+            backend,
             (w, h),
-            self.lockbar_width_mm,
-            depth.as_ref(),
-        ));
-        // Collect every image this capture produced, then save + queue them
-        // in one pass. RGB planes are 8-bit colour; depth is 16-bit gray in
-        // raw mm; v2 IR is 16-bit gray intensity; v1 IR is 8-bit gray.
-        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-        for (kind, src) in [("raw", &raw), ("det", &det)] {
-            match png_bytes_meta(w, h, src, &meta) {
-                Ok(bytes) => files.push((format!("{stem}_{kind}.png"), bytes)),
-                Err(e) => warn!("contribution: {kind} png encode failed: {e}"),
-            }
-        }
-        // Each depth/IR modality ships a lossless file (the real values) plus
-        // an auto-levelled 8-bit `*view` preview so it's reviewable by eye.
-        if let Some((dw, dh, mm)) = depth.as_ref() {
-            match png_gray16_bytes(*dw, *dh, mm) {
-                Ok(bytes) => files.push((format!("{stem}_depth.png"), bytes)),
-                Err(e) => warn!("contribution: depth png encode failed: {e}"),
-            }
-            match autolevel_gray8(*dw, *dh, mm, true) {
-                Ok(bytes) => files.push((format!("{stem}_depthview.png"), bytes)),
-                Err(e) => warn!("contribution: depthview png encode failed: {e}"),
-            }
-        }
-        // IR: v2 (live, 16-bit) or v1 (mode-switch, 8-bit) — only one applies.
-        if let Some((iw, ih, intensity)) = ir_v2.as_ref() {
-            match png_gray16_bytes(*iw, *ih, intensity) {
-                Ok(bytes) => files.push((format!("{stem}_ir.png"), bytes)),
-                Err(e) => warn!("contribution: ir png encode failed: {e}"),
-            }
-            match autolevel_gray8(*iw, *ih, intensity, false) {
-                Ok(bytes) => files.push((format!("{stem}_irview.png"), bytes)),
-                Err(e) => warn!("contribution: irview png encode failed: {e}"),
-            }
-        } else if let Some(frame) = ir_v1.as_ref() {
-            match png_gray8_bytes(frame.width, frame.height, &frame.data) {
-                Ok(bytes) => files.push((format!("{stem}_ir.png"), bytes)),
-                Err(e) => warn!("contribution: ir png encode failed: {e}"),
-            }
-            // v1 IR is native 8-bit; widen to reuse the u16 auto-leveller.
-            let widened: Vec<u16> = frame.data.iter().map(|&b| u16::from(b)).collect();
-            match autolevel_gray8(frame.width, frame.height, &widened, false) {
-                Ok(bytes) => files.push((format!("{stem}_irview.png"), bytes)),
-                Err(e) => warn!("contribution: irview png encode failed: {e}"),
-            }
-        }
+            &raw,
+            &det,
+            depth.as_deref(),
+            ir_v2.as_deref(),
+            ir_v1.as_ref(),
+            &meta,
+        );
         for (name, bytes) in files {
             if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
                 warn!(name, "contribution: local save failed: {e}");
@@ -3422,197 +4456,59 @@ impl App {
             return;
         };
         active.metrics.tick();
-        // Push the live-tunable 1€ knobs onto the filter each frame (cheap;
-        // set_params keeps the running state, no reset).
-        active.pose_filter.set_params(filter_alias::OneEuroParams {
-            min_cutoff_hz: self.head_filter_min_cutoff,
-            beta: self.head_filter_beta,
-            derivative_cutoff_hz: 1.0,
-        });
-        // One pose inference per input frame — no rate cap. BlazePose is
-        // ~7 ms, well under the camera frame budget, so it keeps up.
-        active.blaze_worker.set_min_interval_ms(0);
-        // Debug bypass: raw pose, relaxed depth gate.
-        let bypass = self.bypass_filters;
-        let depth_min = if bypass { 4 } else { 16 };
-        match &mut active.inner {
-            Inner::KinectV2 { device, .. } => {
-                if let Some(rgb) = device.poll_rgb() {
-                    active.metrics.note_input_frame();
-                    // RGB888 feeds BlazePose (every frame) and the U worker
-                    // (until it locks); reused for the display texture.
-                    let rgb888 = bgrx_to_rgb888(&rgb.data);
-                    active
-                        .blaze_worker
-                        .submit(rgb888.clone(), rgb.width, rgb.height);
-                    let pose_out = active.blaze_worker.snapshot();
-                    active.last_pose = pose_out.pose;
-                    if pose_out.ms > 0.0 {
-                        active.metrics.note_head_ms(pose_out.ms);
-                    }
-                    if !active.u_worker.is_locked() {
-                        active
-                            .u_worker
-                            .submit(rgb888.clone(), rgb.width, rgb.height);
-                    }
-                    let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb888);
-                    active.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
-                    let u_out = active.u_worker.snapshot();
-                    active.last_u = u_out.u;
-                    active.last_lockbar = u_out.lockbar;
-                    if active.u_worker.is_locked() {
-                        active.metrics.note_u_locked();
-                    } else if u_out.u_ms > 0.0 {
-                        active.metrics.note_u_ms(u_out.u_ms);
-                    }
-                    upload_texture(egui_ctx, &mut active.rgb_texture, img);
-                }
-                // IR streams on the same listener as depth (both produced by
-                // the depth pipeline). Keep the latest for the capture export;
-                // f32 intensity rounds into u16.
-                if let Some(ir) = device.poll_ir() {
-                    active.last_ir = Some((
-                        ir.width,
-                        ir.height,
-                        ir.data.iter().map(|&v| v as u16).collect(),
-                    ));
-                }
-                if let Some(depth) = device.poll_depth() {
-                    // Keep the latest depth (f32 mm rounded to u16) for the
-                    // "Share a capture" export. Cheap next to the RGB clone
-                    // we already keep every frame.
-                    active.last_depth = Some((
-                        depth.width,
-                        depth.height,
-                        depth.data.iter().map(|&z| z as u16).collect(),
-                    ));
-                    // Head = BlazePose nose sampled in the depth frame (the
-                    // pose comes from the RGB block above, async).
-                    let head = active
-                        .last_pose
-                        .as_ref()
-                        .and_then(|p| {
-                            head_pixel_from_pose_depth(
-                                p,
-                                (1920, 1080),
-                                &depth.data,
-                                (depth.width, depth.height),
-                                &active.intrinsics,
-                                depth_min,
-                            )
-                        })
-                        .map(|mut h| {
-                            // The Kinect v2 colour frame is horizontally mirrored
-                            // (text reads backwards), so the deprojected head X is
-                            // flipped vs the real world — negate it so the
-                            // left/right POV travelling matches v1.
-                            h.x_mm = -h.x_mm;
-                            h
-                        });
-                    let smoothed =
-                        smooth_head(head, &mut active.pose_filter, active.started_at, bypass);
-                    capture_baseline(&mut active.baseline, smoothed);
-                    active.last_head = smoothed;
-                    if smoothed.is_some() {
-                        active.metrics.note_output_pose();
-                    }
-                }
+        // Hand the live-tunable 1€ / bypass knobs to the capture thread (cheap
+        // atomics); the device poll + inference now run over there.
+        active.worker.set_filter(
+            self.head_filter_min_cutoff,
+            self.head_filter_beta,
+            self.bypass_filters,
+        );
+        // Consume the latest processed frame the capture thread published. IN
+        // advances by the cumulative-capture delta (so it counts frames this GL
+        // thread never saw); OUT counts only what we upload → `out ≤ in`, with a
+        // genuine gap whenever rendering runs slower than capture.
+        if let Some(frame) = active.worker.latest.load_full()
+            && frame.frame_id != active.last_consumed_id
+        {
+            let delta = frame.captured.saturating_sub(active.last_captured);
+            active.metrics.add_input(delta);
+            active.last_captured = frame.captured;
+            // Same delta trick for the sensor streams (diagnostic only).
+            active
+                .metrics
+                .add_depth(frame.depth_captured.saturating_sub(active.last_depth_count));
+            active
+                .metrics
+                .add_ir(frame.ir_captured.saturating_sub(active.last_ir_count));
+            active.last_depth_count = frame.depth_captured;
+            active.last_ir_count = frame.ir_captured;
+            active.last_consumed_id = frame.frame_id;
+            let img = stream_color_image(&frame, self.selected_stream);
+            upload_texture(egui_ctx, &mut active.rgb_texture, img);
+            active.metrics.note_output_frame();
+            active.last_rgb_at = frame.last_rgb_at;
+            active.last_ir_at = frame.last_ir_at;
+            active.last_depth_at = frame.last_depth_at;
+            active.pose_src = (frame.pose_src_w, frame.pose_src_h);
+            active.last_pose = frame.pose.clone();
+            active.last_head = frame.head;
+            active.baseline = frame.baseline;
+            active.last_anchor = frame.anchor;
+            active.last_lockbar = frame.lockbar;
+            active.last_rgb_frame = Some((frame.w, frame.h, frame.rgb888.clone()));
+            active.last_depth = frame.depth.clone();
+            active.last_depth_color = frame.depth_color.clone();
+            active.last_ir = frame.ir.clone();
+            if frame.head_ms > 0.0 {
+                active.metrics.note_head_ms(frame.head_ms);
             }
-            Inner::KinectV1 { device, .. } => {
-                if let Some(rgb) = device.poll_rgb() {
-                    active.metrics.note_input_frame();
-                    active
-                        .blaze_worker
-                        .submit(rgb.data.clone(), rgb.width, rgb.height);
-                    let pose_out = active.blaze_worker.snapshot();
-                    active.last_pose = pose_out.pose;
-                    if pose_out.ms > 0.0 {
-                        active.metrics.note_head_ms(pose_out.ms);
-                    }
-                    if !active.u_worker.is_locked() {
-                        active
-                            .u_worker
-                            .submit(rgb.data.clone(), rgb.width, rgb.height);
-                    }
-                    let u_out = active.u_worker.snapshot();
-                    active.last_u = u_out.u;
-                    active.last_lockbar = u_out.lockbar;
-                    if active.u_worker.is_locked() {
-                        active.metrics.note_u_locked();
-                    } else if u_out.u_ms > 0.0 {
-                        active.metrics.note_u_ms(u_out.u_ms);
-                    }
-                    let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
-                    upload_texture(egui_ctx, &mut active.rgb_texture, img);
-                    active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
-                }
-                if let Some(depth) = device.poll_depth() {
-                    // Keep the latest depth (native u16 mm) for the "Share a
-                    // capture" export.
-                    active.last_depth = Some((depth.width, depth.height, depth.data.clone()));
-                    // libfreenect ships u16 mm; widen for the depth sampler.
-                    let f32_data: Vec<f32> = depth.data.iter().map(|&v| f32::from(v)).collect();
-                    // Head = BlazePose nose sampled in the depth frame.
-                    let head = active.last_pose.as_ref().and_then(|p| {
-                        head_pixel_from_pose_depth(
-                            p,
-                            (640, 480),
-                            &f32_data,
-                            (depth.width, depth.height),
-                            &active.intrinsics,
-                            depth_min,
-                        )
-                    });
-                    let smoothed =
-                        smooth_head(head, &mut active.pose_filter, active.started_at, bypass);
-                    capture_baseline(&mut active.baseline, smoothed);
-                    active.last_head = smoothed;
-                    if smoothed.is_some() {
-                        active.metrics.note_output_pose();
-                    }
-                }
-            }
-            Inner::Webcam { camera } => {
-                if let Some(rgb) = camera.poll_rgb() {
-                    active.metrics.note_input_frame();
-                    active
-                        .blaze_worker
-                        .submit(rgb.data.clone(), rgb.width, rgb.height);
-                    let pose_out = active.blaze_worker.snapshot();
-                    active.last_pose = pose_out.pose;
-                    if pose_out.ms > 0.0 {
-                        active.metrics.note_head_ms(pose_out.ms);
-                    }
-                    // Webcam has no depth: triangulate the head distance from
-                    // the pose's shoulder width.
-                    let head = active
-                        .last_pose
-                        .as_ref()
-                        .and_then(|p| head_pixel_from_pose_webcam(p, rgb.width, rgb.height));
-                    let smoothed =
-                        smooth_head(head, &mut active.pose_filter, active.started_at, bypass);
-                    capture_baseline(&mut active.baseline, smoothed);
-                    active.last_head = smoothed;
-                    if smoothed.is_some() {
-                        active.metrics.note_output_pose();
-                    }
-                    if !active.u_worker.is_locked() {
-                        active
-                            .u_worker
-                            .submit(rgb.data.clone(), rgb.width, rgb.height);
-                    }
-                    let u_out = active.u_worker.snapshot();
-                    active.last_u = u_out.u;
-                    active.last_lockbar = u_out.lockbar;
-                    if active.u_worker.is_locked() {
-                        active.metrics.note_u_locked();
-                    } else if u_out.u_ms > 0.0 {
-                        active.metrics.note_u_ms(u_out.u_ms);
-                    }
-                    let img = rgb888_to_color_image(rgb.width, rgb.height, &rgb.data);
-                    upload_texture(egui_ctx, &mut active.rgb_texture, img);
-                    active.last_rgb_frame = Some((rgb.width, rgb.height, rgb.data));
-                }
+            active.metrics.note_reg_ms(frame.reg_ms);
+            active.anchor_locked = frame.anchor_locked;
+            active.anchor_fixed = frame.anchor_fixed;
+            if frame.anchor_locked {
+                active.metrics.note_anchor_locked();
+            } else if frame.anchor_ms > 0.0 {
+                active.metrics.note_anchor_ms(frame.anchor_ms);
             }
         }
     }
@@ -3647,19 +4543,25 @@ impl App {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        let (Inner::KinectV1 { device, .. }, Some(controls)) =
-            (&mut active.inner, active.v1_controls.as_mut())
-        else {
+        if active.backend != Backend::KinectV1 {
+            return;
+        }
+        // The device lives on the capture thread: commands go through the
+        // channel, the live tilt/accel read-out comes from the shared cell.
+        let cmd_tx = active.worker.cmd_tx.clone();
+        let tilt_state = *active.worker.tilt_state.lock();
+        let Some(controls) = active.v1_ui.as_mut() else {
             return;
         };
-
-        // Refresh tilt + accel every 500 ms (USB roundtrip).
-        if controls.last_refresh.elapsed() >= Duration::from_millis(500) {
-            match device.tilt_state() {
-                Ok(state) => controls.last_state = Some(state),
-                Err(e) => warn!(?e, "kinect v1: tilt_state refresh failed"),
+        if let Some(state) = tilt_state {
+            controls.last_state = Some(state);
+            // Seed the slider to the device's real tilt on the first read so it
+            // doesn't snap from 0.
+            if !controls.seeded {
+                controls.desired_tilt_deg = state.angle_deg;
+                controls.last_sent_tilt_deg = state.angle_deg;
+                controls.seeded = true;
             }
-            controls.last_refresh = Instant::now();
         }
 
         Panel::top("v1-controls").show(ui, |ui| {
@@ -3680,12 +4582,9 @@ impl App {
                 if (drag_release || typed_commit)
                     && (controls.desired_tilt_deg - controls.last_sent_tilt_deg).abs() > 0.01
                 {
-                    if let Err(e) = device.set_tilt_degrees(controls.desired_tilt_deg) {
-                        warn!(?e, "set_tilt failed");
-                    } else {
-                        controls.last_sent_tilt_deg = controls.desired_tilt_deg;
-                        info!(angle = controls.desired_tilt_deg, "tilt command sent");
-                    }
+                    let _ = cmd_tx.send(CaptureCmd::SetTilt(controls.desired_tilt_deg));
+                    controls.last_sent_tilt_deg = controls.desired_tilt_deg;
+                    info!(angle = controls.desired_tilt_deg, "tilt command sent");
                 }
 
                 ui.separator();
@@ -3699,11 +4598,8 @@ impl App {
                         }
                     });
                 if controls.selected_led != prev_led {
-                    if let Err(e) = device.set_led(controls.selected_led) {
-                        warn!(?e, "set_led failed");
-                    } else {
-                        controls.last_sent_led = controls.selected_led;
-                    }
+                    let _ = cmd_tx.send(CaptureCmd::SetLed(controls.selected_led));
+                    controls.last_sent_led = controls.selected_led;
                 }
 
                 ui.separator();
@@ -3884,10 +4780,37 @@ impl App {
                 // clamp so a pathological device name can't overflow the row.
                 let combo_w = (longest as f32 * glyph_w + 48.0).clamp(140.0, 520.0);
                 // Popup tall enough to show every entry without an inner
-                // vertical scroll (the taller cab fonts made the default clip
-                // rows). Sized to the entry count with generous per-row height.
-                let popup_h = (self.available.len().max(1) as f32) * 38.0 + 12.0;
-                ComboBox::from_id_salt("backend")
+                // vertical scroll. `.height()` is a MAX (egui caps the popup's
+                // ScrollArea at it). The old magic 38 px/row was smaller than the
+                // real row height under the cab's larger UI font, so the list
+                // clipped + scrolled instead of growing. Derive it from the
+                // actual row height (font + button padding + inter-row spacing) —
+                // same spirit as the width above — so it scales with the font and
+                // always fits every entry.
+                let sp = ui.spacing();
+                let row_h =
+                    font_h.max(sp.interact_size.y) + 2.0 * sp.button_padding.y + sp.item_spacing.y;
+                let popup_h =
+                    (self.available.len().max(1) as f32) * row_h + sp.item_spacing.y + 8.0;
+                let combo_debug_var = std::env::var("HT_DEBUG_COMBO").ok();
+                let combo_debug = combo_debug_var.is_some();
+                let mut entries = self.available.clone();
+                if combo_debug_var.as_deref() == Some("grow") {
+                    // Repro harness for the stale-popup-size bug: draw only 3
+                    // entries for the first 6 s, then all of them — mimics
+                    // "open the dropdown, rescan adds a camera, open again".
+                    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+                    if T0.get_or_init(Instant::now).elapsed() < Duration::from_secs(6) {
+                        entries.truncate(3);
+                    }
+                }
+                // Salt the id with the entry count: egui persists the popup
+                // Area's size across opens, and its ScrollArea clamps content
+                // to that stored size — so a popup once opened with N entries
+                // stays N entries tall forever (scrollbar instead of growing)
+                // after a rescan adds a camera. A fresh id per count = a
+                // fresh size negotiation.
+                let combo_resp = ComboBox::from_id_salt(format!("backend-{}", entries.len()))
                     .width(combo_w)
                     .height(popup_h)
                     .selected_text(selected_label)
@@ -3895,15 +4818,45 @@ impl App {
                         // Keep each entry on a single line; the popup then
                         // stretches to exactly the number of entries.
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        let entries = self.available.clone();
                         for entry in &entries {
                             ui.selectable_value(&mut self.selected, entry.backend, &entry.label);
                         }
+                        if combo_debug {
+                            // Measured from INSIDE the popup: whatever style /
+                            // clip the rows actually got, vs our estimate.
+                            let sp = ui.spacing();
+                            eprintln!(
+                                "combo popup: content_h={:.1} clip_h={:.1} max_h={:.1} \
+                                 avail_h={:.1} | interact_y={:.1} pad_y={:.1} space_y={:.1} \
+                                 font_h={:.1}",
+                                ui.min_rect().height(),
+                                ui.clip_rect().height(),
+                                ui.max_rect().height(),
+                                ui.available_rect_before_wrap().height(),
+                                sp.interact_size.y,
+                                sp.button_padding.y,
+                                sp.item_spacing.y,
+                                egui::TextStyle::Button.resolve(ui.style()).size,
+                            );
+                        }
                     });
+                if combo_debug {
+                    eprintln!(
+                        "combo estimate: n={} row_h={row_h:.1} popup_h={popup_h:.1} \
+                         combo_w={combo_w:.1} | toolbar interact_y={:.1} pad_y={:.1} \
+                         space_y={:.1} font_h={font_h:.1}",
+                        self.available.len(),
+                        ui.spacing().interact_size.y,
+                        ui.spacing().button_padding.y,
+                        ui.spacing().item_spacing.y,
+                    );
+                    // Keep the popup permanently open so layout can be
+                    // inspected/screenshotted without a mouse.
+                    egui::Popup::open_id(ui.ctx(), combo_resp.response.id.with("popup"));
+                }
                 if ui.button("Rescan").clicked() {
                     self.refresh_available();
                 }
-                self.lockbar_width_field(ui);
                 // Screenshot: writes the latest RGB frame next to the binary
                 // as `<backend-slug>_<YYYYMMDD-HHMMSS>.png`. Disabled until a
                 // frame has been received.
@@ -3935,7 +4888,7 @@ impl App {
                         *h,
                         bytes,
                         active.last_pose.as_ref(),
-                        active.last_lockbar.as_ref(),
+                        active.last_anchor.as_ref(),
                         &meta,
                     ));
                     match &self.screenshot_status {
@@ -3948,11 +4901,16 @@ impl App {
                 // click, for a physically rotated pincab display.
                 if ui
                     .button(format!("⟳ {}", rotation_label(self.rotation)))
-                    .on_hover_text("Rotate the window 90° (physically rotated screen)")
+                    .on_hover_text(
+                        "Tourner l'affichage de 90° par clic (écran monté de \
+                         travers, ou à l'envers / 180°).",
+                    )
                     .clicked()
                 {
                     self.rotation = next_rotation(self.rotation);
                 }
+                // Theme: light / dark / follow-system — egui's icon switch.
+                egui::global_theme_preference_buttons(ui);
                 // Parallax — on/off toggle for the off-axis 3D validation view
                 // stacked below the camera feed. A highlight toggle (blue when
                 // on), matching the parallax eye-mode selector. The 🪟 glyph
@@ -4003,9 +4961,12 @@ impl App {
                 }
             });
 
+            ui.add_space(3.0);
+            contribution_banner(ui);
+
             ui.add_space(2.0);
             // Row 2 — camera INPUT (raw, before maths). `input_line` lays out
-            // two rows: device + head measurements, then the U-seg / lockbar
+            // two rows: device + head measurements, then the anchor / lockbar
             // readout on its own line below.
             ui.vertical(|ui| self.input_line(ui));
 
@@ -4136,10 +5097,13 @@ impl App {
                     });
                     cols[1].add_space(2.0);
                     if reset_baseline && let Some(active) = self.active.as_mut() {
+                        // Clear the capture thread's baseline (it owns the pose
+                        // filter) as well as our local copy.
+                        let _ = active.worker.cmd_tx.send(CaptureCmd::ResetBaseline);
                         active.baseline = None;
                     }
                     if let Some(active) = self.active.as_ref() {
-                        if !active.inner.has_head_tracker() {
+                        if !active.backend.has_head_tracker() {
                             cols[1].label(
                                 RichText::new(
                                     "this input has no head tracker yet\n\
@@ -4221,6 +5185,7 @@ impl App {
                     .exact_size(half)
                     .show(ui, |ui| self.draw_parallax_view(ui));
             }
+            self.stream_bar(ui);
             self.draw_camera_view(ui);
         });
         let ctx = ui.ctx().clone();
@@ -4231,41 +5196,77 @@ impl App {
     /// scale. Shown only for a webcam input: depth cameras measure scale
     /// directly, so they don't need it (there it's just a cross-check). mm
     /// with an inch read-out — the international inch is exactly 25.4 mm.
-    fn lockbar_width_field(&mut self, ui: &mut egui::Ui) {
-        let is_webcam = matches!(
-            self.active.as_ref().map(|a| a.backend),
-            Some(Backend::Webcam(_))
-        );
-        // Sidebar/lockbar physical width — the scale reference (webcam only;
-        // the Kinect gets scale from depth).
-        if is_webcam {
-            ui.separator();
-            ui.label("Sidebar:");
-            ui.add(
-                egui::DragValue::new(&mut self.lockbar_width_mm)
-                    .speed(1.0)
-                    .range(200.0..=1200.0)
-                    .suffix(" mm"),
-            );
-            let inches = self.lockbar_width_mm / 25.4;
-            ui.label(RichText::new(format!("({inches:.1} in)")).weak());
-        }
-        // Table inclination — the second key input. The VPX screen is the
-        // near-flat playfield, so the parallax tilts head motion by
-        // 90° − inclination. Shown for every backend.
-        ui.separator();
-        ui.label("Incl:");
-        ui.add(
-            egui::DragValue::new(&mut self.table_incl_deg)
-                .speed(0.5)
-                .range(0.0..=30.0)
-                .suffix("°"),
-        )
-        .on_hover_text(
-            "Playfield inclination from horizontal (VPX gives this per table). \
-             The parallax tilts head motion by 90° − this angle, since the VPX \
-             screen is the laid-flat playfield.",
-        );
+    /// Filters / tuning row — everything on one line as table-like grouped
+    /// cells: the 1€ **stability filter** (two plain-language knobs, no jargon)
+    /// plus the two cabinet-geometry inputs (lockbar width in **cm**, playfield/
+    /// backglass inclination in **°**).
+    fn filters_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            // Cell — stability filter (1€). The two knobs are the 1€ min-cutoff
+            // and beta, relabelled for humans; hover text explains the effect.
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new("Filtre de stabilité (1€)").strong());
+                ui.separator();
+                ui.add(
+                    egui::Slider::new(&mut self.head_filter_min_cutoff, 0.1..=5.0)
+                        .text("Réactivité"),
+                )
+                .on_hover_text(
+                    "Quand tu es immobile : à gauche = très stable et lisse (un \
+                     léger retard), à droite = suit plus vite (peut trembler un peu).",
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.head_filter_beta, 0.0..=1.5)
+                        .text("Suivi mouvements"),
+                )
+                .on_hover_text(
+                    "Quand tu bouges vite : plus à droite = rattrape le retard, \
+                     la vue colle mieux à ta tête.",
+                );
+                ui.toggle_value(&mut self.bypass_filters, "sans filtre")
+                    .on_hover_text(
+                        "Coupe le lissage 1€ (+ scoring du picker + gate depth) — debug.",
+                    );
+            });
+
+            // Cell — lockbar width in cm (scale reference = distance between the
+            // two sidebars). Always shown. Stored in mm internally.
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label("Largeur lockbar");
+                let mut cm = self.lockbar_width_mm / 10.0;
+                if ui
+                    .add(egui::Slider::new(&mut cm, 20.0..=120.0).suffix(" cm"))
+                    .on_hover_text("Largeur entre les deux rails latéraux (référence d'échelle).")
+                    .changed()
+                {
+                    self.lockbar_width_mm = cm * 10.0;
+                }
+            });
+
+            // Cell — playfield / backglass inclination in degrees (all backends).
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label("Inclinaison BG");
+                ui.add(egui::Slider::new(&mut self.table_incl_deg, 0.0..=30.0).suffix(" °"))
+                    .on_hover_text(
+                        "Inclinaison du plateau vs l'horizontale (VPX la donne par \
+                         table). La parallaxe incline le mouvement de tête de \
+                         90° − cet angle.",
+                    );
+            });
+
+            // Cell — parallax bench: gain + axis sign flips.
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label("Parallaxe");
+                ui.add(egui::Slider::new(&mut self.parallax_gain, 0.5..=6.0).text("gain"))
+                    .on_hover_text("Amplification du déplacement de tête → POV.");
+                ui.toggle_value(&mut self.parallax_invert[0], "±X")
+                    .on_hover_text("Inverser l'axe gauche/droite.");
+                ui.toggle_value(&mut self.parallax_invert[1], "±Y")
+                    .on_hover_text("Inverser l'axe haut/bas.");
+                ui.toggle_value(&mut self.parallax_invert[2], "±Z")
+                    .on_hover_text("Inverser l'axe profondeur (avant/arrière).");
+            });
+        });
     }
 
     /// Camera-placement guidance shown at the top of the central panel, above
@@ -4425,19 +5426,92 @@ impl App {
         self.contribute_open = open;
     }
 
+    /// Stream bar, directly above the camera image: one chip per stream the
+    /// device offers, captioned with its nominal spec, **green when frames are
+    /// arriving and red when they aren't**, and clickable to display it.
+    ///
+    /// This is where the Kinect v1's single video endpoint explains itself:
+    /// select IR and the colour chip goes red while IR goes green, so the
+    /// either/or is visible rather than documented.
+    fn stream_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let specs = stream_specs(active.backend, active.cam_spec);
+        if specs.is_empty() {
+            return;
+        }
+        // Aged here, at draw time — see [`Active::last_rgb_at`].
+        let live = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < STREAM_LIVE_FOR);
+        let (rgb_live, ir_live, depth_live) = (
+            live(active.last_rgb_at),
+            live(active.last_ir_at),
+            live(active.last_depth_at),
+        );
+        let mut pick: Option<StreamKind> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("streams")
+                    .strong()
+                    .color(Color32::GRAY)
+                    .monospace(),
+            );
+            ui.separator();
+            for spec in &specs {
+                let live = match spec.kind {
+                    StreamKind::Rgb => rgb_live,
+                    StreamKind::Ir => ir_live,
+                    StreamKind::Depth => depth_live,
+                };
+                let colour = if live {
+                    Color32::from_rgb(60, 200, 90)
+                } else {
+                    Color32::from_rgb(220, 70, 70)
+                };
+                let selected = self.selected_stream == spec.kind;
+                let text = RichText::new(spec.caption()).monospace().color(colour);
+                let text = if selected { text.strong() } else { text };
+                let hint = if live {
+                    "receiving — click to display"
+                } else {
+                    "not receiving (this device can't stream it alongside the current one)"
+                };
+                if ui
+                    .selectable_label(selected, text)
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    pick = Some(spec.kind);
+                }
+            }
+        });
+        if let Some(kind) = pick
+            && kind != self.selected_stream
+        {
+            self.selected_stream = kind;
+            // The v1 has to physically switch its video endpoint; the others
+            // just need to know what's on screen.
+            if let Some(active) = self.active.as_ref() {
+                let _ = active.worker.cmd_tx.send(CaptureCmd::SelectStream(kind));
+            }
+        }
+        ui.add_space(2.0);
+    }
+
     /// Camera feed with the lockbar + head overlays, scaled to fit while
     /// keeping the source aspect ratio.
     fn draw_camera_view(&self, ui: &mut egui::Ui) {
         let avail = ui.available_size();
         let aspect = match self.active.as_ref() {
-            Some(active) => match (&active.inner, active.rgb_texture.as_ref()) {
+            Some(active) => match (active.backend, active.rgb_texture.as_ref()) {
                 (_, Some(tex)) => {
                     let s = tex.size_vec2();
                     if s.y > 0.0 { s.x / s.y } else { 16.0 / 9.0 }
                 }
-                (Inner::KinectV2 { .. }, None) => 1920.0 / 1080.0,
-                (Inner::KinectV1 { .. }, None) => 640.0 / 480.0,
-                (Inner::Webcam { .. }, None) => 640.0 / 480.0,
+                (Backend::KinectV2, None) => 1920.0 / 1080.0,
+                (Backend::KinectV1, None) => 640.0 / 480.0,
+                (Backend::Webcam(_), None) => 640.0 / 480.0,
+                (Backend::None, None) => 16.0 / 9.0,
             },
             None => 16.0 / 9.0,
         };
@@ -4459,33 +5533,36 @@ impl App {
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
-                // Lockbar contour (cyan) + sidebars (orange) derived from the
-                // U — no translucent mask fog any more.
-                if let Some(bar) = active.last_lockbar {
-                    draw_lockbar(ui.painter(), rect, bar);
-                }
-                // Source dimensions for bbox normalisation come from
-                // the texture itself, NOT from the backend's spec.
-                // On macOS AVFoundation the camera often delivers
-                // frames at a size different from what
-                // `SDL_GetCameraFormat` reported at open time —
-                // using the spec here mapped boxes to the wrong
-                // place (or off-screen). The texture was built from
-                // the same buffer the detector saw, so its size is
-                // authoritative.
-                // BlazePose skeleton overlay: landmarks are in frame pixels,
-                // mapped onto the view rect (same space for every backend).
-                let src_size = tex.size_vec2();
-                if let Some(p) = &active.last_pose
-                    && src_size.x > 0.0
-                    && src_size.y > 0.0
-                {
-                    // Clip to the camera rect: BlazePose extrapolates off-frame
-                    // joints (knees/feet), so keep them for tracking but never
-                    // paint them outside the RGB view (they'd spill onto the
-                    // parallax scene below).
+                // Overlay (skeleton bones + anchor geometry) — unified across
+                // live/capture/headless via `draw_overlay`. Clipped to the camera
+                // rect: off-frame joints and the sidebar→VP extensions must not
+                // spill onto the parallax scene below.
+                //
+                // Normalised through the dims of the frame the pose was computed
+                // on, NOT the displayed texture: viewing the 512×424 depth stream
+                // while the pose came from a 1920×1080 colour frame would
+                // otherwise stretch the skeleton across the wrong pixels. Falls
+                // back to the texture size before the first pose arrives.
+                let tex_size = tex.size_vec2();
+                let (sw, sh) = match active.pose_src {
+                    (w, h) if w > 0 && h > 0 => (w as f32, h as f32),
+                    _ => (tex_size.x, tex_size.y),
+                };
+                if sw > 0.0 && sh > 0.0 {
                     let clipped = ui.painter().with_clip_rect(rect);
-                    draw_pose_overlay(&clipped, rect, p, src_size);
+                    let mut canvas = EguiOverlay {
+                        painter: &clipped,
+                        rect,
+                        fw: sw,
+                        fh: sh,
+                    };
+                    draw_overlay(
+                        &mut canvas,
+                        active.last_pose.as_ref(),
+                        active.last_anchor.as_ref(),
+                        sw as u32,
+                        sh as u32,
+                    );
                 }
             } else {
                 centered(ui, rect, "waiting for first RGB frame…");
@@ -4496,11 +5573,8 @@ impl App {
             let msg = match &self.switch_state {
                 SwitchState::Closing(_) => "closing…".to_string(),
                 SwitchState::Opening(_) => format!("opening {}…", self.label_for(self.selected)),
-                SwitchState::Waiting { bounces: 0, .. } => {
+                SwitchState::Waiting { .. } => {
                     format!("opening {}…", self.label_for(self.selected))
-                }
-                SwitchState::Waiting { bounces, .. } => {
-                    format!("retry {bounces}/{MAX_STREAM_BOUNCES}…")
                 }
                 SwitchState::Idle => self
                     .error
@@ -4519,6 +5593,10 @@ impl App {
     /// [`Self::parallax_eye`]; here we just present it and record the panel
     /// rect so Mouse mode can map the pointer.
     fn draw_parallax_view(&mut self, ui: &mut egui::Ui) {
+        // Filters — between the camera feed (input, above) and the parallax
+        // scene (output, below): stability (1€) + cabinet geometry + inversions.
+        self.filters_row(ui);
+        ui.add_space(3.0);
         // Row 1: mode selector + current eye readout.
         ui.horizontal(|ui| {
             ui.label(
@@ -4545,32 +5623,8 @@ impl App {
                     .color(LOCKBAR_COLOR),
             );
         });
-        // Row 2 (Live only): the bench knobs — gain on the same line as the
-        // per-axis sign flips. Find the right signs/gain here, then bake them
-        // into camera/mapping.rs (not a product calibration step).
-        if self.parallax_eye_mode == ParallaxEye::Live {
-            ui.horizontal(|ui| {
-                ui.add(egui::Slider::new(&mut self.parallax_gain, 0.5..=6.0).text("gain"));
-                ui.separator();
-                ui.toggle_value(&mut self.parallax_invert[0], "±X");
-                ui.toggle_value(&mut self.parallax_invert[1], "±Y");
-                ui.toggle_value(&mut self.parallax_invert[2], "±Z");
-            });
-            // 1€ filter knobs — live, so lag on fast head moves can be dialed
-            // out on the cab (higher beta = snappier; higher cutoff = less
-            // smoothing when still). Applied to the pose in `poll`.
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Slider::new(&mut self.head_filter_min_cutoff, 0.1..=5.0)
-                        .text("1€ cutoff"),
-                );
-                ui.add(egui::Slider::new(&mut self.head_filter_beta, 0.0..=1.5).text("1€ beta"));
-            });
-            ui.horizontal(|ui| {
-                ui.toggle_value(&mut self.bypass_filters, "no filters")
-                    .on_hover_text("Bypass 1€ filter + picker scoring + most of the depth gate");
-            });
-        }
+        // (gain + axis flips + the 1€ stability filter all live in `filters_row`,
+        // drawn above — between the camera feed and this parallax scene.)
 
         // Fill the whole panel (no 4:3 letterbox) so the scene reaches the
         // edges; the FBO + projection adopt this aspect → no distortion.
@@ -4634,7 +5688,7 @@ impl App {
         // Line 1 — device + raw head measurements.
         ui.horizontal(|ui| {
             ui.label(prefix());
-            if !active.inner.has_head_tracker() {
+            if !active.backend.has_head_tracker() {
                 ui.label(
                     RichText::new(format!("{label} | capture only — head tracking pending"))
                         .color(Color32::GRAY),
@@ -4654,35 +5708,21 @@ impl App {
                 );
             }
         });
-        // Line 2 — raw U-seg confidence + the derived lockbar, on their own
-        // row below (shown whenever a U exists, independent of head presence).
-        if active.last_u.is_some() || active.last_lockbar.is_some() {
+        // Line 2 — the anchor-derived lockbar, on its own row below.
+        if let Some(bar) = active.last_lockbar {
             ui.horizontal(|ui| {
-                if let Some(u) = &active.last_u {
-                    ui.label(
-                        RichText::new(format!("U seg {:.0}%", u.confidence * 100.0))
-                            .color(LOCKBAR_COLOR)
-                            .monospace()
-                            .size(15.0),
-                    );
-                }
-                if let Some(bar) = active.last_lockbar {
-                    if active.last_u.is_some() {
-                        ui.separator();
-                    }
-                    ui.label(
-                        RichText::new(format!(
-                            "lockbar (U base) px: row {}, w {}px, t {}px, slope {:+.1}°",
-                            bar.mean_row(),
-                            bar.mean_width_px(),
-                            bar.thickness_px,
-                            bar.slope_deg,
-                        ))
-                        .color(LOCKBAR_COLOR)
-                        .monospace()
-                        .size(15.0),
-                    );
-                }
+                ui.label(
+                    RichText::new(format!(
+                        "lockbar (anchor) px: row {}, w {}px, t {}px, slope {:+.1}°",
+                        bar.mean_row(),
+                        bar.mean_width_px(),
+                        bar.thickness_px,
+                        bar.slope_deg,
+                    ))
+                    .color(LOCKBAR_COLOR)
+                    .monospace()
+                    .size(15.0),
+                );
             });
         }
     }
@@ -4707,15 +5747,73 @@ impl App {
         let dx = head.x_mm - lb.x;
         let dy = head.y_mm - lb.y;
         let dz = head.depth_mm - lb.z;
-        // We only reach here with a live lockbar quad; the U warmup/lock state
-        // now lives on the worker thread, so just flag that the delta is live.
-        let (tag, color) = ("U live", Color32::LIGHT_GREEN);
+        // We only reach here with a live lockbar quad. The tag says where the
+        // calibration came from: hand-placed lines (`anchor_fixed.json`) in
+        // light blue, or the live model's locked detection in light green.
+        let (tag, color, hover) = if active.anchor_fixed {
+            (
+                "ancre fixée",
+                Color32::LIGHT_BLUE,
+                "Calibration manuelle (anchor_fixed.json) — le modèle ne tourne pas.",
+            )
+        } else {
+            (
+                "anchor live",
+                Color32::LIGHT_GREEN,
+                "Calibration détectée par le modèle d'ancre.",
+            )
+        };
         ui.label(
             RichText::new(format!(
                 "→ VPX   ΔX {dx:+.0}   ΔY {dy:+.0}   ΔZ {dz:+.0} mm   [{tag}]"
             ))
             .monospace()
             .color(color),
+        )
+        .on_hover_text(hover);
+        self.camera_pose_line(ui, active);
+    }
+
+    /// One-line camera-pose read-out under the VPX delta: where the camera
+    /// sits relative to the cab, computed by the validated `anchor::camera_pose`
+    /// port from the **locked** anchor geometry + the colour intrinsics + the
+    /// lockbar-width slider. The webcam has no factory focal (nominal guess
+    /// until autocalib), so its line is flagged with "≈".
+    fn camera_pose_line(&self, ui: &mut egui::Ui, active: &Active) {
+        if !active.anchor_locked {
+            return;
+        }
+        let (Some(geom), Some((fw, fh, _))) =
+            (active.last_anchor.as_ref(), active.last_rgb_frame.as_ref())
+        else {
+            return;
+        };
+        let fx = color_focal_px(active.backend, *fw);
+        let intr = anchor::CameraIntrinsics {
+            fx,
+            fy: fx,
+            cx: *fw as f32 * 0.5,
+            cy: *fh as f32 * 0.5,
+        };
+        let Some(pose) = anchor::camera_pose(geom, &intr, self.lockbar_width_mm) else {
+            return;
+        };
+        let approx = if matches!(active.backend, Backend::Webcam(_)) {
+            "≈ " // nominal focal — estimate, not a measurement
+        } else {
+            ""
+        };
+        // French number formatting: metres with a decimal comma.
+        let metres = format!("{:.2}", pose.distance_mm / 1000.0).replace('.', ",");
+        ui.label(
+            RichText::new(format!(
+                "{approx}Caméra : {metres} m de la lockbar · {:.0} cm au-dessus · déport {:+.0} cm · penchée {:.0}°",
+                pose.height_mm / 10.0,
+                pose.lateral_mm / 10.0,
+                pose.pitch_deg,
+            ))
+            .monospace()
+            .color(Color32::GRAY),
         );
     }
 }
@@ -4759,92 +5857,345 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
 
 /// Draw the BlazePose skeleton (bones + joints) over the camera view. The 33
 /// landmarks are in frame pixels; `src` is the texture size they map onto.
-fn draw_pose_overlay(painter: &egui::Painter, rect: Rect, pose: &blazepose::Pose, src: Vec2) {
-    use blazepose::idx::{
-        LEFT_ELBOW, LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_ELBOW, RIGHT_SHOULDER, RIGHT_WRIST,
-    };
-    let to_screen = |i: usize| {
-        let l = &pose.landmarks[i];
-        Pos2::new(
-            rect.left() + l.x / src.x * rect.width(),
-            rect.top() + l.y / src.y * rect.height(),
-        )
-    };
-    let bone = Color32::from_gray(0xcc);
-    for (a, b) in [
-        (LEFT_SHOULDER, RIGHT_SHOULDER),
-        (LEFT_SHOULDER, LEFT_ELBOW),
-        (LEFT_ELBOW, LEFT_WRIST),
-        (RIGHT_SHOULDER, RIGHT_ELBOW),
-        (RIGHT_ELBOW, RIGHT_WRIST),
-        (NOSE, LEFT_SHOULDER),
-        (NOSE, RIGHT_SHOULDER),
-    ] {
-        painter.line_segment([to_screen(a), to_screen(b)], Stroke::new(2.0, bone));
-    }
-    for i in 0..33 {
-        let c = if (11..=16).contains(&i) {
-            Color32::from_rgb(0xff, 0x96, 0x00)
-        } else {
-            Color32::from_rgb(0x00, 0xdc, 0x3c)
-        };
-        painter.circle_filled(to_screen(i), 4.0, c);
+/// The anchor calibration model was trained on this many hand-annotated cabinet
+/// images. **Bump it after every retrain** — the contribution banner reads it.
+const MODEL_TRAINING_IMAGES: usize = 3;
+
+/// Red-edged banner under the main menu: the calibration model is still trained
+/// on very few images, so we ask hard for contributions. Bold, centred.
+fn contribution_banner(ui: &mut egui::Ui) {
+    let red = Color32::from_rgb(0xD3, 0x2F, 0x2F);
+    egui::Frame::group(ui.style())
+        .stroke(Stroke::new(1.2, red))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "⚠  Le modèle de calibration n'a tourné que sur \
+                         {MODEL_TRAINING_IMAGES} images — on a vraiment besoin \
+                         d'un MAXIMUM de contributions.  🎁"
+                    ))
+                    .strong()
+                    .color(red),
+                );
+            });
+        });
+}
+
+/// Overlay draw target. All inputs are in ORIGINAL IMAGE PIXEL coords; each impl
+/// maps to its own surface. A single [`draw_overlay`] feeds the live egui view,
+/// the capture RGB buffer and the headless `--pose-test`, so the overlay can
+/// never drift out of sync between them again.
+trait OverlayCanvas {
+    fn stroke(&mut self, a: (f32, f32), b: (f32, f32), col: [u8; 3], width: f32);
+    fn dashed(&mut self, a: (f32, f32), b: (f32, f32), col: [u8; 3]);
+    fn disc(&mut self, p: (f32, f32), r: f32, col: [u8; 3]);
+    /// Text at a fixed top-left screen offset (image px on the egui view;
+    /// no-op on the raw-RGB buffer).
+    fn text(&mut self, p: (f32, f32), s: &str, col: [u8; 3]);
+}
+
+/// Draws onto the live egui view: image px → view-rect screen coords.
+struct EguiOverlay<'a> {
+    painter: &'a egui::Painter,
+    rect: Rect,
+    fw: f32,
+    fh: f32,
+}
+
+impl EguiOverlay<'_> {
+    fn map(&self, p: (f32, f32)) -> Pos2 {
+        self.rect.left_top()
+            + Vec2::new(
+                (p.0 / self.fw) * self.rect.width(),
+                (p.1 / self.fh) * self.rect.height(),
+            )
     }
 }
 
-fn draw_lockbar(
-    painter: &egui::Painter,
-    rect: Rect,
-    bar: headtracking::calibration::LockbarQuadRgb,
-) {
-    if bar.frame_width == 0 || bar.frame_height == 0 {
-        return;
+impl OverlayCanvas for EguiOverlay<'_> {
+    fn stroke(&mut self, a: (f32, f32), b: (f32, f32), col: [u8; 3], width: f32) {
+        self.painter.line_segment(
+            [self.map(a), self.map(b)],
+            Stroke::new(width, Color32::from_rgb(col[0], col[1], col[2])),
+        );
     }
-    let fw = bar.frame_width as f32;
-    let fh = bar.frame_height as f32;
-    let to_screen = |col: u32, row: u32| -> Pos2 {
-        rect.left_top()
-            + Vec2::new(
-                (col as f32 / fw) * rect.width(),
-                (row as f32 / fh) * rect.height(),
-            )
-    };
-    let pts: [Pos2; 4] = [
-        to_screen(bar.corners[0].0, bar.corners[0].1),
-        to_screen(bar.corners[1].0, bar.corners[1].1),
-        to_screen(bar.corners[2].0, bar.corners[2].1),
-        to_screen(bar.corners[3].0, bar.corners[3].1),
-    ];
-    let stroke = Stroke::new(3.0_f32, LOCKBAR_COLOR);
-    painter.line_segment([pts[0], pts[1]], stroke);
-    painter.line_segment([pts[1], pts[2]], stroke);
-    painter.line_segment([pts[2], pts[3]], stroke);
-    painter.line_segment([pts[3], pts[0]], stroke);
-    // Sidebars (rails) in orange, fitted straight segments.
-    let rail_stroke = Stroke::new(3.0_f32, RAIL_COLOR);
-    for rail in [bar.left_rail, bar.right_rail].into_iter().flatten() {
-        painter.line_segment(
-            [
-                to_screen(rail[0].0, rail[0].1),
-                to_screen(rail[1].0, rail[1].1),
-            ],
-            rail_stroke,
+    fn dashed(&mut self, a: (f32, f32), b: (f32, f32), col: [u8; 3]) {
+        let (pa, pb) = (self.map(a), self.map(b));
+        let n = ((pa.distance(pb) / 10.0).round() as usize).clamp(2, 300);
+        let c = Color32::from_rgb(col[0], col[1], col[2]);
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            self.painter.circle_filled(pa + (pb - pa) * t, 1.5, c);
+        }
+    }
+    fn disc(&mut self, p: (f32, f32), r: f32, col: [u8; 3]) {
+        self.painter
+            .circle_filled(self.map(p), r, Color32::from_rgb(col[0], col[1], col[2]));
+    }
+    fn text(&mut self, p: (f32, f32), s: &str, col: [u8; 3]) {
+        self.painter.text(
+            self.map(p),
+            egui::Align2::LEFT_TOP,
+            s,
+            egui::FontId::monospace(13.0),
+            Color32::from_rgb(col[0], col[1], col[2]),
+        );
+    }
+}
+
+/// Draws onto a raw RGB888 buffer (image px == buffer px).
+struct RgbOverlay<'a> {
+    buf: &'a mut [u8],
+    w: usize,
+    h: usize,
+}
+
+impl OverlayCanvas for RgbOverlay<'_> {
+    fn stroke(&mut self, a: (f32, f32), b: (f32, f32), col: [u8; 3], _width: f32) {
+        draw_line_rgb(
+            self.buf,
+            self.w,
+            self.h,
+            (a.0 as i32, a.1 as i32),
+            (b.0 as i32, b.1 as i32),
+            col,
+        );
+    }
+    fn dashed(&mut self, a: (f32, f32), b: (f32, f32), col: [u8; 3]) {
+        let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+        let n = ((len / 12.0).round() as i32).clamp(2, 300);
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            draw_disc_rgb(
+                self.buf,
+                self.w,
+                self.h,
+                (a.0 + (b.0 - a.0) * t) as i32,
+                (a.1 + (b.1 - a.1) * t) as i32,
+                1,
+                col,
+            );
+        }
+    }
+    fn disc(&mut self, p: (f32, f32), r: f32, col: [u8; 3]) {
+        draw_disc_rgb(
+            self.buf, self.w, self.h, p.0 as i32, p.1 as i32, r as i32, col,
+        );
+    }
+    fn text(&mut self, _p: (f32, f32), _s: &str, _col: [u8; 3]) {}
+}
+
+/// The one overlay: skeleton bones (NO landmark dots), the anchor lockbar
+/// rectangle, the two sidebars (solid rail bottom→corner, dashed corner→
+/// depth-VP), the lateral-offset tick, and a readout. Shared by live /
+/// capture / headless.
+fn draw_overlay<C: OverlayCanvas>(
+    c: &mut C,
+    pose: Option<&blazepose::Pose>,
+    anchor: Option<&anchor::AnchorGeometry>,
+    fw: u32,
+    fh: u32,
+) {
+    const BONE: [u8; 3] = [0xcc, 0xcc, 0xcc];
+    const GREEN: [u8; 3] = [60, 230, 90];
+    const CYAN: [u8; 3] = [0, 210, 255];
+    const YELLOW: [u8; 3] = [255, 225, 25];
+    let _ = fh;
+    if let Some(p) = pose {
+        use blazepose::idx::{
+            LEFT_ELBOW, LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_ELBOW, RIGHT_SHOULDER, RIGHT_WRIST,
+        };
+        let g = |i: usize| (p.landmarks[i].x, p.landmarks[i].y);
+        for (a, b) in [
+            (LEFT_SHOULDER, RIGHT_SHOULDER),
+            (LEFT_SHOULDER, LEFT_ELBOW),
+            (LEFT_ELBOW, LEFT_WRIST),
+            (RIGHT_SHOULDER, RIGHT_ELBOW),
+            (RIGHT_ELBOW, RIGHT_WRIST),
+            (NOSE, LEFT_SHOULDER),
+            (NOSE, RIGHT_SHOULDER),
+        ] {
+            c.stroke(g(a), g(b), BONE, 2.0);
+        }
+    }
+    if let Some(geo) = anchor {
+        let cr = geo.corners;
+        for k in 0..4 {
+            c.stroke(cr[k], cr[(k + 1) % 4], GREEN, 2.5);
+        }
+        // Sidebars: solid real rail (bottom → player corner), then dashed
+        // extrapolation to the depth vanishing point.
+        for sb in [geo.left_sidebar, geo.right_sidebar] {
+            c.stroke(sb.1, sb.0, CYAN, 2.5);
+            if let Some(vp) = geo.depth_vp {
+                c.dashed(sb.0, vp, CYAN);
+            }
+        }
+        c.disc(geo.lockbar_center, 4.0, GREEN);
+        c.stroke(
+            (fw as f32 * 0.5, geo.lockbar_center.1),
+            geo.lockbar_center,
+            YELLOW,
+            2.0,
+        );
+        let vp_txt = geo
+            .depth_vp
+            .map_or_else(|| "inf".to_string(), |(x, y)| format!("({x:.0},{y:.0})"));
+        c.text(
+            (8.0, 8.0),
+            &format!(
+                "anchor · width {:.0}px · lateral {:+.0}px · vp {vp_txt}",
+                geo.lockbar_width_px, geo.lateral_offset_px
+            ),
+            [255, 255, 255],
         );
     }
 }
 
 // ============================================================ Backend opening
 
-fn open_backend(b: Backend) -> Result<Active, String> {
-    match b {
-        Backend::None => Err("no backend selected".to_string()),
-        Backend::KinectV2 => open_kinect_v2(),
-        Backend::KinectV1 => open_kinect_v1(),
-        Backend::Webcam(idx) => open_webcam(idx),
+fn open_backend(b: Backend) -> Result<Capture, String> {
+    // Claim the cross-process lock BEFORE touching the hardware, so a
+    // device busy in the plugin / a cron capture / another demo yields one
+    // readable line instead of a driver-level failure. All webcams share
+    // the "webcam" slug: SDL ids aren't stable across processes, and one
+    // cab has one webcam.
+    let slug = match b {
+        Backend::None => return Err("no backend selected".to_string()),
+        Backend::KinectV1 => "kinect-v1",
+        Backend::KinectV2 => "kinect-v2",
+        Backend::Webcam(_) => "webcam",
+    };
+    let hwlock = headtracking::hwlock::HwLock::acquire(slug)?;
+    let mut cap = match b {
+        Backend::None => unreachable!("handled above"),
+        Backend::KinectV2 => open_kinect_v2()?,
+        Backend::KinectV1 => open_kinect_v1()?,
+        Backend::Webcam(idx) => open_webcam(idx)?,
+    };
+    cap.hwlock = Some(hwlock);
+    Ok(cap)
+}
+
+/// Common `Capture` fields (models, filter, empty buffers) shared by every
+/// backend opener — only `backend`, `intrinsics` and `inner` differ.
+fn new_capture(backend: Backend, intrinsics: Intrinsics, inner: Inner) -> Capture {
+    Capture {
+        backend,
+        intrinsics,
+        inner,
+        hwlock: None,
+        blaze_worker: BlazePoseWorker::spawn(),
+        anchor_worker: AnchorWorker::spawn(),
+        pose_filter: make_pose_filter(),
+        started_at: Instant::now(),
+        baseline: None,
+        last_pose: None,
+        last_head: None,
+        last_anchor: None,
+        last_lockbar: None,
+        last_rgb_frame: None,
+        last_depth: None,
+        last_ir: None,
+        depth_frames: 0,
+        ir_frames: 0,
+        last_rgb_at: None,
+        last_ir_at: None,
+        last_depth_at: None,
+        // Filled in by `open_kinect_v2`; every other backend leaves the
+        // registration off and keeps the native depth path.
+        registration: None,
+        color_intr: Intrinsics {
+            fx: 0.0,
+            fy: 0.0,
+            cx: 0.0,
+            cy: 0.0,
+        },
+        bigdepth: Vec::new(),
+        rgb_scratch: Vec::new(),
+        bigdepth_ok: false,
+        reg_ms: 0.0,
+        reg_warned: false,
+        selected_stream: StreamKind::Rgb,
+        last_rgb_refresh: None,
+        rgb_refresh_ack: None,
+        depth_color: None,
+        pose_src: (0, 0),
+        head_ms: 0.0,
+        anchor_ms: 0.0,
+        anchor_fixed: false,
     }
 }
 
-fn open_kinect_v2() -> Result<Active, String> {
+/// One backend's entry in `anchor_fixed.json`: the annotated frame dimensions
+/// plus the four hand-placed lines, in the order
+/// `[sideleft, sideright, lockbar_player, lockbar_screen]`.
+struct FixedAnchorEntry {
+    img_w: u32,
+    img_h: u32,
+    lines: [anchor::LineSeg; 4],
+}
+
+/// Read the optional hand-fixed calibration for `slug` from
+/// `anchor_fixed.json` next to the binary (same location policy as
+/// `contributions/`). Generated by `tools/anchor/lines_to_fixed.py` from the
+/// annotator's output.
+///
+/// Key matching: exact backend slug first (`kinect-v2`, `kinect-v1`); webcams
+/// then fall back to the plain `webcam` key, because the SDL index in
+/// `webcam-<N>` shifts with the USB enumeration order and must not invalidate
+/// the calibration.
+fn load_fixed_anchor(slug: &str) -> Option<FixedAnchorEntry> {
+    let path = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join("anchor_fixed.json");
+    let text = std::fs::read_to_string(&path).ok()?; // absent file = feature off
+    let root: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(?path, "anchor_fixed.json unreadable: {e}");
+            return None;
+        }
+    };
+    let entry = root.get(slug).or_else(|| {
+        slug.starts_with("webcam")
+            .then(|| root.get("webcam"))
+            .flatten()
+    })?;
+    let dim = |k: &str| entry.get(k).and_then(serde_json::Value::as_u64);
+    let (Some(img_w), Some(img_h)) = (dim("img_w"), dim("img_h")) else {
+        warn!(slug, "anchor_fixed.json entry missing img_w/img_h");
+        return None;
+    };
+    // One line = [[x1, y1], [x2, y2]].
+    let seg = |name: &str| -> Option<anchor::LineSeg> {
+        let l = entry.get("lines")?.get(name)?;
+        let p =
+            |i: usize, j: usize| -> Option<f32> { l.get(i)?.get(j)?.as_f64().map(|v| v as f32) };
+        Some([[p(0, 0)?, p(0, 1)?], [p(1, 0)?, p(1, 1)?]])
+    };
+    let names = ["sideleft", "sideright", "lockbar_player", "lockbar_screen"];
+    let mut lines = [[[0.0f32; 2]; 2]; 4];
+    for (slot, name) in lines.iter_mut().zip(names) {
+        match seg(name) {
+            Some(s) => *slot = s,
+            None => {
+                warn!(slug, name, "anchor_fixed.json entry missing/malformed line");
+                return None;
+            }
+        }
+    }
+    Some(FixedAnchorEntry {
+        img_w: img_w as u32,
+        img_h: img_h as u32,
+        lines,
+    })
+}
+
+fn open_kinect_v2() -> Result<Capture, String> {
     let ctx = freenect2::Context::new().map_err(|e| format!("freenect2 Context::new: {e}"))?;
     // Drain any stale libfreenect2 error from a previous call before we
     // run the one whose error we want to surface.
@@ -4868,34 +6219,46 @@ fn open_kinect_v2() -> Result<Active, String> {
         .start_streams(true, true)
         .map_err(|e| format!("freenect2 start_streams: {e}"))?;
     let p = device.ir_params();
-    Ok(Active {
-        backend: Backend::KinectV2,
-        intrinsics: Intrinsics {
+    // Built after `start_streams` on purpose: before the device has streamed
+    // its factory intrinsics the params read all-zero and the registration
+    // would map nothing. Colour params come from the same moment.
+    let registration = device.registration();
+    let c = device.color_params();
+    let mut cap = new_capture(
+        Backend::KinectV2,
+        Intrinsics {
             fx: p.fx,
             fy: p.fy,
             cx: p.cx,
             cy: p.cy,
         },
-        rgb_texture: None,
-        last_head: None,
-        baseline: None,
-        inner: Inner::KinectV2 { device, _ctx: ctx },
-        v1_controls: None,
-        pose_filter: make_pose_filter(),
-        started_at: Instant::now(),
-        last_lockbar: None,
-        last_u: None,
-        u_worker: UWorker::spawn(),
-        blaze_worker: BlazePoseWorker::spawn(),
-        last_pose: None,
-        last_rgb_frame: None,
-        last_depth: None,
-        last_ir: None,
-        metrics: Metrics::new(),
-    })
+        Inner::KinectV2 { device, _ctx: ctx },
+    );
+    if c.fx > 0.0 {
+        info!(
+            fx = c.fx,
+            fy = c.fy,
+            cx = c.cx,
+            cy = c.cy,
+            "kinect v2: colour intrinsics + depth↔colour registration ready"
+        );
+        cap.color_intr = Intrinsics {
+            fx: c.fx,
+            fy: c.fy,
+            cx: c.cx,
+            cy: c.cy,
+        };
+        cap.bigdepth = vec![0.0; freenect2::BIGDEPTH_LEN];
+        cap.rgb_scratch = vec![0u8; 1920 * 1080 * 4];
+        cap.registration = Some(registration);
+    } else {
+        // Not fatal: the head path falls back to naive depth-grid scaling.
+        warn!("kinect v2: colour intrinsics unavailable — depth registration disabled");
+    }
+    Ok(cap)
 }
 
-fn open_kinect_v1() -> Result<Active, String> {
+fn open_kinect_v1() -> Result<Capture, String> {
     info!("kinect v1 open: building context");
     let ctx = freenect::Context::new().map_err(|e| format!("freenect Context::new: {e}"))?;
     let count = ctx.enumerate();
@@ -4918,50 +6281,43 @@ fn open_kinect_v1() -> Result<Active, String> {
         .start_streams(true, true)
         .map_err(|e| format!("freenect start_streams: {e}"))?;
 
-    // Seed the v1 controls with the device's current tilt so the slider
-    // doesn't snap on first use. Failures are non-fatal — we just log.
-    let mut controls = V1Controls::new();
-    match device.tilt_state() {
-        Ok(state) => {
-            controls.desired_tilt_deg = state.angle_deg;
-            controls.last_sent_tilt_deg = state.angle_deg;
-            controls.last_state = Some(state);
-            controls.last_refresh = Instant::now();
-        }
-        Err(e) => warn!(?e, "kinect v1: tilt_state read at open failed"),
-    }
-    if let Err(e) = device.set_led(controls.selected_led) {
+    // Light the LED at open (Green). The tilt read-out is seeded later from the
+    // capture thread's periodic refresh (the slider seeds on its first read).
+    if let Err(e) = device.set_led(freenect::LedState::Green) {
         warn!(?e, "kinect v1: initial set_led failed");
     }
 
-    Ok(Active {
-        backend: Backend::KinectV1,
-        intrinsics: Intrinsics {
+    Ok(new_capture(
+        Backend::KinectV1,
+        Intrinsics {
             fx: freenect::FX,
             fy: freenect::FY,
             cx: freenect::CX,
             cy: freenect::CY,
         },
-        rgb_texture: None,
-        last_head: None,
-        baseline: None,
-        inner: Inner::KinectV1 { device, _ctx: ctx },
-        v1_controls: Some(controls),
-        pose_filter: make_pose_filter(),
-        started_at: Instant::now(),
-        last_lockbar: None,
-        last_u: None,
-        u_worker: UWorker::spawn(),
-        blaze_worker: BlazePoseWorker::spawn(),
-        last_pose: None,
-        last_rgb_frame: None,
-        last_depth: None,
-        last_ir: None,
-        metrics: Metrics::new(),
-    })
+        Inner::KinectV1 { device, _ctx: ctx },
+    ))
 }
 
-fn open_webcam(index: u32) -> Result<Active, String> {
+/// Nominal `(w, h, fps)` of a webcam's best advertised mode, for the stream
+/// info bar. `index` is the 1-based position in SDL's list (what
+/// [`Backend::Webcam`] carries), resolved to an `SDL_CameraID` the same way
+/// [`open_webcam`] does. Picks the highest-resolution mode, breaking ties on
+/// frame rate — SDL usually advertises exactly one. `None` if SDL says nothing,
+/// in which case the bar falls back to a generic 640×480 30p.
+fn webcam_nominal_spec(index: u32) -> Option<(u32, u32, u32)> {
+    let cams = webcam::list().ok()?;
+    if cams.is_empty() {
+        return None;
+    }
+    let n = (index.max(1) as usize - 1).min(cams.len() - 1);
+    let fmts = webcam::supported_formats(cams[n].id).ok()?;
+    fmts.iter()
+        .max_by_key(|f| (u64::from(f.width) * u64::from(f.height), f.fps as u64))
+        .map(|f| (f.width, f.height, f.fps.round().max(0.0) as u32))
+}
+
+fn open_webcam(index: u32) -> Result<Capture, String> {
     // `index` is 1-based into SDL's enumerated list — NOT a raw SDL_CameraID
     // (those are opaque, assigned 1,2,… per hot-plug, so passing the index
     // straight to SDL_OpenCamera fails with "Invalid camera device instance
@@ -4980,34 +6336,20 @@ fn open_webcam(index: u32) -> Result<Active, String> {
         "webcam selected"
     );
     let camera = webcam::Camera::open(chosen.id).map_err(|e| format!("webcam open: {e}"))?;
-    Ok(Active {
-        backend: Backend::Webcam(index),
-        // Without lockbar/disc calibration, fx ≈ 0.85 × frame_width is a
-        // reasonable placeholder for a generic 60° HFOV webcam. The values
-        // get replaced by ht-calibrate output when that lands.
-        intrinsics: Intrinsics {
+    Ok(new_capture(
+        Backend::Webcam(index),
+        // Without lockbar/disc calibration the webcam focal is unknown; the
+        // zeroed intrinsics make consumers fall back to the shared
+        // WEBCAM_FX_PER_WIDTH nominal. Replaced by ht-calibrate output when
+        // that lands.
+        Intrinsics {
             fx: 0.0,
             fy: 0.0,
             cx: 0.0,
             cy: 0.0,
         },
-        rgb_texture: None,
-        last_head: None,
-        baseline: None,
-        inner: Inner::Webcam { camera },
-        v1_controls: None,
-        pose_filter: make_pose_filter(),
-        started_at: Instant::now(),
-        last_lockbar: None,
-        last_u: None,
-        u_worker: UWorker::spawn(),
-        blaze_worker: BlazePoseWorker::spawn(),
-        last_pose: None,
-        last_rgb_frame: None,
-        last_depth: None,
-        last_ir: None,
-        metrics: Metrics::new(),
-    })
+        Inner::Webcam { camera },
+    ))
 }
 
 // ============================================================ Image conversion
@@ -5022,6 +6364,102 @@ fn bgrx_to_rgb888(bgrx: &[u8]) -> Vec<u8> {
         out.push(chunk[2]); // R from BGRX
         out.push(chunk[1]); // G
         out.push(chunk[0]); // B
+    }
+    out
+}
+
+/// Build the camera-view image for the stream the user selected. Falls back to
+/// the colour frame whenever the chosen stream hasn't delivered anything yet
+/// (e.g. the depth listener during the first moments after an open), so the
+/// view never goes blank on a selection.
+fn stream_color_image(frame: &LatestFrame, want: StreamKind) -> ColorImage {
+    match want {
+        StreamKind::Ir => {
+            if let Some(ir) = frame.ir.as_deref() {
+                let (w, h, data) = ir;
+                // Auto-levelled so a 16-bit v2 intensity frame and an 8-bit v1
+                // one both land in a visible range — same levelling the shared
+                // captures use, so what you see matches what you'd upload.
+                let gray = autolevel_gray8_raw(data, false);
+                return rgb888_to_color_image(*w, *h, &gray8_to_rgb888(&gray));
+            }
+        }
+        StreamKind::Depth => {
+            // Prefer the colour-space projection when the v2 registration
+            // produced one: it shares the colour framing, so the pose and
+            // anchor overlays land exactly, with no lens-parallax offset.
+            // v1 / webcam (and any v2 frame before the registration ran) fall
+            // back to the sensor's native depth grid.
+            if let Some(d) = frame.depth_color.as_deref().or(frame.depth.as_deref()) {
+                let (w, h, mm) = d;
+                return rgb888_to_color_image(*w, *h, &depth_to_turbo_rgb888(mm));
+            }
+        }
+        StreamKind::Rgb => {}
+    }
+    rgb888_to_color_image(frame.w, frame.h, &frame.rgb888)
+}
+
+/// Google's Turbo colormap, subsampled to 16 control points. Perceptually far
+/// easier to read than gray for depth: distance reads as hue (near = blue,
+/// far = red) instead of as brightness, which the eye judges poorly.
+const TURBO_LUT: [[u8; 3]; 16] = [
+    [48, 18, 59],
+    [65, 69, 171],
+    [70, 117, 237],
+    [57, 162, 252],
+    [37, 200, 220],
+    [30, 228, 176],
+    [61, 244, 128],
+    [123, 252, 82],
+    [176, 244, 57],
+    [217, 220, 56],
+    [246, 187, 55],
+    [254, 145, 45],
+    [246, 100, 30],
+    [225, 63, 17],
+    [193, 35, 8],
+    [122, 4, 3],
+];
+
+/// Map a depth frame (raw millimetres, `0` = no reading) to packed RGB888
+/// through [`TURBO_LUT`], with linear interpolation between control points.
+/// Distances are clamped to the tracking range; invalid pixels come out
+/// near-black so dropouts stay obvious rather than reading as "very close".
+///
+/// Shared by the live depth view and the `*_depthview.png` contribution
+/// preview, so a reviewer sees exactly what the operator saw. The lossless
+/// `*_depth.png` keeps the raw 16-bit millimetres — this is only ever the
+/// human-readable rendering.
+fn depth_to_turbo_rgb888(mm: &[u16]) -> Vec<u8> {
+    let (lo, hi) = (DEPTH_MIN_MM, DEPTH_MAX_MM);
+    let mut out = Vec::with_capacity(mm.len() * 3);
+    for &z in mm {
+        if z == 0 {
+            out.extend_from_slice(&[10, 10, 12]);
+            continue;
+        }
+        let t = ((f32::from(z) - lo) / (hi - lo)).clamp(0.0, 1.0);
+        let x = t * (TURBO_LUT.len() - 1) as f32;
+        let i = x.floor() as usize;
+        let j = (i + 1).min(TURBO_LUT.len() - 1);
+        let f = x - i as f32;
+        let (a, b) = (TURBO_LUT[i], TURBO_LUT[j]);
+        out.extend_from_slice(&[
+            (f32::from(a[0]) + (f32::from(b[0]) - f32::from(a[0])) * f) as u8,
+            (f32::from(a[1]) + (f32::from(b[1]) - f32::from(a[1])) * f) as u8,
+            (f32::from(a[2]) + (f32::from(b[2]) - f32::from(a[2])) * f) as u8,
+        ]);
+    }
+    out
+}
+
+/// Expand 8-bit gray to packed RGB888 by replicating each byte across the three
+/// channels — how a Kinect v1 IR frame is fed to the models, which take colour.
+fn gray8_to_rgb888(gray: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(gray.len() * 3);
+    for &v in gray {
+        out.extend_from_slice(&[v, v, v]);
     }
     out
 }
@@ -5068,6 +6506,77 @@ fn contribution_stem(backend: Backend) -> String {
         backend_slug(backend),
         format_utc_stamp(now.as_secs())
     )
+}
+
+/// Encode every stream of a capture into the contribution file set: `_raw` +
+/// `_det` colour planes, lossless `_depth` (16-bit raw mm) + Turbo
+/// `_depthview`, `_ir` (native bit depth) + auto-levelled `_irview`. Shared
+/// by the GUI Contribute button and the headless `--contribute` mode so both
+/// always export EVERY stream the camera has.
+#[allow(clippy::too_many_arguments)]
+fn build_contribution_files(
+    stem: &str,
+    backend: Backend,
+    (w, h): (u32, u32),
+    raw: &[u8],
+    det: &[u8],
+    depth: Option<&(u32, u32, Vec<u16>)>,
+    ir_v2: Option<&(u32, u32, Vec<u16>)>,
+    ir_v1: Option<&freenect::IrFrame>,
+    meta: &[(String, String)],
+) -> Vec<(String, Vec<u8>)> {
+    // RGB planes are 8-bit colour; depth is 16-bit gray in raw mm; v2 IR is
+    // 16-bit gray intensity; v1 IR is 8-bit gray.
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for (kind, src) in [("raw", raw), ("det", det)] {
+        match png_bytes_meta(w, h, src, meta) {
+            Ok(bytes) => files.push((format!("{stem}_{kind}.png"), bytes)),
+            Err(e) => warn!("contribution: {kind} png encode failed: {e}"),
+        }
+    }
+    // Each depth/IR modality ships a lossless file (the real values) plus a
+    // `*view` preview so it's reviewable by eye. Depth's preview is the same
+    // Turbo false-colour the live view uses — distance reads as hue, which
+    // the eye judges far better than brightness. The lossless `_depth.png`
+    // below stays 16-bit raw mm: that's what training consumes.
+    if let Some((dw, dh, mm)) = depth {
+        match png_gray16_bytes(*dw, *dh, mm) {
+            Ok(bytes) => files.push((format!("{stem}_depth.png"), bytes)),
+            Err(e) => warn!("contribution: depth png encode failed: {e}"),
+        }
+        match png_bytes_meta(*dw, *dh, &depth_to_turbo_rgb888(mm), meta) {
+            Ok(bytes) => files.push((format!("{stem}_depthview.png"), bytes)),
+            Err(e) => warn!("contribution: depthview png encode failed: {e}"),
+        }
+    }
+    // IR: v1 always exports the freshly grabbed native 8-bit frame (the
+    // live `last_ir` is the same sensor but 8→16-widened while the IR
+    // stream is selected — using the grab keeps the file format identical
+    // across modes). v2 exports its live 16-bit stream.
+    if backend == Backend::KinectV1 {
+        if let Some(frame) = ir_v1 {
+            match png_gray8_bytes(frame.width, frame.height, &frame.data) {
+                Ok(bytes) => files.push((format!("{stem}_ir.png"), bytes)),
+                Err(e) => warn!("contribution: ir png encode failed: {e}"),
+            }
+            // v1 IR is native 8-bit; widen to reuse the u16 auto-leveller.
+            let widened: Vec<u16> = frame.data.iter().map(|&b| u16::from(b)).collect();
+            match autolevel_gray8(frame.width, frame.height, &widened, false) {
+                Ok(bytes) => files.push((format!("{stem}_irview.png"), bytes)),
+                Err(e) => warn!("contribution: irview png encode failed: {e}"),
+            }
+        }
+    } else if let Some((iw, ih, intensity)) = ir_v2 {
+        match png_gray16_bytes(*iw, *ih, intensity) {
+            Ok(bytes) => files.push((format!("{stem}_ir.png"), bytes)),
+            Err(e) => warn!("contribution: ir png encode failed: {e}"),
+        }
+        match autolevel_gray8(*iw, *ih, intensity, false) {
+            Ok(bytes) => files.push((format!("{stem}_irview.png"), bytes)),
+            Err(e) => warn!("contribution: irview png encode failed: {e}"),
+        }
+    }
+    files
 }
 
 /// Encode an RGB888 buffer to PNG bytes in memory (for the contribution
@@ -5120,17 +6629,19 @@ struct CabGeom {
 /// The Kinects have known **factory** colour intrinsics (independent of any
 /// detection), so we use them directly — scaled to the actual frame width in
 /// case the resolution differs from the native one. The webcam's focal is
-/// unknown until the lockbar autocalib recovers it, so fall back to a nominal
-/// `0.9 × width`.
+/// unknown until the lockbar autocalib recovers it, so fall back to the
+/// shared [`WEBCAM_FX_PER_WIDTH`] nominal.
 fn color_focal_px(backend: Backend, frame_width: u32) -> f32 {
     let w = frame_width as f32;
     match backend {
         // Kinect v2 colour: ~1081 px at 1920×1080.
         Backend::KinectV2 => 1081.0 * w / 1920.0,
-        // Kinect v1 RGB: ~525 px at 640×480.
-        Backend::KinectV1 => 525.0 * w / 640.0,
+        // Kinect v1 RGB: ~525 px at 640×480 (the colour lens — NOT the 580 px
+        // depth/IR focal, which lives on a different imager; see the const's
+        // doc in the freenect crate).
+        Backend::KinectV1 => freenect::RGB_FX * w / 640.0,
         // Webcam / none: nominal until autocalib supplies the real focal.
-        _ => w * 0.9,
+        _ => w * WEBCAM_FX_PER_WIDTH,
     }
 }
 
@@ -5207,7 +6718,7 @@ fn capture_meta(
         None => push("ht_pose", "none".to_string()),
     }
     // Lockbar-derived geometry: apparent width → estimated distance (the 610 mm
-    // bar seen through a nominal focal `fx = frame_w × 0.9`), and the bar centre's
+    // bar seen through the shared nominal focal), and the bar centre's
     // pixel offset → camera lateral/vertical offset off the playfield centreline
     // at that distance. Same nominal-focal placeholder as the webcam Z; the
     // autocalib homography will replace `fx` with the real one. See
@@ -5215,7 +6726,8 @@ fn capture_meta(
     match lockbar {
         Some(lb) => {
             let [tl, tr, br, bl] = lb.corners.map(|(u, v)| (u as f32, v as f32));
-            let edge = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+            let edge =
+                |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
             let width_px = 0.5 * (edge(tl, tr) + edge(bl, br));
             // Factory colour focal for the Kinects, nominal for the webcam.
             let fx = color_focal_px(backend, lb.frame_width);
@@ -5300,28 +6812,18 @@ fn sample_depth_at(
 fn autocalib_meta(
     lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
     rgb_dims: (u32, u32),
-    lockbar_mm: f32,
     depth: Option<&(u32, u32, Vec<u16>)>,
 ) -> Vec<(String, String)> {
-    use headtracking::calibration::autocalib;
+    // The two experimental focal estimators that used to emit
+    // `ht_autocalib_fx` / `ht_autocalib_dist_mm` / `ht_autocalib_vp_fx`
+    // are gone: both leaned on the lockbar's ~70 mm band thickness, which
+    // is too thin to measure (proven wrong on real captures). The metric
+    // reference is the lockbar WIDTH; webcam focal will come from the full
+    // playfield rectangle. Only the depth ground truth remains here.
     let mut m: Vec<(String, String)> = Vec::new();
     let Some(q) = lockbar else {
         return m;
     };
-    // Lockbar-rectangle homography (Zhang): focal + pose, no manual step. `t`
-    // is the front-edge centre in camera coords, so |t| = cam↔bar distance.
-    if let Some(cal) =
-        autocalib::calibrate_homography(q, lockbar_mm, autocalib::DEFAULT_LOCKBAR_DEPTH_MM)
-    {
-        let dist = (cal.t[0] * cal.t[0] + cal.t[1] * cal.t[1] + cal.t[2] * cal.t[2]).sqrt();
-        m.push(("ht_autocalib_fx".to_string(), format!("{:.0}", cal.fx)));
-        m.push(("ht_autocalib_dist_mm".to_string(), format!("{dist:.0}")));
-    }
-    // Sidebar vanishing-point focal (needs both rails; long lever arm → robust
-    // depth axis). `None` when the U-seg only yielded the front bar.
-    if let Some(cal) = autocalib::calibrate_from_lockbar(q, lockbar_mm) {
-        m.push(("ht_autocalib_vp_fx".to_string(), format!("{:.0}", cal.fx)));
-    }
     // Ground truth: measured depth at the lockbar centre (Kinect only).
     if let Some((dw, dh, dd)) = depth {
         let c = q.corners.map(|(u, v)| (u as f32, v as f32));
@@ -5411,6 +6913,36 @@ fn autolevel_gray8(
         })
         .collect();
     png_gray8_bytes(width, height, &gray)
+}
+
+/// The auto-levelling of [`autolevel_gray8`] without the PNG encode: stretches
+/// `samples` to the full 0–255 range and returns the raw bytes. Used for the
+/// live IR view, so what the camera panel shows matches the `*view` PNG a
+/// shared capture would carry.
+fn autolevel_gray8_raw(samples: &[u16], zero_is_hole: bool) -> Vec<u8> {
+    let (mut lo, mut hi) = (u16::MAX, 0u16);
+    for &v in samples {
+        if zero_is_hole && v == 0 {
+            continue;
+        }
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    if hi < lo {
+        lo = 0;
+        hi = 0;
+    }
+    let span = f32::from(hi.saturating_sub(lo)).max(1.0);
+    samples
+        .iter()
+        .map(|&v| {
+            if zero_is_hole && v == 0 {
+                0
+            } else {
+                ((f32::from(v.saturating_sub(lo)) / span) * 255.0).clamp(0.0, 255.0) as u8
+            }
+        })
+        .collect()
 }
 
 /// Decode an embedded JPEG thumbnail into an egui texture (once, at panel open).
@@ -5531,76 +7063,23 @@ fn format_utc_stamp(secs: u64) -> String {
     format!("{y:04}{month_civil:02}{d:02}-{h:02}{m:02}{s:02}")
 }
 
-/// Bake the same overlays the GUI draws (U mask tint, head bbox in red,
-/// derived lockbar quad in cyan) directly into a copy of the RGB888
-/// buffer. Used by the screenshot path so users can read back what the
-/// algorithms saw, not just the raw frame.
-/// Draw the BlazePose skeleton (bones + joints) and the lockbar contour onto a
-/// copy of an RGB888 frame. Shared by the contribution `_det` export and the
-/// headless screenshot.
+/// Bake the unified overlay ([`draw_overlay`]: skeleton bones + anchor lockbar/
+/// sidebars) into a copy of the RGB888 buffer, so a capture reads back what the
+/// algorithms saw. Shared by the contribution `_det` export and the screenshot.
 fn bake_overlays(
     width: u32,
     height: u32,
     rgb888: &[u8],
     pose: Option<&blazepose::Pose>,
-    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    anchor: Option<&anchor::AnchorGeometry>,
 ) -> Vec<u8> {
-    use blazepose::idx::{
-        LEFT_ELBOW, LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_ELBOW, RIGHT_SHOULDER, RIGHT_WRIST,
-    };
-    const LOCKBAR_RGB: [u8; 3] = [0x00, 0xe5, 0xff]; // cyan
-    const RAIL_RGB: [u8; 3] = [0xff, 0x9a, 0x00]; // orange
-    const ARM_RGB: [u8; 3] = [0xff, 0x96, 0x00]; // shoulders/elbows/wrists
-    const FACE_RGB: [u8; 3] = [0x00, 0xdc, 0x3c]; // everything else
     let mut out = rgb888.to_vec();
-    let (wu, hu) = (width as usize, height as usize);
-    if let Some(p) = pose {
-        let g = |i: usize| (p.landmarks[i].x as i32, p.landmarks[i].y as i32);
-        for (a, b) in [
-            (LEFT_SHOULDER, RIGHT_SHOULDER),
-            (LEFT_SHOULDER, LEFT_ELBOW),
-            (LEFT_ELBOW, LEFT_WRIST),
-            (RIGHT_SHOULDER, RIGHT_ELBOW),
-            (RIGHT_ELBOW, RIGHT_WRIST),
-            (NOSE, LEFT_SHOULDER),
-            (NOSE, RIGHT_SHOULDER),
-        ] {
-            draw_line_rgb(&mut out, wu, hu, g(a), g(b), C_BONE);
-        }
-        let r = (width / 220).max(4) as i32;
-        for (i, l) in p.landmarks.iter().enumerate() {
-            let c = if (11..=16).contains(&i) {
-                ARM_RGB
-            } else {
-                FACE_RGB
-            };
-            draw_disc_rgb(&mut out, wu, hu, l.x as i32, l.y as i32, r, c);
-        }
-    }
-    if let Some(bar) = lockbar {
-        for w in 0..4 {
-            let a = bar.corners[w];
-            let b = bar.corners[(w + 1) % 4];
-            draw_line_rgb(
-                &mut out,
-                wu,
-                hu,
-                (a.0 as i32, a.1 as i32),
-                (b.0 as i32, b.1 as i32),
-                LOCKBAR_RGB,
-            );
-        }
-        for rail in [bar.left_rail, bar.right_rail].into_iter().flatten() {
-            draw_line_rgb(
-                &mut out,
-                wu,
-                hu,
-                (rail[0].0 as i32, rail[0].1 as i32),
-                (rail[1].0 as i32, rail[1].1 as i32),
-                RAIL_RGB,
-            );
-        }
-    }
+    let mut canvas = RgbOverlay {
+        buf: &mut out,
+        w: width as usize,
+        h: height as usize,
+    };
+    draw_overlay(&mut canvas, pose, anchor, width, height);
     out
 }
 
@@ -5614,8 +7093,6 @@ fn bake_overlays(
 //   * optionally, a real RGB image → `personseg` → `track_mask`   (full webcam)
 // Each renders a PNG with the detected joints drawn over the input and prints
 // the joint coordinates, so a remote `ssh` run can eyeball the result.
-
-const C_BONE: [u8; 3] = [0x88, 0x88, 0x88]; // grey
 
 fn put_rgb(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, c: [u8; 3]) {
     if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
@@ -5672,9 +7149,7 @@ fn run_pose_test(
     _ir_path: Option<&str>,
     out_path: Option<&str>,
 ) -> Result<(), String> {
-    use blazepose::idx::{
-        LEFT_ELBOW, LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_ELBOW, RIGHT_SHOULDER, RIGHT_WRIST,
-    };
+    use blazepose::idx::{LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_SHOULDER, RIGHT_WRIST};
     let img = image::open(raw_path)
         .map_err(|e| format!("open {raw_path}: {e}"))?
         .to_rgb8();
@@ -5688,31 +7163,9 @@ fn run_pose_test(
         return Ok(());
     };
 
-    // Draw skeleton on a copy of the frame.
+    // Copy of the frame; the unified overlay is painted onto it at the end.
     let mut buf = img.as_raw().clone();
     let (wu, hu) = (w as usize, h as usize);
-    let bones = [
-        (LEFT_SHOULDER, RIGHT_SHOULDER),
-        (LEFT_SHOULDER, LEFT_ELBOW),
-        (LEFT_ELBOW, LEFT_WRIST),
-        (RIGHT_SHOULDER, RIGHT_ELBOW),
-        (RIGHT_ELBOW, RIGHT_WRIST),
-        (NOSE, LEFT_SHOULDER),
-        (NOSE, RIGHT_SHOULDER),
-    ];
-    let g = |i: usize| (pose.landmarks[i].x as i32, pose.landmarks[i].y as i32);
-    for (a, b) in bones {
-        draw_line_rgb(&mut buf, wu, hu, g(a), g(b), [0xcc, 0xcc, 0xcc]);
-    }
-    let r = (w / 220).max(4) as i32;
-    for (i, l) in pose.landmarks.iter().enumerate() {
-        let c = if (11..=16).contains(&i) {
-            [0xff, 0x96, 0x00]
-        } else {
-            [0x00, 0xdc, 0x3c]
-        };
-        draw_disc_rgb(&mut buf, wu, hu, l.x as i32, l.y as i32, r, c);
-    }
 
     println!(
         "== pose-test {raw_path} ({w}x{h}) — presence={:.2}",
@@ -5765,6 +7218,43 @@ fn run_pose_test(
         }
     }
 
+    // --- Anchor model (RGB): cabinet frame → lateral / sidebars→∞ / width ---
+    let anchor_geo = match anchor::AnchorDetector::new() {
+        Ok(mut det) => match det.detect(img.as_raw(), w, h) {
+            Some(d) => {
+                let geo = d.geometry(w, h);
+                println!(
+                    "  anchor score={:.2}  width={:.0}px  lateral={:+.0}px  vp={}",
+                    d.score,
+                    geo.lockbar_width_px,
+                    geo.lateral_offset_px,
+                    geo.depth_vp
+                        .map_or("inf".to_string(), |(x, y)| format!("({x:.0},{y:.0})")),
+                );
+                Some(geo)
+            }
+            None => {
+                println!("  anchor: no detection");
+                None
+            }
+        },
+        Err(e) => {
+            println!("  anchor init failed: {e}");
+            None
+        }
+    };
+
+    // Paint the one unified overlay (skeleton bones + anchor geometry) — same
+    // code path as the live view and screenshots.
+    {
+        let mut canvas = RgbOverlay {
+            buf: &mut buf,
+            w: wu,
+            h: hu,
+        };
+        draw_overlay(&mut canvas, Some(&pose), anchor_geo.as_ref(), w, h);
+    }
+
     let out = out_path.unwrap_or("pose-test.png");
     let bytes = png_bytes(w, h, &buf)?;
     std::fs::write(out, &bytes).map_err(|e| format!("write {out}: {e}"))?;
@@ -5778,10 +7268,10 @@ fn save_rgb_screenshot_at(
     height: u32,
     rgb888: &[u8],
     pose: Option<&blazepose::Pose>,
-    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    anchor: Option<&anchor::AnchorGeometry>,
     meta: &[(String, String)],
 ) -> Result<(), String> {
-    let painted = bake_overlays(width, height, rgb888, pose, lockbar);
+    let painted = bake_overlays(width, height, rgb888, pose, anchor);
     let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
     let writer = std::io::BufWriter::new(file);
     let mut encoder = png::Encoder::new(writer, width, height);
@@ -5808,7 +7298,7 @@ fn save_rgb_screenshot(
     height: u32,
     rgb888: &[u8],
     pose: Option<&blazepose::Pose>,
-    lockbar: Option<&headtracking::calibration::LockbarQuadRgb>,
+    anchor: Option<&anchor::AnchorGeometry>,
     meta: &[(String, String)],
 ) -> Result<std::path::PathBuf, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5822,7 +7312,7 @@ fn save_rgb_screenshot(
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = dir.join(format!("{slug}_{stamp}.png"));
-    save_rgb_screenshot_at(&path, width, height, rgb888, pose, lockbar, meta)?;
+    save_rgb_screenshot_at(&path, width, height, rgb888, pose, anchor, meta)?;
     Ok(path)
 }
 

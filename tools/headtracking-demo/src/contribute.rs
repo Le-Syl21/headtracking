@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 /// Public write-only share token (the tail of the share URL).
-const DROP_TOKEN: &str = "sRiJcfBKMeGwsmT";
+const DROP_TOKEN: &str = "cnYQZtzPHQSpCiW";
 const DROP_HOST: &str = "https://nextcloud.syl21.org";
 const UPLOAD_RETRIES: u32 = 3;
 
