@@ -96,6 +96,23 @@ const CONTRIB_TERMS: &[(&str, &str)] = &[
 const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
 
 fn main() {
+    // The `windows_subsystem = "windows"` attribute above detaches release
+    // builds from any console (no black window on double-click) — but the
+    // CLI modes (--capture, --contribute, --list-cameras…) still need to
+    // print when launched FROM a terminal. Re-attach to the parent's
+    // console if there is one; failing (the double-click case) is normal.
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        unsafe extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        // SAFETY: plain kernel32 call, no pointers involved.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+
     let logs: Arc<Mutex<VecDeque<String>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_LINES)));
     init_tracing(Arc::clone(&logs));
@@ -233,6 +250,20 @@ fn main() {
 // a seam eframe doesn't expose. Window plumbing adapted from egui_glow's
 // `pure_glow` example via `egui-rotate/examples/rotated_demo.rs`.
 
+/// The embedded webcam glyph (original artwork, drawn for this project) as
+/// the window/taskbar icon. `None` on a decode failure — a missing icon is
+/// not worth failing startup for.
+fn window_icon() -> Option<winit::window::Icon> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(
+        &include_bytes!("../assets/icon.png")[..],
+    ));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    winit::window::Icon::from_rgba(buf, info.width, info.height).ok()
+}
+
 struct GlutinWindowContext {
     window: winit::window::Window,
     gl_context: glutin::context::PossiblyCurrentContext,
@@ -257,6 +288,7 @@ impl GlutinWindowContext {
                 height: 800u32,
             })
             .with_title("headtracking-demo")
+            .with_window_icon(window_icon())
             .with_visible(false);
 
         let config_template_builder = glutin::config::ConfigTemplateBuilder::new()

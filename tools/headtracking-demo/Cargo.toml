@@ -56,3 +56,7 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # JPEG decode for the embedded setup / example thumbnails in the "Share a
 # capture" help (jpeg only — already in the lockfile transitively).
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[build-dependencies]
+# Embeds assets/icon.ico as the .exe icon on Windows; inert elsewhere.
+winresource = "0.1"

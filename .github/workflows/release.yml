@@ -88,19 +88,19 @@ jobs:
           #   demo_bin: headtracking-demo.exe
           #   archive: zip
 
-          # macOS Intel: `macos-26-intel` is the standard-tier alias
-          # for the most recent Intel image, free unlimited on public
-          # repos (per "Standard GitHub-hosted runners for public
-          # repositories" doc). The `-large` and `-xlarge` siblings
-          # point at the same hardware but bill against the larger-
-          # runner quota — don't use those without a configured
-          # spending limit.
-          - suffix: macos-x86_64
-            os: macos-26-intel
-            target: x86_64-apple-darwin
-            plugin_lib: libheadtracking.dylib
-            demo_bin: headtracking-demo
-            archive: tar.gz
+          # macOS Intel — disabled: ort 2.0.0-rc.13 stopped shipping
+          # prebuilt onnxruntime binaries for x86_64-apple-darwin, so the
+          # demo build fails at ort-sys. Re-enable by either compiling
+          # onnxruntime from source on that leg (slow) or when ort
+          # restores the prebuilt. Intel Macs are also a shrinking VPX
+          # audience; Apple Silicon below stays first-class.
+          #
+          # - suffix: macos-x86_64
+          #   os: macos-26-intel
+          #   target: x86_64-apple-darwin
+          #   plugin_lib: libheadtracking.dylib
+          #   demo_bin: headtracking-demo
+          #   archive: tar.gz
 
           # macOS Apple Silicon: pinned to `macos-26` so we track the
           # same OS version on both arches. `macos-latest` floats and

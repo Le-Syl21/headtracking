@@ -105,6 +105,16 @@ fn main() {
     // pre-set them from the libusb-sys metadata.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let modules_dir = write_findlibusb_shim(&out_dir);
+    // Same backslash trap one level up: cmake-rs passes OUT_DIR as the
+    // native-path install prefix, CMake copies it VERBATIM into the
+    // generated cmake_install.cmake, and `D:\a\...` (GitHub runners'
+    // workspace root!) dies on the invalid `\a` escape at install time.
+    // Overriding the prefix with forward slashes keeps every generated
+    // script parseable.
+    config.define(
+        "CMAKE_INSTALL_PREFIX",
+        out_dir.to_string_lossy().replace('\\', "/"),
+    );
     // CMake on Windows accepts forward slashes; passing native
     // backslashes triggers "Syntax error in cmake code" inside the
     // auto-generated try_compile scratch file because cmake interprets
