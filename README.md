@@ -76,8 +76,21 @@ model — lives in **[`tools/anchor/`](tools/anchor/)** with its own guide.
 
 ## 🚧 Status — honestly
 
-This is **early development**. Nothing is wired end-to-end against a running VPX
-install *yet* — but a lot of the hard parts already work standalone.
+This is **early development**, released as **beta**. It builds for Linux,
+Windows and macOS, but has only been **field-validated on Linux** so far —
+Windows and macOS runs are exactly what we need testers for. Nothing is wired
+end-to-end against a running VPX install *yet* — but a lot of the hard parts
+already work standalone.
+
+> [!CAUTION]
+> ### ⚠️ Windows + Kinect users — read this BEFORE installing anything
+> To let this project access a Kinect, the bundled driver setup **replaces
+> Microsoft's official Kinect driver** with a generic WinUSB one.
+> **This breaks everything built on the Microsoft Kinect SDK — including a
+> working BAM head-tracking setup — until you restore the original driver**
+> (Device Manager → the "Xbox NUI" devices → uninstall our driver, rescan, or
+> reinstall the Kinect SDK/runtime). Only run the Kinect driver setup if you
+> accept that trade. **Webcam users are not affected.**
 
 | Piece | State |
 |-------|-------|
@@ -256,11 +269,24 @@ devant le cab** sont les plus rares et les plus précieux.
   Microsoft, tout est lié statiquement.
 - **100 % Rust**, Linux · Windows · macOS.
 
-**État :** début de développement. Rien n'est encore branché de bout en bout dans
-VPX, mais l'essentiel des briques difficiles marche déjà en standalone (capture
-Kinect v1/v2 + webcam, tête BlazePose ~7 ms, maths d'auto-calibration validées à
-±0–3 % au mètre-ruban, démo parallaxe fish-tank). Voir le tableau d'état plus
-haut.
+**État :** début de développement, publié en **beta**. Ça compile pour Linux,
+Windows et macOS, mais ce n'est **validé sur le terrain que sous Linux** — les
+retours Windows/macOS sont exactement ce qu'on cherche. Rien n'est encore
+branché de bout en bout dans VPX, mais l'essentiel des briques difficiles
+marche déjà en standalone (capture Kinect v1/v2 + webcam, tête BlazePose
+~7 ms, maths d'auto-calibration validées à ±0–3 % au mètre-ruban, démo
+parallaxe fish-tank). Voir le tableau d'état plus haut.
+
+> [!CAUTION]
+> ### ⚠️ Utilisateurs Windows + Kinect — à lire AVANT toute installation
+> Pour que ce projet accède à une Kinect, l'installeur de pilote fourni
+> **remplace le pilote Kinect officiel de Microsoft** par un pilote WinUSB
+> générique. **Ça casse tout ce qui repose sur le SDK Kinect Microsoft — y
+> compris un head tracking BAM fonctionnel — jusqu'à restauration du pilote
+> d'origine** (Gestionnaire de périphériques → périphériques « Xbox NUI » →
+> désinstaller notre pilote puis re-scanner, ou réinstaller le SDK/runtime
+> Kinect). Ne lancez l'installeur Kinect que si vous acceptez cet échange.
+> **Les utilisateurs webcam ne sont pas concernés.**
 
 **On cherche des contributeurs — aucune permission requise, ouvre une issue ou
 passe sur le Discord :**
