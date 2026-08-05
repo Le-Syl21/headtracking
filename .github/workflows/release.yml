@@ -321,19 +321,23 @@ jobs:
     environment: signing
     steps:
       # Les noms d'artefacts portent la version du tag ; la matrice n'existe
-      # plus ici, on résout donc les deux suffixes macOS explicitement.
+      # plus ici, on résout donc le suffixe macOS explicitement. (Un seul :
+      # Apple Silicon. Si macOS Intel revient dans la matrice, ajouter un
+      # second download/upload par NOM — surtout pas un `pattern:` :
+      # `download-artifact` n'ajoute le sous-dossier par artefact que
+      # lorsque le pattern matche PLUSIEURS artefacts, un match unique
+      # s'extrait à la racine du `path` et casse toutes les hypothèses de
+      # chemins. C'est exactement le bug qui a fait échouer le premier run.)
       - name: Resolve artifact names
         run: |
           version="${GITHUB_REF_NAME#v}"
-          echo "ART_PREFIX=headtracking-${version}" >> "$GITHUB_ENV"
-          echo "ART_X86=headtracking-${version}-macos-x86_64" >> "$GITHUB_ENV"
           echo "ART_ARM=headtracking-${version}-macos-aarch64" >> "$GITHUB_ENV"
 
-      - name: Download the macOS artifacts
+      - name: Download the macOS artifact
         uses: actions/download-artifact@v8
         with:
-          pattern: ${{ env.ART_PREFIX }}-macos-*
-          path: dl
+          name: ${{ env.ART_ARM }}
+          path: dl/headtracking-macos-aarch64
 
       - name: Import Apple Developer ID certificate
         env:
@@ -450,9 +454,9 @@ jobs:
             return 1
           }
 
-          for art in "$ART_ARM" "$ART_X86"; do
+          for art in "$ART_ARM"; do
             echo "::group::$art"
-            work="dl/$art"
+            work="dl/headtracking-macos-aarch64"
 
             # `upload-artifact` round-trips through a zip blob, which doesn't
             # preserve POSIX executable bits: les fichiers reviennent en 0644.
@@ -494,15 +498,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ART_ARM }}
-          path: dl/${{ env.ART_ARM }}/
-          if-no-files-found: error
-          overwrite: true
-
-      - name: Re-upload the signed macOS x86_64 artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.ART_X86 }}
-          path: dl/${{ env.ART_X86 }}/
+          path: dl/headtracking-macos-aarch64/
           if-no-files-found: error
           overwrite: true
 
