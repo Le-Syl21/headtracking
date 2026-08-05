@@ -69,6 +69,19 @@ pub struct IrFrame {
     pub data: Vec<u8>,
 }
 
+/// Which image the single video endpoint currently carries. The Kinect v1
+/// shares one USB isochronous endpoint between the colour and IR cameras, so
+/// exactly one of them streams at a time — see [`Device::set_video_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoStream {
+    /// 640×480 RGB888 (the default).
+    Rgb,
+    /// 640×480 8-bit IR. Actively illuminated by the sensor's own emitter, so
+    /// its frame rate does not drop in a dark room the way the auto-exposed
+    /// colour stream does.
+    Ir,
+}
+
 /// Pinhole intrinsics for the Kinect v1 IR / depth camera. libfreenect does
 /// not expose factory parameters, so the values are nominal Microsoft specs
 /// (good to ~1% on a calibrated device).
@@ -76,6 +89,23 @@ pub const FX: f32 = 580.0;
 pub const FY: f32 = 580.0;
 pub const CX: f32 = (DEPTH_WIDTH as f32) / 2.0;
 pub const CY: f32 = (DEPTH_HEIGHT as f32) / 2.0;
+
+/// Pinhole intrinsics for the Kinect v1 **colour** camera (640×480). Distinct
+/// from the depth/IR intrinsics above — the two imagers sit behind different
+/// lenses (colour ≈ 62° HFOV vs depth ≈ 58°), so using [`FX`] on colour-frame
+/// pixels overestimates every colour-derived distance by ~10 %.
+///
+/// libfreenect itself carries no literal colour focal: its registration runs
+/// off a per-device factory blob (`vendor/libfreenect/src/registration.c`,
+/// `freenect_zero_plane_info`). These are the widely used community
+/// calibration values (Burrus / OpenNI defaults, ~525 px at 640×480), good to
+/// ~1–2 % across retail units — and independently confirmed on our own
+/// captures by `tools/anchor/campose.py` (rails ⟂ lockbar comes out at ~91°
+/// with 525 where 580 skews it).
+pub const RGB_FX: f32 = 525.0;
+pub const RGB_FY: f32 = 525.0;
+pub const RGB_CX: f32 = (VIDEO_WIDTH as f32) / 2.0;
+pub const RGB_CY: f32 = (VIDEO_HEIGHT as f32) / 2.0;
 
 /// Mechanical tilt range advertised by the Kinect v1 motor (in degrees).
 pub const TILT_MIN_DEG: f32 = -31.0;
@@ -298,6 +328,10 @@ pub struct Device {
     started: AtomicBool,
     depth_running: bool,
     video_running: bool,
+    /// Image the video endpoint currently carries. Kept in step with every
+    /// `set_video_format` call so callers can tell whether `poll_rgb` or
+    /// `poll_ir_frame` is the meaningful one.
+    video_stream: VideoStream,
     ctx: Arc<CtxHandle>,
 }
 
@@ -359,6 +393,8 @@ impl Device {
             started: AtomicBool::new(false),
             depth_running: false,
             video_running: false,
+            // `wrap` configured FREENECT_VIDEO_RGB above.
+            video_stream: VideoStream::Rgb,
             ctx,
         })
     }
@@ -457,13 +493,56 @@ impl Device {
         self.slots.depth.poll()
     }
 
-    /// Read the latest color frame (640×480 RGB888), if any.
+    /// Read the latest color frame (640×480 RGB888), if any. Only meaningful
+    /// while [`Self::video_stream`] is [`VideoStream::Rgb`] — in IR mode the
+    /// endpoint carries 8-bit gray, so use [`Self::poll_ir_frame`] instead.
     pub fn poll_rgb(&self) -> Option<RgbFrame> {
         self.slots.video.poll()
     }
 
+    /// Read the latest 8-bit IR frame (640×480 gray), if any. Only meaningful
+    /// while [`Self::video_stream`] is [`VideoStream::Ir`]; in RGB mode the
+    /// endpoint carries three bytes per pixel and this returns `None` rather
+    /// than a mis-sized frame.
+    pub fn poll_ir_frame(&self) -> Option<IrFrame> {
+        self.slots.video.poll_ir()
+    }
+
+    /// Which image the video endpoint currently carries.
+    pub fn video_stream(&self) -> VideoStream {
+        self.video_stream
+    }
+
+    /// Switch the video endpoint between colour and IR, and leave it there.
+    ///
+    /// The Kinect v1 shares a single USB isochronous endpoint between the two
+    /// cameras, so this is a genuine trade — while IR streams there is no
+    /// colour frame at all (and vice versa). The depth stream is untouched.
+    /// The switch stops and restarts the video stream, so expect a ~100–150 ms
+    /// gap; it is a user-driven action, not something to call per frame.
+    /// A no-op (and no stream interruption) when already in the requested mode.
+    pub fn set_video_stream(&mut self, s: VideoStream) -> Result<(), Error> {
+        if self.video_stream == s {
+            return Ok(());
+        }
+        let (format, bytes) = match s {
+            VideoStream::Rgb => (
+                sys::freenect_video_format_FREENECT_VIDEO_RGB,
+                (VIDEO_WIDTH * VIDEO_HEIGHT * 3) as usize,
+            ),
+            VideoStream::Ir => (
+                sys::freenect_video_format_FREENECT_VIDEO_IR_8BIT,
+                (VIDEO_WIDTH * VIDEO_HEIGHT) as usize,
+            ),
+        };
+        self.set_video_format(format, bytes)?;
+        self.video_stream = s;
+        Ok(())
+    }
+
     /// Momentarily switch the video stream to 8-bit IR, let it settle, grab
-    /// one frame, then switch back to RGB. The depth stream is untouched.
+    /// one frame, then restore whatever stream was selected (no switch at all
+    /// when IR is already live). The depth stream is untouched.
     ///
     /// The Kinect v1 shares a single USB isochronous endpoint between RGB and
     /// IR, so the two are mutually exclusive — this reconfigures the video
@@ -473,28 +552,58 @@ impl Device {
     /// needs a couple of frames for its auto-exposure to settle — 3 is a good
     /// default). Precondition: the video stream is already running (so the
     /// event loop is live); otherwise this returns [`Error::CaptureTimeout`]
-    /// after restoring RGB.
+    /// after restoring the caller's stream.
     pub fn capture_ir(&mut self, warmup: usize) -> Result<IrFrame, Error> {
-        // Reconfigure to IR_8BIT (640×480, one byte per pixel).
-        self.set_video_format(
-            sys::freenect_video_format_FREENECT_VIDEO_IR_8BIT,
-            (VIDEO_WIDTH * VIDEO_HEIGHT) as usize,
-        )?;
-        // Keep the Nth fresh frame that arrives after the switch.
-        let grabbed = self.grab_fresh_video(warmup.max(1), Duration::from_millis(1500));
-        // Always restore RGB, even if the grab timed out.
-        let restore = self.set_video_format(
-            sys::freenect_video_format_FREENECT_VIDEO_RGB,
-            (VIDEO_WIDTH * VIDEO_HEIGHT * 3) as usize,
-        );
-        let (data, timestamp_raw) = grabbed.ok_or(Error::CaptureTimeout)?;
-        restore?;
+        let (data, timestamp_raw) = self.capture_video_as(VideoStream::Ir, warmup)?;
         Ok(IrFrame {
             width: VIDEO_WIDTH,
             height: VIDEO_HEIGHT,
             timestamp_raw,
             data,
         })
+    }
+
+    /// Momentarily switch the video stream to colour, let the auto-exposure
+    /// settle, grab one frame, then restore whatever stream was selected.
+    /// The exact mirror of [`Self::capture_ir`] — needed so a contribution
+    /// capture can always export a true-colour frame even while the user has
+    /// the IR stream selected. Same caveats: ~100–150 ms video gap per switch,
+    /// manual-action cadence only, requires a running video stream.
+    pub fn capture_rgb(&mut self, warmup: usize) -> Result<RgbFrame, Error> {
+        let (data, timestamp_raw) = self.capture_video_as(VideoStream::Rgb, warmup)?;
+        Ok(RgbFrame {
+            width: VIDEO_WIDTH,
+            height: VIDEO_HEIGHT,
+            timestamp_raw,
+            data,
+        })
+    }
+
+    /// Shared body of [`Self::capture_ir`] / [`Self::capture_rgb`]: grab the
+    /// `warmup`-th fresh frame of `target`, borrowing the video endpoint if a
+    /// mode switch is needed and **always restoring the caller's selected
+    /// stream** afterwards (even when the grab times out). When the endpoint
+    /// already carries `target`, no switch happens — the frame comes straight
+    /// off the live stream.
+    fn capture_video_as(
+        &mut self,
+        target: VideoStream,
+        warmup: usize,
+    ) -> Result<(Vec<u8>, u32), Error> {
+        if self.video_stream == target {
+            return self
+                .grab_fresh_video(warmup.max(1), Duration::from_millis(1500))
+                .ok_or(Error::CaptureTimeout);
+        }
+        let restore_to = self.video_stream;
+        self.set_video_stream(target)?;
+        let grabbed = self.grab_fresh_video(warmup.max(1), Duration::from_millis(1500));
+        // Restore the user's stream even if the grab timed out — the
+        // contribution borrows the sensor, it never keeps it.
+        let restore = self.set_video_stream(restore_to);
+        let (data, timestamp_raw) = grabbed.ok_or(Error::CaptureTimeout)?;
+        restore?;
+        Ok((data, timestamp_raw))
     }
 
     /// Stop the video stream, set a new video format + matching frame size,
@@ -748,6 +857,32 @@ impl VideoSlot {
             return None;
         }
         let frame = RgbFrame {
+            width: VIDEO_WIDTH,
+            height: VIDEO_HEIGHT,
+            timestamp_raw: g.timestamp,
+            data: g.data.clone(),
+        };
+        drop(g);
+        self.has_new.store(false, Ordering::Release);
+        Some(frame)
+    }
+
+    /// Same as [`Self::poll`] but reads the slot as one intensity byte per
+    /// pixel. Returns `None` unless the buffer really holds a full 8-bit
+    /// frame, so calling this in RGB mode yields nothing instead of a frame
+    /// built from a third of the image.
+    fn poll_ir(&self) -> Option<IrFrame> {
+        if !self.has_new.load(Ordering::Acquire) {
+            return None;
+        }
+        let g = self.inner.lock();
+        if !self.has_new.load(Ordering::Relaxed) {
+            return None;
+        }
+        if g.data.len() != (VIDEO_WIDTH * VIDEO_HEIGHT) as usize {
+            return None; // not an 8-bit IR buffer — wrong video mode
+        }
+        let frame = IrFrame {
             width: VIDEO_WIDTH,
             height: VIDEO_HEIGHT,
             timestamp_raw: g.timestamp,

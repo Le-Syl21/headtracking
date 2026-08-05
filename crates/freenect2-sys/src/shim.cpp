@@ -11,6 +11,19 @@
 
 namespace freenect2_shim {
 
+namespace {
+// Kinect v2 sensor geometry, fixed in hardware and hard-checked by
+// libfreenect2's Registration::apply().
+constexpr size_t kColorW = 1920;
+constexpr size_t kColorH = 1080;
+constexpr size_t kDepthW = 512;
+constexpr size_t kDepthH = 424;
+// apply() writes bigdepth as its internal filter map: the colour plane plus a
+// one-row border top and bottom (filter_height_half = 1), i.e. 1920×1082
+// floats. Colour row `y` therefore lives at bigdepth row `y + 1`.
+constexpr size_t kBigDepthLen = kColorW * (kColorH + 2);
+}  // namespace
+
 RustLogger::RustLogger(libfreenect2::Logger::Level lvl) {
     level_ = lvl;
 }
@@ -262,6 +275,57 @@ IrCameraParams ir_params(const Freenect2Dev &dev) {
     r.p1 = p.p1;
     r.p2 = p.p2;
     return r;
+}
+
+ColorCameraParams color_params(const Freenect2Dev &dev) {
+    ColorCameraParams r{};
+    if (!dev.dev) return r;
+    auto p = const_cast<libfreenect2::Freenect2Device *>(dev.dev)->getColorCameraParams();
+    r.fx = p.fx;
+    r.fy = p.fy;
+    r.cx = p.cx;
+    r.cy = p.cy;
+    return r;
+}
+
+bool register_bigdepth(Registration &reg, rust::Slice<const uint8_t> rgb,
+                       rust::Slice<const float> depth,
+                       rust::Slice<float> bigdepth) {
+    if (!reg.inner) {
+        return false;
+    }
+    // libfreenect2's apply() silently returns on any dimension mismatch, so
+    // validate here — otherwise a wrong-sized buffer would look like success
+    // while leaving stale data behind. Sizes are fixed by the sensor.
+    if (rgb.size() != kColorW * kColorH * 4 || depth.size() != kDepthW * kDepthH ||
+        bigdepth.size() != kBigDepthLen) {
+        return false;
+    }
+    // `Frame(w, h, bpp, data)` with non-null `data` does NOT take ownership
+    // (it leaves `rawdata` null, so ~Frame() deletes nothing). apply() only
+    // reads rgb/depth, hence the const_cast onto libfreenect2's non-const API.
+    libfreenect2::Frame rgb_f(kColorW, kColorH, 4,
+                              const_cast<unsigned char *>(rgb.data()));
+    libfreenect2::Frame depth_f(
+        kDepthW, kDepthH, 4,
+        reinterpret_cast<unsigned char *>(const_cast<float *>(depth.data())));
+    libfreenect2::Frame bigdepth_f(
+        kColorW, kColorH + 2, 4,
+        reinterpret_cast<unsigned char *>(bigdepth.data()));
+    // apply() requires both scratch outputs even though we only want bigdepth.
+    // Persistent members (lazily sized): at 30 Hz, per-call vectors were
+    // ~50 MB/s of pure allocator churn.
+    reg.undistorted_scratch.resize(kDepthW * kDepthH * 4);
+    reg.registered_scratch.resize(kDepthW * kDepthH * 4);
+    libfreenect2::Frame undistorted_f(kDepthW, kDepthH, 4,
+                                      reg.undistorted_scratch.data());
+    libfreenect2::Frame registered_f(kDepthW, kDepthH, 4,
+                                     reg.registered_scratch.data());
+    // enable_filter MUST be true: bigdepth doubles as the filter map, and the
+    // non-filtered path never writes it.
+    reg.inner->apply(&rgb_f, &depth_f, &undistorted_f, &registered_f, true,
+                     &bigdepth_f, nullptr);
+    return true;
 }
 
 std::unique_ptr<Registration> new_registration(const Freenect2Dev &dev) {

@@ -109,6 +109,18 @@ mod ffi {
         pub p2: f32,
     }
 
+    /// Color camera intrinsics. Matches `Freenect2Device::ColorCameraParams`
+    /// (only the pinhole terms — the distortion coefficients aren't needed:
+    /// libfreenect2's registration already outputs undistorted color-space
+    /// depth). Valid once the device has started streaming.
+    #[derive(Clone, Copy, Default)]
+    pub struct ColorCameraParams {
+        pub fx: f32,
+        pub fy: f32,
+        pub cx: f32,
+        pub cy: f32,
+    }
+
     /// A depth pixel mapped onto the color image via [`map_depth_to_color`].
     /// `x`/`y` are color-frame pixel coordinates (0..1920, 0..1080); `valid`
     /// is `false` when the depth point has no color mapping (out of the color
@@ -182,6 +194,11 @@ mod ffi {
         /// IR / depth camera intrinsics, available after the device starts.
         fn ir_params(dev: &Freenect2Dev) -> IrCameraParams;
 
+        /// Color camera intrinsics, available after the device starts. Needed
+        /// to deproject a point sampled from the *color-space* depth map
+        /// produced by [`register_bigdepth`].
+        fn color_params(dev: &Freenect2Dev) -> ColorCameraParams;
+
         /// Build a depth↔color [`Registration`] from the device's factory
         /// intrinsics. Call after `start_streams` — before the camera params
         /// have loaded the returned registration maps nothing (all `valid=false`).
@@ -190,17 +207,38 @@ mod ffi {
         /// Map a depth pixel `(dx, dy)` at depth `dz` (mm) onto the color image.
         /// See [`ColorPixel`]. Pure/const — safe to call from any thread.
         fn map_depth_to_color(reg: &Registration, dx: i32, dy: i32, dz: f32) -> ColorPixel;
+
+        /// Project the whole depth frame into **color space**: fills `bigdepth`
+        /// with `1920 × 1082` millimetre floats, so color pixel `(x, y)` reads
+        /// at `bigdepth[(y + 1) * 1920 + x]` (one blank border row top and
+        /// bottom). Pixels with no depth come back `+inf`, *not* zero.
+        ///
+        /// `rgb` is BGRX `1920*1080*4` bytes, `depth` is `512*424` millimetre
+        /// floats. Returns `false` — leaving `bigdepth` untouched — if the
+        /// registration was built before the camera params loaded, or any
+        /// buffer length is wrong.
+        fn register_bigdepth(
+            reg: Pin<&mut Registration>,
+            rgb: &[u8],
+            depth: &[f32],
+            bigdepth: &mut [f32],
+        ) -> bool;
     }
 }
 
 pub use ffi::{
-    ColorPixel, DepthFrame, Freenect2Ctx, Freenect2Dev, IrCameraParams, IrFrame, Registration,
-    RgbFrame,
+    ColorCameraParams, ColorPixel, DepthFrame, Freenect2Ctx, Freenect2Dev, IrCameraParams, IrFrame,
+    Registration, RgbFrame,
 };
 pub use ffi::{
-    enumerate, install_logger, ir_params, map_depth_to_color, new_context, new_registration,
-    open_default, poll_depth, poll_ir, poll_rgb, start_depth, start_streams, stop_device,
+    color_params, enumerate, install_logger, ir_params, map_depth_to_color, new_context,
+    new_registration, open_default, poll_depth, poll_ir, poll_rgb, register_bigdepth, start_depth,
+    start_streams, stop_device,
 };
+
+/// Length of the color-space depth buffer [`register_bigdepth`] fills:
+/// `1920 × 1082` floats (the color plane plus a one-row border top and bottom).
+pub const BIGDEPTH_LEN: usize = 1920 * 1082;
 
 // SAFETY: libfreenect2 spawns its own internal worker threads; the
 // Rust-visible handles are only ever touched from a single Rust thread
@@ -209,7 +247,11 @@ pub use ffi::{
 // enforced by the safe wrapper's `Mutex<UniquePtr<...>>`.
 unsafe impl Send for ffi::Freenect2Ctx {}
 unsafe impl Send for ffi::Freenect2Dev {}
-// `Registration::apply` is a const, pure-math method with no shared mutable
-// state — safe to move between threads and to share by `&`.
+// The shim `Registration` now carries persistent scratch buffers, but they
+// are only ever written through `register_bigdepth(Pin<&mut _>)` — shared
+// `&` access (`map_depth_to_color`) stays const pure math. So moving it
+// between threads is fine (in practice a single capture thread owns it),
+// and sharing by `&` cannot race the scratch state, which is only reachable
+// through an exclusive borrow.
 unsafe impl Send for ffi::Registration {}
 unsafe impl Sync for ffi::Registration {}

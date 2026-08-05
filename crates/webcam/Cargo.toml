@@ -19,3 +19,9 @@ sdl3-sys = { version = "0.6", default-features = false, features = [
 parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
+# Fast MJPG decode for the camera stream. Same vendored static libjpeg-turbo
+# the Kinect v2 path already links (freenect2-sys pulls the identical crate,
+# cargo dedups to one instance — a single static archive in the binary).
+# SDL's own MJPG→RGB conversion is a software path that costs ~40 ms/frame at
+# 1280×720 and caps the webcam at ~20 fps; TurboJPEG does it in a few ms.
+turbojpeg-sys = { version = "1", default-features = false, features = ["cmake"] }

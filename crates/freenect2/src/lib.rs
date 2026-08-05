@@ -29,7 +29,10 @@ use cxx::UniquePtr;
 use parking_lot::Mutex;
 
 use freenect2_sys as sys;
-pub use freenect2_sys::{DepthFrame, IrCameraParams, IrFrame, RgbFrame, take_last_log_error};
+pub use freenect2_sys::{
+    BIGDEPTH_LEN, ColorCameraParams, DepthFrame, IrCameraParams, IrFrame, RgbFrame,
+    take_last_log_error,
+};
 
 /// Depth↔color registration model (IR-vs-RGB parallax correction).
 ///
@@ -52,6 +55,32 @@ impl Registration {
         let reg = self.inner.as_ref()?;
         let p = sys::map_depth_to_color(reg, dx as i32, dy as i32, dz);
         p.valid.then_some((p.x, p.y))
+    }
+
+    /// Project a whole depth frame into **color space**, filling `out` with
+    /// `1920 × 1082` millimetre floats — color pixel `(x, y)` reads at
+    /// `out[(y + 1) * 1920 + x]`, since libfreenect2 pads one border row top
+    /// and bottom. Pixels the depth camera couldn't see come back **`+inf`**,
+    /// not zero, so callers must gate on `is_finite()`.
+    ///
+    /// This is the accurate alternative to scaling a color coordinate into the
+    /// depth grid by resolution ratio: the two sensors sit ~5 cm apart with
+    /// different fields of view, so the naive mapping samples the wrong pixel
+    /// (increasingly so as the subject nears the camera).
+    ///
+    /// `rgb` is BGRX (`1920*1080*4` bytes) and `depth` is `512*424` millimetre
+    /// floats, exactly as [`Device::poll_rgb`] and [`Device::poll_depth`]
+    /// deliver them. `out` must be [`BIGDEPTH_LEN`] long — allocate it once and
+    /// reuse it, it's ~8 MB. Returns `false` (leaving `out` untouched) if any
+    /// length is wrong or the registration was built before the device had
+    /// streamed its camera params.
+    /// `&mut` because the shim reuses per-registration scratch planes across
+    /// calls instead of reallocating ~1.7 MB each frame.
+    pub fn bigdepth(&mut self, rgb: &[u8], depth: &[f32], out: &mut [f32]) -> bool {
+        if self.inner.is_null() {
+            return false;
+        }
+        sys::register_bigdepth(self.inner.pin_mut(), rgb, depth, out)
     }
 }
 
@@ -218,6 +247,14 @@ impl Device {
     pub fn ir_params(&self) -> IrCameraParams {
         let guard = self.inner.lock();
         sys::ir_params(&guard)
+    }
+
+    /// Color camera intrinsics. Valid after [`Device::start`]. Use these — not
+    /// [`Device::ir_params`] — to deproject a point sampled from
+    /// [`Registration::bigdepth`], which lives in color space.
+    pub fn color_params(&self) -> ColorCameraParams {
+        let guard = self.inner.lock();
+        sys::color_params(&guard)
     }
 
     /// Build a depth↔color [`Registration`] from this device's factory

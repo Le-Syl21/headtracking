@@ -25,6 +25,7 @@ struct DepthFrame;
 struct IrFrame;
 struct RgbFrame;
 struct IrCameraParams;
+struct ColorCameraParams;
 struct ColorPixel;
 
 // The combined IR+Depth listener slot. libfreenect2 delivers both the IR and
@@ -104,6 +105,11 @@ struct Freenect2Dev {
 // camera params (getColorCameraParams would be all-zero).
 struct Registration {
     std::unique_ptr<libfreenect2::Registration> inner;
+    // Scratch planes apply() insists on filling even though we only keep
+    // bigdepth. Persistent members so the 30 Hz call doesn't allocate
+    // ~1.7 MB per frame; sized lazily on first use.
+    std::vector<unsigned char> undistorted_scratch;
+    std::vector<unsigned char> registered_scratch;
 };
 
 // Subclass of libfreenect2's Logger that forwards each log call into
@@ -132,8 +138,12 @@ bool poll_depth(Freenect2Dev &dev, DepthFrame &out);
 bool poll_ir(Freenect2Dev &dev, IrFrame &out);
 bool poll_rgb(Freenect2Dev &dev, RgbFrame &out);
 IrCameraParams ir_params(const Freenect2Dev &dev);
+ColorCameraParams color_params(const Freenect2Dev &dev);
 std::unique_ptr<Registration> new_registration(const Freenect2Dev &dev);
 ColorPixel map_depth_to_color(const Registration &reg, int32_t dx, int32_t dy,
                               float dz);
+bool register_bigdepth(Registration &reg, rust::Slice<const uint8_t> rgb,
+                       rust::Slice<const float> depth,
+                       rust::Slice<float> bigdepth);
 
 }  // namespace freenect2_shim
