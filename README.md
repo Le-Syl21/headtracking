@@ -1,622 +1,279 @@
-# headtracking
+<div align="center">
 
-[🇬🇧 English](#english) · [🇫🇷 Français](#français)
+# 🎯 headtracking
 
-Real-time head tracking POV plugin for **Visual Pinball X 10.8.1+**, in pure Rust.
-Drives the table's POV live from a **Kinect v1**, **Kinect v2** or **webcam**,
-through VPX's new plugin system. Open-source alternative to BAM,
-cross-platform (Linux, Windows, macOS).
+**Real-time head-tracked 3D point-of-view for [Visual Pinball X](https://github.com/vpinball/vpinball) — pure Rust, zero-install, self-calibrating.**
 
-- Repo: <https://github.com/Le-Syl21/headtracking>
-- License: GPL-3.0-or-later
-- Status: **beta (0.0.3) — early development, nothing tested end-to-end yet**
+Move your head, the table's perspective follows — the *fish-tank VR* effect that
+makes a flat screen feel like a real cabinet. An open-source, cross-platform
+alternative to BAM, that works from a plain **webcam** or a **Kinect v1 / v2**.
 
-> ⚠ **Heads-up — work in progress.** Nothing has been physically wired up and
-> tested against a running VPX install yet. The plugin builds on every target
-> and the trackers run standalone (`headtracking-demo`), but the
-> install/configure flow described below is the *intended* one and may still
-> be wrong in places. Bug reports very welcome.
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20·%20Windows%20·%20macOS-informational)]()
+[![Status](https://img.shields.io/badge/status-early%20dev-yellow)]()
+[![Discord](https://img.shields.io/badge/Discord-support%20%26%20beta-5865F2?logo=discord&logoColor=white)](https://discord.gg/cFcNrt9AY)
+[![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen)](#-contributors-wanted)
 
-## Community & support
+**🇬🇧 [English](#-what-makes-it-different) · 🇫🇷 [Français](#-français)**
 
-Questions, bug reports, beta testing, or just want to chat? Join the Discord:
+<table><tr>
+<td><img src="docs/images/setup.jpeg" alt="A pinball cabinet running VPX, with a Kinect v2 and a webcam mounted on the backbox"/></td>
+<td><img src="docs/images/setup-backbox.jpeg" alt="Close-up of the cameras mounted on top of the backbox"/></td>
+<td><img src="docs/images/lockbar-detection.jpeg" alt="Detected lockbar (box) and side rails overlaid on a real cabinet"/></td>
+</tr></table>
 
-[![Discord](https://img.shields.io/badge/Discord-Le--Syl21%20Tools-5865F2?logo=discord&logoColor=white)](https://discord.gg/T37DYHmt2j)
+<sub>A real pincab (Attack from Mars): the tracking rig on the backbox, and the cabinet reference frame the model detects.</sub>
+
+</div>
 
 ---
 
-## English
+## ✨ What makes it different
 
-### Install the plugin
+Head tracking for pinball isn't new. Doing it **without asking the user to
+calibrate anything** is. That's the whole bet of this project:
 
-Grab the binary for your OS from the Releases page and drop it into VPX's
-plugin folder:
+- **Zero manual calibration.** The cabinet itself is the calibration target. The
+  lockbar and the two side rails form a **known rectangle** of the playfield. Seen
+  in perspective, that's enough to recover the camera's focal length *and* its
+  pose relative to the table — from the image alone. No checkerboard, no wizard,
+  no "look here and press space".
+
+  ![Detected lockbar (box) and side rails on a real cabinet](docs/images/lockbar-detection.jpeg)
+
+  <sub>The reference frame the model finds: lockbar (box) + the two side rails → camera pose, automatically.</sub>
+
+- **3D from a plain webcam.** No depth sensor required: the recovered focal turns
+  a single camera into a metric 3D head tracker. Kinect depth is a bonus, not a
+  requirement.
+- **Zero install for the end user.** One plugin binary. No Microsoft SDK, no
+  Python, no drivers to hunt down — `libfreenect`/`libfreenect2` and the ONNX
+  runtime are all statically linked.
+- **100 % Rust**, cross-platform (Linux · Windows · macOS), GPL-3.0.
+
+## 🧠 How it works
+
+```mermaid
+flowchart LR
+    CAM[Webcam / Kinect] --> HEAD[BlazePose<br/>head landmarks]
+    CAM --> ANCHOR[anchor model<br/>lockbar + rails]
+    ANCHOR --> CAL[Auto-calibration<br/>focal + camera pose]
+    HEAD --> POSE[Head position in mm]
+    CAL --> POSE
+    POSE --> VPX[VPX plugin<br/>live POV update]
+    VPX --> TABLE[Table perspective follows your head]
+```
+
+Two ONNX models run per frame through [`ort`](https://ort.pyke.io/): **BlazePose**
+finds the head (~7 ms), and the **`anchor`** model locates the cabinet's reference
+frame. A pure-Rust decoder turns that frame into the camera's focal length and
+pose (vanishing points + single-plane homography), then every head pixel
+deprojects into real millimetres and drives the table's point of view.
+
+The auto-calibration toolkit — draw a few lines on cabinet photos, get an ONNX
+model — lives in **[`tools/anchor/`](tools/anchor/)** with its own guide.
+
+## 🚧 Status — honestly
+
+This is **early development**. Nothing is wired end-to-end against a running VPX
+install *yet* — but a lot of the hard parts already work standalone.
+
+| Piece | State |
+|-------|-------|
+| VPX plugin loads & builds (Linux/Windows/macOS) | ✅ |
+| Kinect v2 capture + head blob | ✅ operational |
+| Kinect v1 capture | ✅ |
+| Webcam capture (SDL3) | ✅ |
+| BlazePose head tracking (ONNX, ~7 ms) | ✅ proven on real captures |
+| Standalone demo + fish-tank parallax window | ✅ `headtracking-demo` |
+| Auto-calibration maths (focal + pose) | ✅ validated to ±0–3 % vs tape measure |
+| `anchor` training pipeline (lines → ONNX) | ✅ validated end-to-end |
+| Trained, generalizing `anchor` model | 🚧 needs annotated photos |
+| Live POV inside VPX, end-to-end | 🚧 not tested yet |
+| Windows / macOS real-world runs | 🚧 needs testers |
+
+## 📸 We need captures of YOUR pincab — 2 minutes, no coding
+
+**This is the project's #1 bottleneck, and anyone with a pincab can fix it.**
+The auto-calibration model currently knows exactly one cabinet: ours. To learn
+what *every* lockbar and rail look like — every wood tone, lighting, camera
+angle — it needs to see real cabinets. Yours.
+
+1. Download **`headtracking-demo`** from the
+   [latest release](https://github.com/Le-Syl21/headtracking/releases) — a
+   single binary, nothing to install.
+2. Point your webcam or Kinect at the playfield, select it in the demo.
+3. Click **🎁 Contribute** and confirm.
+
+That's it. The demo uploads a capture set (colour image + what the detector
+saw + depth/IR when a Kinect is there) to a write-only drop, and it becomes
+training data.
+
+![The reference frame derived from a capture: 4 traced lines and their 6 intersection points on the lockbar and rails](docs/images/anchor-check.jpeg)
+
+<sub>What we extract from your capture: the lockbar's two edges, the two side
+rails, and their 6 intersection points — the cabinet's reference frame.</sub>
+
+**What gets shared, honestly:** the images show your cabinet and whatever is
+around it — check the preview before accepting. Uploads need no account and carry no identity; each capture has a printed ID you can quote on Discord
+to have it removed. Empty cab or mid-game, day or night, every variation
+helps — captures with **a player standing at the cab** are the rarest and
+most valuable.
+
+## 🙌 Contributors wanted
+
+**This project needs a small crew to go from "the hard parts work" to "you can
+install it and play".** If any of this sounds like your kind of fun, jump in — no
+permission needed, open an issue or say hi on Discord.
+
+- 📸 **Send a capture of your pincab** *(biggest lever, no coding — see
+  [above](#-we-need-captures-of-your-pincab--2-minutes-no-coding))*, or go one
+  step further and **annotate photos**: trace 4 lines per photo in a browser
+  tool ([`tools/anchor/`](tools/anchor/)). More cabinets = a model that
+  generalizes.
+- 🦀 **Rust / systems** — the VPX plugin glue, the calibration decoder, the
+  filter/POV mapping. Clean `cdylib`, no async soup.
+- 👁️ **Computer vision / ML** — improve the head + anchor models, the
+  vanishing-point/homography solver, webcam focal recovery.
+- 🎛️ **VPX & pinball folks** — test the plugin on real tables, sanity-check the
+  POV feel, tell us what a good cabinet setup needs.
+- 🪟 **Windows / macOS testers** — it builds everywhere; it has run on Linux. Help
+  us prove the other two.
+
+New to the codebase? [`CLAUDE.md`](CLAUDE.md) is a full architecture tour, and the
+issues tagged **good first issue** are a soft landing.
+
+## 🔧 Build & run
+
+```bash
+git clone --recurse-submodules https://github.com/Le-Syl21/headtracking
+cd headtracking
+
+# Build the plugin (pick your backend)
+cargo build --release --features kinect-v2      # or: all-trackers
+
+# Try the trackers + fish-tank parallax window, no VPX needed
+cargo run --release -p headtracking-demo --features kinect-v2
+```
+
+No user-facing dependencies to install: `libfreenect`, `libfreenect2`,
+libjpeg-turbo and the ONNX runtime are vendored and statically linked. You need a
+recent Rust (2024 edition), `cmake`, `libclang` (for bindgen) and `libusb-1.0`.
+Full install / VPX config / per-OS Kinect setup: **[`docs/INSTALL.md`](docs/INSTALL.md)**.
+
+### Install into VPX
+
+Drop the built library into VPX's plugin folder:
 
 ```
 <VPX_install>/plugins/headtracking/
 ├── plugin.cfg
 ├── headtracking.dll          # Windows
-├── libheadtracking.so        # Linux (x86_64 or aarch64)
-└── libheadtracking.dylib     # macOS (arm64 or x86_64)
+├── libheadtracking.so        # Linux
+└── libheadtracking.dylib     # macOS
 ```
 
-Both files (the binary **and** `plugin.cfg`) must live in the same folder —
-VPX scans `plugins/<id>/plugin.cfg` to discover plugins.
+## 🗺️ Architecture
 
-### Enable & configure inside VPX
-
-1. Launch VPX once after copying the files. The plugin manager picks up the
-   new `plugin.cfg` automatically.
-2. Open **Preferences → Plugins**, find **Head Tracking** in the list, tick
-   **Enable**, then restart VPX. The plugin only loads on next start, not
-   live.
-3. The plugin's settings appear in the same dialog (one row per setting).
-   Under the hood they're persisted in `VPinballX.ini` under
-   `[Plugin.HeadTracking]` — you can also edit that file by hand:
-
-   ```ini
-   [Plugin.HeadTracking]
-   Backend             = 0     ; 0=Auto, 1=Kinect v2, 2=Kinect v1, 3=Webcam
-   DeviceIndex         = 0     ; 0-based, ignored for Kinect v2
-   Gain                = 1.0   ; multiplier applied to head delta → camera
-   MinCutoffHz         = 0.4   ; 1€ filter baseline cutoff (lower = smoother when still)
-   Beta                = 0.05  ; 1€ filter response to fast motion (higher = less lag)
-   BaselineOffsetX     = 0.0   ; correction (mm) on the captured neutral pose
-   BaselineOffsetY     = 0.0
-   BaselineOffsetZ     = 0.0
-   LockbarHandSpan     = 660.0 ; mm between hands on flipper buttons (~660 widebody)
-   LockbarFloorHeight  = 850.0 ; mm from floor to top of lockbar (850 widebody)
-   IPDmm               = 63.0  ; interpupillary distance — 63 adult mean
-   ```
-
-   On Linux this lives at `~/.vpinball/VPinballX.ini`, on Windows at
-   `%APPDATA%\VPinballX\VPinballX.ini`, on macOS at
-   `~/Library/Application Support/VPinballX/VPinballX.ini`.
-
-4. **In-table view setup**: open a table, hit **F6** (or whichever key your
-   build maps to *View Setup*), and pick the **Camera** view layout mode.
-   Head tracking only steers the camera in that mode (`VLM_CAMERA`); in
-   *Legacy* it has no effect. Re-center yourself in front of the
-   sensor/webcam *before* loading the table — that pose is captured as the
-   neutral baseline. `BaselineOffsetX/Y/Z` lets you nudge the baseline
-   afterwards without recapturing.
-
-5. Open the VPX log console; on plugin load you should see something like
-   `kinect2 backend: 1 device(s) detected` (or v1 / webcam equivalents).
-   No line → driver/permission issue, see runtime requirements below.
-
-### Runtime requirements per OS
-
-#### Linux — udev rules for libusb access
-
-`libfreenect` / `libfreenect2` reach the Kinect through `libusb`. Without
-udev rules, only `root` can open the device — VPX will silently fail. Copy
-the rules shipped by the upstream libs (already vendored as submodules in
-this repo):
-
-##### Kinect v2
-
-```bash
-sudo tee /etc/udev/rules.d/90-kinect2.rules > /dev/null <<'EOF'
-# Microsoft Kinect v2 (Xbox One) — open USB access for libfreenect2
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02c4", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02d8", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02d9", MODE="0666"
-EOF
-sudo udevadm control --reload-rules
-sudo udevadm trigger
+```mermaid
+flowchart TD
+    subgraph host["VPX host"]
+      VP[plugin manager] -->|C ABI| DL
+    end
+    subgraph plugin["headtracking cdylib (Rust)"]
+      DL[plugin/ffi.rs] --> TR[tracker thread]
+      TR --> KV2[Kinect v2 · libfreenect2]
+      TR --> KV1[Kinect v1 · libfreenect]
+      TR --> WC[Webcam · SDL3]
+      TR --> CV[BlazePose + anchor · ort/ONNX]
+      TR -->|ArcSwap Pose| CAM[camera/mapping to POV]
+      CAM --> DL
+    end
 ```
 
-Then **unplug and replug** the Kinect (rules apply on attach).
+The tracker runs on its own thread and publishes the latest pose through an
+`ArcSwap`; the VPX frame callback reads it without blocking. Everything crossing
+the FFI boundary is `#[repr(C)]` and `catch_unwind`-guarded. Details in
+[`CLAUDE.md`](CLAUDE.md).
 
-##### Kinect v1
+## 💬 Community, support & beta testing
 
-```bash
-sudo tee /etc/udev/rules.d/51-kinect.rules > /dev/null <<'EOF'
-# Microsoft Kinect v1 (Xbox 360) — open USB access for libfreenect
-# Xbox NUI Motor / Audio / Camera
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02b0", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02ad", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02ae", MODE="0666"
-# Kinect for Windows (v1 variant)
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02c2", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02be", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02bf", MODE="0666"
-EOF
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
+Bug reports, help, and **beta testing** happen on Discord — come say hi:
 
-Same: unplug/replug.
+[![Discord — support & beta](https://img.shields.io/badge/Discord-support%20%26%20beta-5865F2?logo=discord&logoColor=white)](https://discord.gg/cFcNrt9AY)
 
-##### Verification
+Part of the wider [Le-Syl21 Tools](https://discord.gg/T37DYHmt2j) community.
 
-```bash
-lsusb | grep -i microsoft           # Kinect must show up
-ls -l /dev/bus/usb/<bus>/<dev>      # MODE should be crw-rw-rw-
-```
+## 📜 License
 
-##### Webcam
-
-On most distros your user is already in the `video` group (`/dev/video0` is
-`crw-rw----+ root:video`). If not:
-
-```bash
-sudo usermod -aG video "$USER"   # logout/login required afterwards
-```
-
-##### System libraries
-
-No application dependency to install — `libfreenect`, `libfreenect2` and
-`libjpeg-turbo` are statically linked. Only `libusb-1.0`, `libstdc++`,
-`libgcc_s` and the libc are required, all present by default on
-Debian/Ubuntu/Fedora/Arch.
-
-#### Windows — libusb drivers for the Kinect
-
-**Webcam-only** users have nothing to do (capture goes through SDL3 /
-Media Foundation, not libusb). The rest of this section is Kinect-specific.
-
-##### What Windows does out of the box (= nothing useful)
-
-Tested 2026-05 on a fresh Windows pincab: even with all Windows Updates
-installed, **the Kinect ships with no driver at all**. Plug a Kinect v1
-or v2 in and Device Manager shows it as *Unknown / Other device* — no
-device path for libusb to enumerate, plugin reports zero devices.
-**You must install something before anything works.**
-
-The release ZIP solves this in one click — see Option 1 below.
-
-##### Option 1 — One-click setup from the demo (recommended)
-
-The Windows release ZIP includes a `setup/` folder with the WinUSB
-installer script and a fresh build of `headtracking-demo.exe` that
-knows how to launch it elevated:
-
-1. (Windows 7 only) install
-   [Microsoft Security Advisory 3033929](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2015/3033929)
-   first or USB keyboards/mice may stop working.
-2. Plug in the Kinect, then double-click `headtracking-demo.exe`. If
-   no usable driver is bound, the app shows a yellow banner
-   *"⚠ Kinect plugged in but not accessible"* with an **Install
-   Kinect drivers (UAC prompt)** button.
-3. Click the button, confirm the UAC prompt. The PowerShell window
-   that opens shows a warning summary and asks you to **type `yes`**
-   to proceed — this is destructive for **BAM** head tracking and
-   any other software that depends on the Microsoft Kinect SDK
-   runtime (see the warning text for details). Type anything else
-   to abort without touching the system.
-4. Wait for the script to finish (~10–30 s), then hit **rescan** in
-   the demo's toolbar.
-
-That's it for both Kinect v1 and v2. Plug the Kinect, restart VPX.
-
-> ⚠ **Coexists with BAM?** No. BAM relies on the Microsoft Kinect
-> for Windows v2 SDK runtime, and this script removes that driver
-> in favour of WinUSB. If you want to go back to BAM afterwards,
-> reinstall the MS Kinect SDK runtime — there's no automated
-> rollback.
-
-Prefer the terminal? Open an elevated PowerShell and run:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File setup\setup.ps1
-```
-
-(The `-ExecutionPolicy Bypass` matters — a fresh Windows defaults to
-`Restricted`/`RemoteSigned` and would otherwise refuse to run an
-unsigned local script.)
-
-What the script does, in order:
-
-| Step | Action |
-|---|---|
-| 1 | Removes any currently-attached Kinect device instance from the system and **deletes every Kinect driver package from the Driver Store** — legacy Microsoft Kinect SDK runtime, leftover Zadig output, and our own kinect_v[12]_*.inf from previous runs. Cleans up any obsolete `DenyDeviceIDs` registry entries left by older versions of this script (they used to block PnP rebinding but caused FAILEDINSTALL more often than they helped). |
-| 2 | `pnputil /add-driver /install` on the 9 WinUSB INF/CAT packages in `setup\drivers\` — covers every known Kinect VID/PID. The bundled `.cat` files are signed by libwdi's self-signed cert, which the script pre-trusts in the certificate stores so `pnputil` doesn't prompt or fail under HVCI / Memory Integrity. |
-| 3 | Clears `CONFIGFLAG_FAILEDINSTALL` on any Kinect device still flagged as problem 28 by a previous failed run — PnP refuses to retry binding otherwise. |
-| 4 | `pnputil /scan-devices` re-enumerates USB so devices removed in step 1 (and unblocked in step 3) get re-bound to our freshly-installed WinUSB INF without a physical replug — useful when the Kinect is hard-mounted in a pinball cabinet. |
-
-After the script: every Kinect interface is bound to **WinUSB** (the
-Microsoft inbox kernel driver, signed at the kernel level — HVCI /
-Memory Integrity safe). libusb claims them through its WinUSB
-backend, libfreenect/libfreenect2 enumerate normally, no Zadig
-required, no UsbDk required.
-
-Re-running the script is idempotent: missing devices are silently
-skipped, `pnputil /add-driver` is a no-op when the same INF is
-already in the Driver Store at the same DriverVer.
-
-##### Verification
-
-Launch `headtracking-demo.exe` (or VPX with the plugin loaded). The
-backend dropdown / plugin log should list the Kinect within a second
-of opening.
-
-If it doesn't:
-* Open Device Manager (`devmgmt.msc`) → look under *Universal Serial
-  Bus devices*. Your Kinect's interfaces should show as
-  `kinect_v1_*` or `kinect_v2_*` with `WinUSB Device` in the *Driver*
-  tab.
-* If the entries still appear with a yellow `?` (no driver), the
-  script's `pnputil /add-driver` step failed — the elevated
-  PowerShell window shows the `[FAIL]` lines; copy them when
-  reporting the issue.
-* Set `FREENECT_LOG_LEVEL=spew` and
-  `HEADTRACKING_LOG=libfreenect=debug,info` before launching the demo
-  to surface libfreenect's full USB transcript via `tracing`.
-
-##### Option 2 — Manual Zadig fallback
-
-If you'd rather not run a script, or the script failed for some
-reason (locked-down corporate Windows, code-signing policy, etc.),
-you can bind WinUSB by hand with [Zadig](https://zadig.akeo.ie/).
-
-1. Get Zadig (single ~5 MB executable). **Right-click → Run as
-   administrator**.
-2. *Options* → **check** *List All Devices*, **uncheck** *Ignore
-   Hubs or Composite Parents*.
-3. For **Kinect v1**: bind WinUSB to all three sub-devices —
-   *Xbox NUI Audio*, *Xbox NUI Camera*, *Xbox NUI Motor*.
-   For **Kinect v2**: bind WinUSB to *Xbox NUI Sensor (composite
-   parent)* (USB ID `045E:02C4` or `045E:02D8`). ⚠ Skip *NuiSensor
-   Adaptor* — that's the power brick, not the sensor.
-4. On the right side of the Zadig window, leave the default
-   `WinUSB (v6.x.x.x)` and click **Replace Driver**.
-
-**To revert** any of these bindings: Device Manager → right-click
-the device → *Uninstall device* → tick *Delete the driver software
-for this device* → *Scan for hardware changes*.
-
-##### v2 needs USB 3.0 root-port bandwidth
-
-If you have a Kinect v2 and `setup.ps1` ran clean but the demo still
-doesn't see it, replug into a **dedicated USB 3.0 port** on the
-motherboard's back panel — the v2 needs the bandwidth of a root
-port and won't enumerate behind a shared hub.
-
-#### macOS
-
-`libusb` works on macOS without an extra driver. Drop the `.dylib` into
-VPX's plugin folder and plug the Kinect — done. On Apple Silicon, the
-aarch64 build ships natively (no Rosetta).
-
-For webcam access, allow VPX in **System Settings → Privacy & Security →
-Camera** on first launch.
-
-### Building from source
-
-See `CLAUDE.md` for the full picture. Short version:
-
-```bash
-git clone --recurse-submodules https://github.com/Le-Syl21/headtracking
-cd headtracking
-cargo build --release                                            # all backends
-cargo build --release --no-default-features --features kinect-v2 # one backend
-```
-
-Prerequisites: recent stable Rust (edition 2024), `cmake` ≥ 3.20, `libclang`
-(for `bindgen`). libusb is vendored as a submodule and built statically
-by `libusb-sys` on **all three** platforms — no `apt install
-libusb-1.0-0-dev`, no `brew install libusb`, no vcpkg. SDL3 build deps
-(only needed for the standalone demo's static SDL3) are still
-distro-managed: see the workflow `release.yml` for the exhaustive list.
-
-Native libs (libfreenect, libfreenect2, libjpeg-turbo, libusb) are all
-vendored as submodules or via `turbojpeg-sys` and built **statically** —
-zero external runtime dep on the end user's machine across Linux,
-macOS, and Windows.
-
-### Credits
-
-- [libfreenect](https://github.com/OpenKinect/libfreenect) — Kinect v1 driver
-  (Apache 2.0 / GPL 2.0)
-- [libfreenect2](https://github.com/OpenKinect/libfreenect2) — Kinect v2
-  driver (Apache 2.0 / GPL 2.0)
-- [libjpeg-turbo](https://libjpeg-turbo.org/) (BSD-3)
-- [SDL3](https://github.com/libsdl-org/SDL) (Zlib) — webcam capture
-- [Visual Pinball X](https://github.com/vpinball/vpinball) — host, and the
-  reference we follow for the plugin API
+GPL-3.0-or-later. See [LICENSE](LICENSE).
 
 ---
 
-## Français
+## 🇫🇷 Français
 
-### Installation du plugin
+**🇬🇧 [English](#-what-makes-it-different) · 🇫🇷 Français**
 
-Récupérer le binaire correspondant à votre OS depuis la page Releases, puis le
-déposer dans le dossier des plugins de votre install VPX :
+**Head tracking POV temps réel pour Visual Pinball X, en Rust pur.** Tu bouges la
+tête, la perspective de la table suit — l'effet *fish-tank VR* qui donne à un
+écran plat la profondeur d'un vrai cab. Alternative open-source à BAM, multi-plateforme,
+qui marche depuis une simple **webcam** ou une **Kinect v1 / v2**.
 
-```
-<VPX_install>/plugins/headtracking/
-├── plugin.cfg
-├── headtracking.dll          # Windows
-├── libheadtracking.so        # Linux (x86_64 ou aarch64)
-└── libheadtracking.dylib     # macOS (arm64 ou x86_64)
-```
+### 📸 On a besoin de relevés de VOTRE pincab — 2 minutes, sans coder
 
-Les deux fichiers (le binaire **et** `plugin.cfg`) doivent vivre dans le même
-dossier — VPX scanne `plugins/<id>/plugin.cfg` pour découvrir les plugins.
+**C'est LE goulot du projet, et n'importe quel possesseur de pincab peut le
+débloquer.** Le modèle d'auto-calibration ne connaît pour l'instant qu'un seul
+cab : le nôtre. Pour apprendre à reconnaître toutes les lockbars et tous les
+rails — chaque bois, chaque éclairage, chaque angle de caméra — il doit voir de
+vrais cabs. Le vôtre.
 
-### Activation et configuration dans VPX
+1. Téléchargez **`headtracking-demo`** depuis la
+   [dernière release](https://github.com/Le-Syl21/headtracking/releases) — un
+   binaire unique, rien à installer.
+2. Pointez votre webcam ou Kinect vers le plateau, sélectionnez-la dans la démo.
+3. Cliquez **🎁 Contribute** et confirmez.
 
-1. Lancer VPX une fois après avoir copié les fichiers. Le plugin manager
-   prend en compte le nouveau `plugin.cfg` automatiquement.
-2. Ouvrir **Preferences → Plugins**, trouver **Head Tracking** dans la
-   liste, cocher **Enable**, puis redémarrer VPX. Le plugin n'est chargé
-   qu'au prochain démarrage, pas à chaud.
-3. Les réglages du plugin apparaissent dans le même dialogue (une ligne par
-   réglage). Ils sont persistés dans `VPinballX.ini` sous
-   `[Plugin.HeadTracking]` — vous pouvez aussi éditer ce fichier à la main :
+C'est tout. La démo envoie un relevé (image couleur + ce que le détecteur a vu
++ depth/IR si Kinect) vers un dépôt en écriture seule, et ça devient des
+données d'entraînement.
 
-   ```ini
-   [Plugin.HeadTracking]
-   Backend             = 0     ; 0=Auto, 1=Kinect v2, 2=Kinect v1, 3=Webcam
-   DeviceIndex         = 0     ; 0-based, ignoré pour la Kinect v2
-   Gain                = 1.0   ; multiplicateur appliqué au delta tête → caméra
-   MinCutoffHz         = 0.4   ; cutoff de base du filtre 1€ (plus bas = plus lissé au repos)
-   Beta                = 0.05  ; réponse 1€ au mouvement rapide (plus haut = moins de lag)
-   BaselineOffsetX     = 0.0   ; correction (mm) de la pose neutre capturée
-   BaselineOffsetY     = 0.0
-   BaselineOffsetZ     = 0.0
-   LockbarHandSpan     = 660.0 ; mm entre les mains sur les boutons (~660 widebody)
-   LockbarFloorHeight  = 850.0 ; mm du sol au sommet du lockbar (850 widebody)
-   IPDmm               = 63.0  ; distance interpupillaire — 63 adulte moyen
-   ```
+**Ce qui est partagé, honnêtement :** les images montrent votre cab et ce qu'il
+y a autour — vérifiez l'aperçu avant d'accepter. L'envoi ne demande aucun compte et n'embarque aucune identité ; chaque relevé a un identifiant affiché que vous
+pouvez citer sur Discord pour demander sa suppression. Cab vide ou en pleine
+partie, jour ou nuit, toute variation aide — les relevés avec **un joueur
+devant le cab** sont les plus rares et les plus précieux.
 
-   Sur Linux le fichier est à `~/.vpinball/VPinballX.ini`, sur Windows à
-   `%APPDATA%\VPinballX\VPinballX.ini`, sur macOS à
-   `~/Library/Application Support/VPinballX/VPinballX.ini`.
+**Ce qui le rend unique :**
 
-4. **View Setup en table** : ouvrir une table, presser **F6** (ou la
-   touche que votre build mappe sur *View Setup*) et choisir le mode
-   **Camera**. Le head tracking ne pilote la caméra que dans ce mode
-   (`VLM_CAMERA`) ; en *Legacy* il n'a aucun effet. Se recentrer face au
-   capteur/webcam **avant** de charger la table — cette pose est capturée
-   comme baseline neutre. `BaselineOffsetX/Y/Z` permet d'ajuster la
-   baseline ensuite sans tout recapturer.
+- **Zéro calibration manuelle.** Le cab EST la mire : la lockbar + les 2 rails
+  latéraux forment un rectangle connu du plateau. Vu en perspective, ça suffit à
+  retrouver la focale **et** la pose de la caméra — depuis l'image seule. Pas de
+  mire à damier, pas d'assistant, rien à régler.
+- **3D depuis une simple webcam** — pas besoin de capteur de profondeur ; la
+  focale récupérée transforme une caméra unique en tracker 3D métrique.
+- **Zéro install côté utilisateur** — un seul binaire plugin, aucun SDK
+  Microsoft, tout est lié statiquement.
+- **100 % Rust**, Linux · Windows · macOS.
 
-5. Ouvrir la console plugin de VPX ; au PluginLoad on doit voir une ligne
-   du genre `kinect2 backend: 1 device(s) detected` (ou v1 / webcam
-   équivalent). Rien → souci driver/permissions, voir la section runtime
-   plus bas.
+**État :** début de développement. Rien n'est encore branché de bout en bout dans
+VPX, mais l'essentiel des briques difficiles marche déjà en standalone (capture
+Kinect v1/v2 + webcam, tête BlazePose ~7 ms, maths d'auto-calibration validées à
+±0–3 % au mètre-ruban, démo parallaxe fish-tank). Voir le tableau d'état plus
+haut.
 
-### Pré-requis runtime par plateforme
+**On cherche des contributeurs — aucune permission requise, ouvre une issue ou
+passe sur le Discord :**
 
-#### Linux — règles udev pour accès USB sans root
+- 📸 **Envoyer un relevé de son pincab** *(le plus utile, sans coder — voir
+  ci-dessus)*, ou aller plus loin et **annoter des photos** : tracer 4 lignes
+  par photo dans un outil navigateur ([`tools/anchor/`](tools/anchor/)). Plus
+  de cabs = un modèle qui généralise. C'est **la** priorité.
+- 🦀 **Rust / systèmes**, 👁️ **vision / ML**, 🎛️ **pinball & VPX** (tester sur
+  vraies tables), 🪟 **testeurs Windows / macOS**.
 
-`libfreenect` / `libfreenect2` accèdent aux Kinect via `libusb`. Sans règles
-udev, seul `root` peut ouvrir le device — VPX échouera silencieusement. Il
-faut copier les règles fournies par les libs upstream (déjà présentes dans
-les submodules de ce repo) :
+Nouveau ? [`CLAUDE.md`](CLAUDE.md) est la visite guidée complète de l'architecture.
 
-##### Kinect v2
+**Support & beta-test** sur Discord :
 
-```bash
-sudo tee /etc/udev/rules.d/90-kinect2.rules > /dev/null <<'EOF'
-# Microsoft Kinect v2 (Xbox One) — accès USB libre pour libfreenect2
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02c4", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02d8", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02d9", MODE="0666"
-EOF
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-Puis **débrancher / rebrancher** la Kinect (les règles s'appliquent à
-l'attachement).
-
-##### Kinect v1
-
-```bash
-sudo tee /etc/udev/rules.d/51-kinect.rules > /dev/null <<'EOF'
-# Microsoft Kinect v1 (Xbox 360) — accès USB libre pour libfreenect
-# Xbox NUI Motor / Audio / Camera
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02b0", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02ad", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02ae", MODE="0666"
-# Kinect for Windows (variante v1)
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02c2", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02be", MODE="0666"
-SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02bf", MODE="0666"
-EOF
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-Idem : débrancher/rebrancher.
-
-##### Vérification
-
-```bash
-lsusb | grep -i microsoft           # doit montrer la Kinect
-ls -l /dev/bus/usb/<bus>/<dev>      # MODE doit valoir crw-rw-rw-
-```
-
-##### Webcam
-
-Sur la majorité des distros, l'utilisateur courant est dans le groupe `video`
-(`/dev/video0` est en `crw-rw----+ root:video`). Si ce n'est pas le cas :
-
-```bash
-sudo usermod -aG video "$USER"   # logout/login requis ensuite
-```
-
-##### Bibliothèques système
-
-Aucune dépendance applicative à installer (libfreenect, libfreenect2 et
-libjpeg-turbo sont linkés statiquement dans le `.so`). Seules `libusb-1.0`,
-`libstdc++`, `libgcc_s` et la libc sont requises — elles sont présentes par
-défaut sur Debian/Ubuntu/Fedora/Arch.
-
-#### Windows — drivers libusb pour la Kinect
-
-Si vous utilisez **uniquement la webcam**, rien à faire : la capture
-passe par SDL3 / Media Foundation, pas par libusb. Le reste de cette
-section concerne la Kinect.
-
-##### Comportement Windows par défaut (= rien d'utilisable)
-
-Testé en mai 2026 sur un pincab Windows neuf : même avec toutes les
-mises à jour Windows, **la Kinect arrive sans aucun driver**. Brancher
-une Kinect v1 ou v2 et le Gestionnaire de périphériques affiche
-*Périphérique inconnu* — pas de chemin device pour libusb à énumérer,
-le plugin ne détecte rien. **Il faut installer quelque chose avant
-que ça démarre.**
-
-Le ZIP release règle ça en un clic — voir Option 1 ci-dessous.
-
-##### Option 1 — Installation en un clic depuis la démo (recommandé)
-
-Le ZIP release Windows inclut un dossier `setup/` avec le script
-d'installation WinUSB et un `headtracking-demo.exe` qui sait le
-lancer élevé :
-
-1. (Windows 7 uniquement) installer d'abord
-   [Microsoft Security Advisory 3033929](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2015/3033929)
-   sinon les claviers/souris USB peuvent cesser de fonctionner.
-2. Brancher la Kinect, puis double-cliquer sur
-   `headtracking-demo.exe`. Si aucun driver utilisable n'est bindé,
-   l'appli affiche une bannière jaune *« ⚠ Kinect plugged in but
-   not accessible »* avec un bouton **Install Kinect drivers (UAC
-   prompt)**.
-3. Cliquer le bouton, confirmer l'UAC. La fenêtre PowerShell qui
-   s'ouvre affiche un résumé d'avertissement et te demande de
-   **taper `yes`** pour confirmer — l'opération est destructive
-   pour **BAM** et tout logiciel qui dépend du runtime Microsoft
-   Kinect SDK (détails dans le texte d'avertissement). Taper autre
-   chose annule sans rien toucher.
-4. Attendre la fin du script (~10–30 s), puis cliquer **rescan**
-   dans la barre d'outils de la démo.
-
-C'est tout, pour les deux Kinect v1 et v2. Brancher la Kinect, relancer VPX.
-
-> ⚠ **Cohabite avec BAM ?** Non. BAM dépend du runtime Microsoft
-> Kinect for Windows v2 SDK, et le script remplace ce driver par
-> WinUSB. Pour revenir à BAM ensuite, il faut réinstaller le
-> runtime MS Kinect SDK à la main — pas de rollback automatique.
-
-Tu préfères le terminal ? Ouvrir un PowerShell administrateur et lancer :
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File setup\setup.ps1
-```
-
-(Le `-ExecutionPolicy Bypass` est important — Windows neuf est par
-défaut en `Restricted`/`RemoteSigned` et refuserait sinon un script
-local non signé.)
-
-Ce que fait le script, dans l'ordre :
-
-| Étape | Action |
-|---|---|
-| 1 | Retire toute instance Kinect actuellement attachée et **supprime tous les packages de driver Kinect du Driver Store** — runtime Microsoft Kinect SDK legacy, output Zadig précédent, et nos propres kinect_v[12]_*.inf des runs antérieurs. Nettoie aussi les entrées `DenyDeviceIDs` obsolètes laissées par les anciennes versions du script (elles bloquaient le re-binding PnP mais causaient FAILEDINSTALL plus souvent qu'elles n'aidaient). |
-| 2 | `pnputil /add-driver /install` sur les 9 paquets WinUSB INF/CAT dans `setup\drivers\` — couvre tous les VID/PID Kinect connus. Les `.cat` bundlés sont signés par le certificat self-signé libwdi, que le script pré-trust dans les magasins de certificats pour que `pnputil` ne prompte pas ni n'échoue sous HVCI / Memory Integrity. |
-| 3 | Efface `CONFIGFLAG_FAILEDINSTALL` sur toute Kinect encore flaggée problème 28 par un run précédent échoué — sinon PnP refuse de réessayer le bind. |
-| 4 | `pnputil /scan-devices` ré-énumère USB pour que les devices retirés à l'étape 1 (et débloqués à l'étape 3) soient re-bindés à notre INF WinUSB fraîchement installé sans replug physique — utile quand la Kinect est câblée à demeure dans un pincab. |
-
-Après le script : chaque interface Kinect est bindée à **WinUSB** (le
-driver kernel inbox Microsoft, signé au niveau kernel — compatible
-HVCI / Memory Integrity). libusb les claim via son backend WinUSB,
-libfreenect/libfreenect2 les énumèrent normalement, **pas de Zadig
-requis, pas de UsbDk requis**.
-
-Re-lancer le script est idempotent : devices manquants silencieusement
-skippés, `pnputil /add-driver` ne fait rien quand le même INF est
-déjà dans le Driver Store au même DriverVer.
-
-##### Vérification
-
-Lancer `headtracking-demo.exe` (ou VPX avec le plugin chargé). La
-dropdown backend / le log plugin doit lister la Kinect en moins
-d'une seconde après ouverture.
-
-Si pas le cas :
-* Ouvrir Device Manager (`devmgmt.msc`) → regarder sous *Universal
-  Serial Bus devices*. Les interfaces Kinect doivent apparaître
-  comme `kinect_v1_*` ou `kinect_v2_*` avec `WinUSB Device` dans
-  l'onglet *Driver*.
-* Si elles affichent encore un `?` jaune (pas de driver), le step
-  `pnputil /add-driver` du script a échoué — la fenêtre PowerShell
-  élevée affiche les lignes `[FAIL]`, les copier pour le rapport
-  d'incident.
-* Mettre `FREENECT_LOG_LEVEL=spew` et
-  `HEADTRACKING_LOG=libfreenect=debug,info` dans l'environnement
-  avant de lancer le demo pour avoir le transcript USB complet de
-  libfreenect via `tracing`.
-
-##### Option 2 — Zadig manuel (fallback)
-
-Si tu ne veux pas lancer un script, ou si le script a échoué pour
-une raison ou une autre (Windows verrouillé en entreprise, policy
-de signature, etc.), tu peux binder WinUSB à la main via
-[Zadig](https://zadig.akeo.ie/).
-
-1. Récupérer Zadig (exécutable unique de ~5 Mo). **Clic droit →
-   Exécuter en tant qu'administrateur**.
-2. *Options* → **cocher** *List All Devices*, **décocher** *Ignore
-   Hubs or Composite Parents*.
-3. Pour la **Kinect v1** : binder WinUSB sur les trois
-   sous-périphériques — *Xbox NUI Audio*, *Xbox NUI Camera*,
-   *Xbox NUI Motor*.
-   Pour la **Kinect v2** : binder WinUSB sur *Xbox NUI Sensor
-   (composite parent)* (USB ID `045E:02C4` ou `045E:02D8`).
-   ⚠ Ignorer *NuiSensor Adaptor* — c'est l'adaptateur secteur, pas
-   le sensor.
-4. Côté droit de la fenêtre Zadig, laisser le `WinUSB (v6.x.x.x)`
-   par défaut et cliquer **Replace Driver**.
-
-**Pour revenir en arrière** sur un binding : Device Manager → clic
-droit sur le device → *Uninstall device* → cocher *Delete the
-driver software for this device* → *Scan for hardware changes*.
-
-##### v2 demande la bande passante d'un port USB 3.0 racine
-
-Si tu as une Kinect v2 et que `setup.ps1` est passé sans erreur
-mais le demo ne la voit toujours pas, rebrancher sur un **port USB
-3.0 dédié** au dos de la carte mère — la v2 a besoin de la bande
-passante d'un port racine et n'énumère pas derrière un hub partagé.
-
-#### macOS
-
-`libusb` fonctionne sans driver supplémentaire sur macOS. Aucune étape
-spécifique : poser le `.dylib` dans le dossier plugins de VPX et brancher
-la Kinect. Sur Apple Silicon, la build aarch64 est livrée nativement (pas
-de Rosetta).
-
-Pour la webcam, autoriser VPX à accéder à la caméra dans **System
-Settings → Privacy & Security → Camera** au premier lancement.
-
-### Build depuis les sources
-
-Voir `CLAUDE.md` pour le détail. Résumé :
-
-```bash
-git clone --recurse-submodules https://github.com/Le-Syl21/headtracking
-cd headtracking
-cargo build --release                                            # tous les backends
-cargo build --release --no-default-features --features kinect-v2 # un seul
-```
-
-Pré-requis : Rust stable récent (édition 2024), `cmake` ≥ 3.20, `libclang`
-(pour `bindgen`). libusb est vendoré en submodule et compilé
-statiquement par `libusb-sys` sur **les trois** plateformes — pas de
-`apt install libusb-1.0-0-dev`, pas de `brew install libusb`, pas de
-vcpkg. Les deps SDL3 (pour la build statique SDL3 du demo standalone
-uniquement) restent gérées par la distro — voir le workflow
-`release.yml` pour la liste complète.
-
-Les libs natives (libfreenect, libfreenect2, libjpeg-turbo, libusb)
-sont toutes vendorées en submodules ou via `turbojpeg-sys` et
-compilées **statiquement** — zéro dep externe au runtime côté
-utilisateur, sur Linux, macOS et Windows.
-
-### Crédits
-
-- [libfreenect](https://github.com/OpenKinect/libfreenect) — driver Kinect
-  v1 (Apache 2.0 / GPL 2.0)
-- [libfreenect2](https://github.com/OpenKinect/libfreenect2) — driver
-  Kinect v2 (Apache 2.0 / GPL 2.0)
-- [libjpeg-turbo](https://libjpeg-turbo.org/) (BSD-3)
-- [SDL3](https://github.com/libsdl-org/SDL) (Zlib) — capture webcam
-- [Visual Pinball X](https://github.com/vpinball/vpinball) — l'host, et la
-  référence qu'on suit pour l'API plugin
+[![Discord — support & beta](https://img.shields.io/badge/Discord-support%20%26%20beta-5865F2?logo=discord&logoColor=white)](https://discord.gg/cFcNrt9AY)

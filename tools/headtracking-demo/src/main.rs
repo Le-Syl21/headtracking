@@ -5205,38 +5205,38 @@ impl App {
             // Cell — stability filter (1€). The two knobs are the 1€ min-cutoff
             // and beta, relabelled for humans; hover text explains the effect.
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(RichText::new("Filtre de stabilité (1€)").strong());
+                ui.label(RichText::new("Stability filter (1€)").strong());
                 ui.separator();
                 ui.add(
                     egui::Slider::new(&mut self.head_filter_min_cutoff, 0.1..=5.0)
-                        .text("Réactivité"),
+                        .text("Responsiveness"),
                 )
                 .on_hover_text(
-                    "Quand tu es immobile : à gauche = très stable et lisse (un \
-                     léger retard), à droite = suit plus vite (peut trembler un peu).",
+                    "While you stand still: left = very stable and smooth (a slight \
+                     delay), right = follows faster (may tremble a little).",
                 );
                 ui.add(
                     egui::Slider::new(&mut self.head_filter_beta, 0.0..=1.5)
-                        .text("Suivi mouvements"),
+                        .text("Motion catch-up"),
                 )
                 .on_hover_text(
-                    "Quand tu bouges vite : plus à droite = rattrape le retard, \
-                     la vue colle mieux à ta tête.",
+                    "When you move fast: further right = catches up quicker, the \
+                     view sticks to your head.",
                 );
-                ui.toggle_value(&mut self.bypass_filters, "sans filtre")
+                ui.toggle_value(&mut self.bypass_filters, "no filter")
                     .on_hover_text(
-                        "Coupe le lissage 1€ (+ scoring du picker + gate depth) — debug.",
+                        "Disables the 1€ smoothing (+ picker scoring + depth gate) — debug.",
                     );
             });
 
             // Cell — lockbar width in cm (scale reference = distance between the
             // two sidebars). Always shown. Stored in mm internally.
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label("Largeur lockbar");
+                ui.label("Lockbar width");
                 let mut cm = self.lockbar_width_mm / 10.0;
                 if ui
                     .add(egui::Slider::new(&mut cm, 20.0..=120.0).suffix(" cm"))
-                    .on_hover_text("Largeur entre les deux rails latéraux (référence d'échelle).")
+                    .on_hover_text("Width between the two side rails (the scale reference).")
                     .changed()
                 {
                     self.lockbar_width_mm = cm * 10.0;
@@ -5245,26 +5245,25 @@ impl App {
 
             // Cell — playfield / backglass inclination in degrees (all backends).
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label("Inclinaison BG");
+                ui.label("Playfield incline");
                 ui.add(egui::Slider::new(&mut self.table_incl_deg, 0.0..=30.0).suffix(" °"))
                     .on_hover_text(
-                        "Inclinaison du plateau vs l'horizontale (VPX la donne par \
-                         table). La parallaxe incline le mouvement de tête de \
-                         90° − cet angle.",
+                        "Playfield angle vs horizontal (VPX provides it per table). The \
+                         parallax tilts the head motion by 90° minus this angle.",
                     );
             });
 
             // Cell — parallax bench: gain + axis sign flips.
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label("Parallaxe");
+                ui.label("Parallax");
                 ui.add(egui::Slider::new(&mut self.parallax_gain, 0.5..=6.0).text("gain"))
-                    .on_hover_text("Amplification du déplacement de tête → POV.");
+                    .on_hover_text("Amplification of head movement into the POV.");
                 ui.toggle_value(&mut self.parallax_invert[0], "±X")
-                    .on_hover_text("Inverser l'axe gauche/droite.");
+                    .on_hover_text("Flip the left/right axis.");
                 ui.toggle_value(&mut self.parallax_invert[1], "±Y")
-                    .on_hover_text("Inverser l'axe haut/bas.");
+                    .on_hover_text("Flip the up/down axis.");
                 ui.toggle_value(&mut self.parallax_invert[2], "±Z")
-                    .on_hover_text("Inverser l'axe profondeur (avant/arrière).");
+                    .on_hover_text("Flip the depth axis (closer/farther).");
             });
         });
     }
@@ -5752,15 +5751,15 @@ impl App {
         // light blue, or the live model's locked detection in light green.
         let (tag, color, hover) = if active.anchor_fixed {
             (
-                "ancre fixée",
+                "anchor pinned",
                 Color32::LIGHT_BLUE,
-                "Calibration manuelle (anchor_fixed.json) — le modèle ne tourne pas.",
+                "Manual calibration (anchor_fixed.json) — the model is not running.",
             )
         } else {
             (
                 "anchor live",
                 Color32::LIGHT_GREEN,
-                "Calibration détectée par le modèle d'ancre.",
+                "Calibration detected by the anchor model.",
             )
         };
         ui.label(
@@ -5803,11 +5802,10 @@ impl App {
         } else {
             ""
         };
-        // French number formatting: metres with a decimal comma.
-        let metres = format!("{:.2}", pose.distance_mm / 1000.0).replace('.', ",");
+        let metres = format!("{:.2}", pose.distance_mm / 1000.0);
         ui.label(
             RichText::new(format!(
-                "{approx}Caméra : {metres} m de la lockbar · {:.0} cm au-dessus · déport {:+.0} cm · penchée {:.0}°",
+                "{approx}Camera: {metres} m from the lockbar · {:.0} cm above · offset {:+.0} cm · tilted {:.0}°",
                 pose.height_mm / 10.0,
                 pose.lateral_mm / 10.0,
                 pose.pitch_deg,
