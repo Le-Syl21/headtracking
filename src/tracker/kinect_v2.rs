@@ -66,12 +66,11 @@ impl KinectV2Backend {
             return Err(Error::Freenect2(freenect2::Error::NoDevice));
         }
         let device = ctx.open_default()?;
-        match stream {
-            // IR rides the depth pipeline; skipping colour halves the USB
-            // load and the per-frame CPU (no 8 MB BGRX to convert).
-            TrackingStream::Ir => device.start_streams(false, true)?,
-            TrackingStream::Rgb => device.start()?,
-        }
+        // Colour always flows at open, whatever the target: the anchor
+        // calibration phase needs RGB frames. `begin_tracking` then trades
+        // colour for the IR/depth-only pipeline (halved USB load, no 8 MB
+        // BGRX conversions per frame).
+        device.start()?;
         let ir = device.ir_params();
         let ir_intr = Intrinsics {
             fx: ir.fx,
@@ -226,6 +225,29 @@ impl HeadTracker for KinectV2Backend {
             TrackingStream::Ir => "Kinect v2 (IR stream)".to_string(),
             TrackingStream::Rgb => "Kinect v2 (color stream)".to_string(),
         }
+    }
+
+    fn poll_calibration_rgb(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        let rgb = self.device.poll_rgb()?;
+        Some((rgb.width, rgb.height, bgrx_to_rgb888(&rgb.data)))
+    }
+
+    fn begin_tracking(&mut self) {
+        if self.stream == TrackingStream::Ir {
+            let res = self
+                .device
+                .stop()
+                .and_then(|()| self.device.start_streams(false, true));
+            match res {
+                Ok(()) => info!("kinect-v2: calibration done, restarted on IR/depth only"),
+                Err(e) => warn!(?e, "kinect-v2: IR restart failed; streams may be stale"),
+            }
+        }
+    }
+
+    fn color_intrinsics(&self) -> Option<[f32; 4]> {
+        let c = &self.color_intr;
+        Some([c.fx, c.fy, c.cx, c.cy])
     }
 
     fn shutdown(&mut self) {

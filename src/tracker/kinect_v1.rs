@@ -52,9 +52,10 @@ impl KinectV1Backend {
             return Err(Error::Freenect(freenect::Error::NoDevice));
         }
         let mut device = ctx.open(0)?;
+        // Colour first, whatever the target: the anchor-calibration phase
+        // needs RGB frames; `begin_tracking` switches to IR afterwards.
         device.start_streams(true, true)?;
         let stream = if ir {
-            device.set_video_stream(VideoStream::Ir)?;
             TrackingStream::Ir
         } else {
             TrackingStream::Rgb
@@ -152,6 +153,23 @@ impl HeadTracker for KinectV1Backend {
         match self.stream {
             TrackingStream::Ir => "Kinect v1 (IR stream)".to_string(),
             TrackingStream::Rgb => "Kinect v1 (color stream)".to_string(),
+        }
+    }
+
+    fn poll_calibration_rgb(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        // libfreenect's colour stream is already RGB888.
+        let rgb = self.device.poll_rgb()?;
+        Some((rgb.width, rgb.height, rgb.data))
+    }
+
+    fn begin_tracking(&mut self) {
+        if self.stream == TrackingStream::Ir {
+            if let Err(e) = self.device.set_video_stream(VideoStream::Ir) {
+                warn!(?e, "kinect-v1: switch to IR failed; staying on colour");
+                self.stream = TrackingStream::Rgb;
+            } else {
+                info!("kinect-v1: calibration done, video stream switched to IR");
+            }
         }
     }
 

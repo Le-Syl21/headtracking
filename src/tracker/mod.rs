@@ -57,6 +57,23 @@ pub trait HeadTracker: Send {
         self.name().to_string()
     }
 
+    /// Poll one COLOUR frame (rgb888) for the anchor-calibration phase at
+    /// session start. Backends that cannot serve colour return `None`.
+    fn poll_calibration_rgb(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        None
+    }
+
+    /// Leave the colour calibration phase and start the configured tracking
+    /// stream (IR on Kinects when requested). No-op by default; called
+    /// exactly once, before the first `poll`.
+    fn begin_tracking(&mut self) {}
+
+    /// Real colour-stream intrinsics `[fx, fy, cx, cy]` when the device
+    /// knows them (Kinect v2 factory calibration). `None` = use nominals.
+    fn color_intrinsics(&self) -> Option<[f32; 4]> {
+        None
+    }
+
     /// Release device handles. Must be safe to call multiple times.
     fn shutdown(&mut self);
 }

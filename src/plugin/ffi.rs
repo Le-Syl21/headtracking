@@ -29,9 +29,8 @@ use crate::tracker::session::TrackerSession;
 struct PluginState {
     msg_api: *const MsgPluginAPI,
     vpx_api: *mut VPXPluginAPI,
-    /// VPX install path and per-user preference path, copied out of
+    /// Per-user preference path (`VPinballX.ini` home), copied out of
     /// `GetVpxInfo` at load time (host strings are copied immediately).
-    vpx_path: Option<std::path::PathBuf>,
     pref_path: Option<std::path::PathBuf>,
     /// Reserved for cross-thread API calls (`RunOnMainThread`, `SendMsg`).
     #[allow(dead_code)]
@@ -75,8 +74,11 @@ struct GameSession {
     lockbar_held_since: Option<Instant>,
     recentered_this_hold: bool,
     /// One-shot text pushed as a native VPX notification on the next
-    /// frame (calibration summary; built off the main thread).
+    /// frame (startup summary; built off the main thread).
     pending_note: Option<std::ffi::CString>,
+    /// Set once the live anchor calibration's camera-pose notification has
+    /// been pushed (the tracker thread fills the result asynchronously).
+    calib_notified: bool,
 }
 
 /// Hold the (already mapped everywhere) lockbar button this long to
@@ -207,8 +209,8 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     info!("VPX plugin API resolved");
 
     // Copy the host paths now — the plugin later reads VPinballX.ini
-    // (cabinet lockbar geometry) and anchor_fixed.json from them.
-    let (vpx_path, pref_path) = {
+    // (cabinet lockbar geometry) from them.
+    let pref_path = {
         let mut info = super::vpx_sys::VPXInfo::default();
         // SAFETY: vpx_api verified non-null; `info` is a valid out-pointer.
         if let Some(get_info) = unsafe { (*vpx_api).GetVpxInfo } {
@@ -224,9 +226,10 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
                 (!s.is_empty()).then(|| std::path::PathBuf::from(s.into_owned()))
             }
         };
-        (to_path(info.path), to_path(info.prefPath))
+        let _ = info.path; // install path: nothing reads it today
+        to_path(info.prefPath)
     };
-    info!(?vpx_path, ?pref_path, "host paths");
+    info!(?pref_path, "host preference path");
 
     // Wire the tracing → VPX console bridge as soon as MsgPluginAPI is
     // available. From this point on every `info!` / `warn!` / `error!`
@@ -284,7 +287,6 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     *STATE.lock() = Some(PluginState {
         msg_api: api_ptr,
         vpx_api,
-        vpx_path,
         pref_path,
         endpoint_id: session_id,
         msg_ids,
@@ -373,6 +375,7 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
                     lockbar_held_since: None,
                     recentered_this_hold: false,
                     pending_note,
+                    calib_notified: false,
                 });
                 // A continuously moving camera invalidates VPX's static
                 // prerender pass — disable it like the in-game POV page does.
@@ -470,6 +473,20 @@ fn apply_pose_to_view() {
     {
         // SAFETY: NUL-terminated CString kept alive across the call.
         unsafe { notify(note.as_ptr(), STARTUP_NOTE_MS) };
+    }
+
+    // Camera-pose notification, once the tracker thread's RGB anchor
+    // calibration lands (a few seconds into the game, or never).
+    if !game.calib_notified
+        && let Some(calib) = game.tracker.calibration()
+    {
+        game.calib_notified = true;
+        if let Some(note) = camera_pose_note(game.tracker.backend_name(), &calib)
+            && let Some(notify) = vpx.PushNotification
+        {
+            // SAFETY: NUL-terminated CString kept alive across the call.
+            unsafe { notify(note.as_ptr(), STARTUP_NOTE_MS) };
+        }
     }
 
     // Long-press recenter: re-baseline on the CURRENT head position and
@@ -579,50 +596,81 @@ fn apply_pose_to_view() {
 }
 
 /// Build the one-shot startup notification: the camera the plugin tracks
-/// on, the derived camera pose when a fixed anchor calibration exists, and
-/// the VPX settings the head-tracking experience depends on.
-fn startup_note(device: &str, backend: &str, cfg: &config::Config) -> Option<std::ffi::CString> {
-    let mut text = format!("Head tracking: {device} active");
-    if let Some(summary) = calibration_summary(backend, cfg) {
-        text.push('\n');
-        text.push_str(&summary);
-    }
-    text.push_str(
-        "\nCheck your VPX setup: lockbar width + screen inclination \
+/// on and the VPX settings the head-tracking experience depends on. The
+/// camera-pose line arrives later, once the live anchor calibration lands.
+fn startup_note(device: &str, _backend: &str, _cfg: &config::Config) -> Option<std::ffi::CString> {
+    let text = format!(
+        "Head tracking: {device} active\
+         \nCheck your VPX setup: lockbar width + screen inclination \
          (Cabinet settings), POV layout 'Window' with rotation 0, \
          cabinet autofit enabled",
     );
     std::ffi::CString::new(text).ok()
 }
 
-/// Read the host cabinet geometry and the hand-fixed anchor calibration,
-/// and format the camera-pose summary. `None` when no calibration is
-/// available (the plugin still tracks — relative deltas need no anchor).
+/// Camera pose derived from the LIVE anchor calibration + the host's
+/// lockbar width, formatted for the VPX notification.
 #[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
-fn calibration_summary(backend: &str, cfg: &config::Config) -> Option<String> {
-    let (vpx_path, pref_path) = {
-        let state = STATE.lock();
-        let s = state.as_ref()?;
-        (s.vpx_path.clone(), s.pref_path.clone())
-    };
-    let geo = pref_path
+fn camera_pose_note(
+    backend: &str,
+    calib: &crate::tracker::session::CameraCalibration,
+) -> Option<std::ffi::CString> {
+    let cfg = config::current();
+    let pref_path = STATE.lock().as_ref()?.pref_path.clone();
+    let lockbar_mm = pref_path
         .as_deref()
         .map(crate::plugin::host_settings::read_cab_geometry)
-        .unwrap_or_default();
-    let entry =
-        crate::calibration::anchor_fixed::load(backend, vpx_path.as_deref(), pref_path.as_deref())?;
-    let summary = crate::calibration::anchor_fixed::camera_pose_summary(
-        backend,
-        &entry,
-        geo.lockbar_width_mm,
-        cfg.webcam_focal_px,
-    )?;
-    info!(%summary, "fixed anchor calibration active");
-    Some(summary)
+        .unwrap_or_default()
+        .lockbar_width_mm;
+    // Real factory intrinsics when the device provides them (Kinect v2);
+    // demo-validated nominals otherwise (±0-3 % against tape measures).
+    let [fx, fy, cx, cy] = calib.color_intrinsics.unwrap_or_else(|| {
+        let fx = if backend.starts_with("kinect-v1") {
+            525.0
+        } else if cfg.webcam_focal_px > 0.0 {
+            cfg.webcam_focal_px
+        } else {
+            calib.frame_w as f32 * crate::tracker::pipeline::WEBCAM_FX_PER_WIDTH
+        };
+        [
+            fx,
+            fx,
+            calib.frame_w as f32 * 0.5,
+            calib.frame_h as f32 * 0.5,
+        ]
+    });
+    let intr = anchor::CameraIntrinsics { fx, fy, cx, cy };
+    let lockbar = if lockbar_mm > 0.0 {
+        lockbar_mm
+    } else {
+        crate::calibration::LOCKBAR_WIDTH_MM
+    };
+    let pose = anchor::camera_pose(&calib.geometry, &intr, lockbar)?;
+    let approx = if backend.starts_with("webcam") {
+        "~"
+    } else {
+        ""
+    };
+    info!(
+        ?pose,
+        score = calib.score,
+        "live anchor calibration: camera pose"
+    );
+    let text = format!(
+        "Head tracking: camera {approx}{:.2} m from the lockbar, {:.0} cm above, offset {:+.0} cm, tilted {:.0}\u{b0}",
+        pose.distance_mm / 1000.0,
+        pose.height_mm / 10.0,
+        pose.lateral_mm / 10.0,
+        pose.pitch_deg,
+    );
+    std::ffi::CString::new(text).ok()
 }
 
 #[cfg(not(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam")))]
-fn calibration_summary(_backend: &str, _cfg: &config::Config) -> Option<String> {
+fn camera_pose_note(
+    _backend: &str,
+    _calib: &crate::tracker::session::CameraCalibration,
+) -> Option<std::ffi::CString> {
     None
 }
 

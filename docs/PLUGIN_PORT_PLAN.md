@@ -62,26 +62,25 @@ Replace the tract-era detection with the demo's validated pipeline in
   the plugin → unblocks Windows ARM later), `face_depth.rs`,
   `hand_fiducial.rs`, depth-based `detect_lockbar`.
 
-## Phase 2 — calibration [DELIVERED 2026-08-06, scope note below]
+## Phase 2 — calibration [DELIVERED 2026-08-06; upgraded to LIVE same day]
 
-- `anchor_fixed.json` loader (`src/calibration/anchor_fixed.rs`); search
-  order: next to the plugin library (`<VPX>/plugins/headtracking/`),
-  then `VPXInfo.prefPath`. Same format and webcam-slug fallback as the
-  demo.
+- **Live anchor calibration (the former scope cut, now delivered):**
+  every session starts on the COLOUR stream, `anchor::AnchorDetector`
+  (embedded ONNX) runs at 300 ms cadence with the demo-validated
+  best-of-warmup lock (2.5 s after the first hit, 6 s hard timeout),
+  then `HeadTracker::begin_tracking()` switches the device to the
+  configured tracking stream — v1 `set_video_stream(Ir)`, v2
+  `stop()` + `start_streams(false, true)`, webcam no-op. No detection =
+  relative tracking exactly as before, minus the camera-pose note.
+- The `anchor_fixed.json` loader is REMOVED (plugin side; the demo and
+  the annotation tooling keep theirs). serde_json left the plugin deps.
 - Host cabinet geometry (`src/plugin/host_settings.rs`): `[Player]
   LockbarWidth/Height` read from `<prefPath>/VPinballX.ini` (cm → mm),
   VPX defaults as fallback. Unit-tested.
-- `anchor::camera_pose` as diagnostics: computed from the fixed
-  calibration at game start with per-backend nominal focals, pushed
-  once as a native VPX notification ("Head tracking: camera 1.30 m from
-  the lockbar…").
-- **Scope cut (deliberate): the live in-plugin AnchorWorker is
-  deferred.** In the default IR tracking mode no RGB frames stream, and
-  the anchor model wants RGB — the honest design is "calibrate on RGB at
-  session start, then switch the stream to IR", which is its own piece
-  (stream restart choreography per backend). Tracked as follow-up; the
-  fixed-file path fully covers cabs calibrated once (cameras are
-  bolted), and RGB-mode live anchoring can ride the same worker later.
+- `anchor::camera_pose` as diagnostics: computed from the live
+  detection (v2 uses its factory colour intrinsics; nominals
+  elsewhere), pushed once as a native VPX notification when the lock
+  lands ("Head tracking: camera 1.30 m from the lockbar…").
 
 ## Phase 3 — VPX integration
 

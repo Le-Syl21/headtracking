@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
+#[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use tracing::{error, info, warn};
@@ -19,6 +21,96 @@ use super::webcam::WebcamBackend;
 use super::{HeadTracker, Pose};
 use crate::config::{BackendKind, Config};
 use crate::filter::{MedianGate, OneEuroParams, OneEuroPose3D};
+
+/// Result of the RGB anchor-calibration phase run at session start.
+#[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
+#[derive(Debug, Clone, Copy)]
+pub struct CameraCalibration {
+    pub geometry: anchor::AnchorGeometry,
+    pub frame_w: u32,
+    pub frame_h: u32,
+    /// Real colour intrinsics `[fx, fy, cx, cy]` when the device knows them.
+    pub color_intrinsics: Option<[f32; 4]>,
+    pub score: f32,
+}
+
+/// Stub so the featureless build (unit tests) keeps the same session API.
+#[cfg(not(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam")))]
+#[derive(Debug, Clone, Copy)]
+pub struct CameraCalibration;
+
+/// Detection cadence during calibration — the cabinet is fixed, no rush.
+#[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
+const ANCHOR_INTERVAL: Duration = Duration::from_millis(300);
+/// After the FIRST successful detection, keep improving for this long,
+/// then freeze the best (the demo-validated best-of-warmup strategy).
+#[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
+const ANCHOR_WARMUP: Duration = Duration::from_millis(2500);
+/// No detection at all after this long: give up — the plugin tracks in
+/// relative mode exactly as before, just without the camera-pose note.
+#[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
+const ANCHOR_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Run the anchor model on colour frames until the warmup closes. Returns
+/// the best-scoring detection's geometry, or `None` (no model, no frames,
+/// nothing recognized).
+#[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
+fn run_anchor_calibration(
+    backend: &mut Box<dyn HeadTracker>,
+    stop: &AtomicBool,
+) -> Option<CameraCalibration> {
+    let mut det = match anchor::AnchorDetector::new() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("anchor: detector init failed ({e}); skipping calibration");
+            return None;
+        }
+    };
+    let started = Instant::now();
+    let mut first_hit: Option<Instant> = None;
+    let mut best: Option<(f32, anchor::AnchorDetection, u32, u32)> = None;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        match first_hit {
+            None if started.elapsed() > ANCHOR_TIMEOUT => break,
+            Some(t) if t.elapsed() > ANCHOR_WARMUP => break,
+            _ => {}
+        }
+        let Some((w, h, rgb)) = backend.poll_calibration_rgb() else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        if let Some(d) = det.detect(&rgb, w, h) {
+            first_hit.get_or_insert_with(Instant::now);
+            if best.as_ref().is_none_or(|(s, ..)| d.score > *s) {
+                best = Some((d.score, d, w, h));
+            }
+        }
+        thread::sleep(ANCHOR_INTERVAL);
+    }
+    let (score, d, w, h) = best?;
+    info!(
+        score,
+        w, h, "anchor: cabinet locked from live RGB detection"
+    );
+    Some(CameraCalibration {
+        geometry: d.geometry(w, h),
+        frame_w: w,
+        frame_h: h,
+        color_intrinsics: backend.color_intrinsics(),
+        score,
+    })
+}
+
+#[cfg(not(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam")))]
+fn run_anchor_calibration(
+    _backend: &mut Box<dyn HeadTracker>,
+    _stop: &AtomicBool,
+) -> Option<CameraCalibration> {
+    None
+}
 
 /// Owns the tracker thread and exposes the latest pose.
 ///
@@ -35,6 +127,9 @@ pub struct TrackerSession {
     /// the One-Euro filter so the fresh baseline isn't dragged from the
     /// old smoothed position.
     reset_filter: Arc<AtomicBool>,
+    /// Filled by the tracker thread once the RGB anchor-calibration phase
+    /// completes successfully (never, if nothing was recognized).
+    calibration: Arc<std::sync::Mutex<Option<CameraCalibration>>>,
 }
 
 impl TrackerSession {
@@ -60,6 +155,7 @@ impl TrackerSession {
         let latest = Arc::new(ArcSwap::from_pointee(Pose::ZERO));
         let stop = Arc::new(AtomicBool::new(false));
         let reset_filter = Arc::new(AtomicBool::new(false));
+        let calibration = Arc::new(std::sync::Mutex::new(None));
 
         let to_params = |cfg: &Config| {
             cfg.one_euro_params().map(|a| OneEuroParams {
@@ -74,10 +170,18 @@ impl TrackerSession {
         let latest_for_thread = Arc::clone(&latest);
         let stop_for_thread = Arc::clone(&stop);
         let reset_for_thread = Arc::clone(&reset_filter);
+        let calibration_for_thread = Arc::clone(&calibration);
         let handle = thread::Builder::new()
             .name(format!("headtracking-{backend_name}"))
             .spawn(move || {
                 info!(backend = backend_name, "tracker thread started");
+                // Phase 1 — anchor calibration on the COLOUR stream (the
+                // model wants RGB; on Kinects the tracking stream is IR).
+                if let Some(calib) = run_anchor_calibration(&mut backend, &stop_for_thread) {
+                    *calibration_for_thread.lock().expect("calibration mutex") = Some(calib);
+                }
+                // Phase 2 — hand the device to the tracking stream and run.
+                backend.begin_tracking();
                 let mut filter = OneEuroPose3D::new_per_axis(initial);
                 // Spike gate ahead of the One-Euro filter; the window size
                 // is a live setting (see MedianGate docs for the trade-off).
@@ -127,6 +231,7 @@ impl TrackerSession {
             backend_name,
             device_label,
             reset_filter,
+            calibration,
         })
     }
 
@@ -148,6 +253,12 @@ impl TrackerSession {
     /// Ask the tracker thread to reset its smoothing filter (recenter).
     pub fn reset_filter(&self) {
         self.reset_filter.store(true, Ordering::Relaxed);
+    }
+
+    /// Camera calibration from the session-start RGB anchor phase, once
+    /// the tracker thread has produced one.
+    pub fn calibration(&self) -> Option<CameraCalibration> {
+        *self.calibration.lock().expect("calibration mutex")
     }
 }
 
