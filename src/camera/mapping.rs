@@ -106,7 +106,10 @@ pub fn pose_delta_to_view_delta(current: &Pose, baseline: &Pose, p: &MappingPara
         // player), Z up — a pure relabeling of the camera axes. VPX builds
         // the oblique projection from there.
         ViewMode::Window => ViewDelta {
-            dx: mm_to_vpu(dx_mm),
+            // The camera FACES the player, so its image is mirrored
+            // relative to the player frame VPX expects: the player's
+            // rightward move shows up leftward in camera X.
+            dx: mm_to_vpu(-dx_mm),
             // The eye sits on the NEGATIVE-Y side of the screen plane
             // (field-verified: ScreenPlayerY is negative in VPX configs) —
             // stepping back from the cab pushes viewY further negative.
@@ -116,7 +119,9 @@ pub fn pose_delta_to_view_delta(current: &Pose, baseline: &Pose, p: &MappingPara
         // Camera/Legacy: `viewX/Y/Z` is a flying camera in table space —
         // the degraded path (the plugin nudges the user toward Window).
         ViewMode::Legacy | ViewMode::Camera => ViewDelta {
-            dx: mm_to_vpu(dx_mm),
+            // Same mirror as Window: camera image X is flipped relative
+            // to the player's right.
+            dx: mm_to_vpu(-dx_mm),
             // Camera Y is downward; VPX Z is upward → flip.
             dz: -mm_to_vpu(dy_mm),
             // Camera Z grows away from the sensor; +Y is forward (away
@@ -151,11 +156,13 @@ mod tests {
     }
 
     #[test]
-    fn rightward_motion_increases_view_x() {
+    fn camera_x_is_mirrored_into_player_x() {
         let base = pose(0.0, 0.0, 700.0);
-        let cur = pose(50.0, 0.0, 700.0); // 50 mm to the right
+        // The camera faces the player, so camera +X is the player's LEFT:
+        // a +50 mm camera-X move must DECREASE view X.
+        let cur = pose(50.0, 0.0, 700.0);
         let d = pose_delta_to_view_delta(&cur, &base, &FLAT);
-        assert!(d.dx > 0.0, "dx should be positive: {d:?}");
+        assert!(d.dx < 0.0, "camera X must mirror into player X: {d:?}");
         assert!(d.dy.abs() < 1e-4);
         assert!(d.dz.abs() < 1e-4);
     }
