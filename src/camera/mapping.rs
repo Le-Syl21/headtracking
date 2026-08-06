@@ -217,6 +217,8 @@ mod tests {
             mode: ViewMode::Camera,
         };
         let d = pose_delta_to_view_delta(&cur, &base, &inv);
-        assert!(d.dx < 0.0, "inverted X must flip the sign: {d:?}");
+        // The mirrored default maps camera +X to negative view X;
+        // InvertX flips that back to positive.
+        assert!(d.dx > 0.0, "inverted X must flip the sign: {d:?}");
     }
 }
