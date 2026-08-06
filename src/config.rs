@@ -125,6 +125,9 @@ pub struct Config {
     pub device_index: i32,
     pub gain: f32,
     pub smoothing: SmoothingPreset,
+    /// Median spike-gate window in frames (odd, 1 = off); see
+    /// `filter::MedianGate` for the latency trade-off.
+    pub median_window: i32,
     pub tracking_stream: StreamPref,
     pub invert_x: bool,
     pub invert_y: bool,
@@ -145,42 +148,30 @@ pub struct AxisParams {
 }
 
 impl Config {
+    /// Median gate window as a usize for `MedianGate`.
+    #[must_use]
+    pub fn median_window_frames(&self) -> usize {
+        self.median_window.max(1) as usize
+    }
+
     /// Per-axis One-Euro parameters `[x, y, z]` for the active preset.
+    ///
+    /// The three axes are tuned independently: X (lateral) is the visible
+    /// parallax and gets the most responsiveness; Y (height) matters less
+    /// and can sit calmer; Z (depth) is the noisiest reading AND the one
+    /// that re-skews the whole Window-mode projection, so it gets the
+    /// tightest cutoff of all.
     #[must_use]
     pub fn one_euro_params(&self) -> [AxisParams; 3] {
-        let (xy, z) = match self.smoothing {
-            SmoothingPreset::Stable => (
-                AxisParams {
-                    min_cutoff_hz: 0.4,
-                    beta: 0.003,
-                },
-                AxisParams {
-                    min_cutoff_hz: 0.15,
-                    beta: 0.01,
-                },
-            ),
-            SmoothingPreset::Normal => (
-                AxisParams {
-                    min_cutoff_hz: 1.0,
-                    beta: 0.01,
-                },
-                AxisParams {
-                    min_cutoff_hz: 0.4,
-                    beta: 0.05,
-                },
-            ),
-            SmoothingPreset::Reactive => (
-                AxisParams {
-                    min_cutoff_hz: 2.0,
-                    beta: 0.05,
-                },
-                AxisParams {
-                    min_cutoff_hz: 0.8,
-                    beta: 0.1,
-                },
-            ),
+        let p = |min_cutoff_hz: f32, beta: f32| AxisParams {
+            min_cutoff_hz,
+            beta,
         };
-        [xy, xy, z]
+        match self.smoothing {
+            SmoothingPreset::Stable => [p(0.25, 0.002), p(0.2, 0.002), p(0.1, 0.006)],
+            SmoothingPreset::Normal => [p(1.0, 0.01), p(0.8, 0.008), p(0.4, 0.05)],
+            SmoothingPreset::Reactive => [p(2.0, 0.05), p(1.6, 0.04), p(0.8, 0.1)],
+        }
     }
 }
 
@@ -191,6 +182,7 @@ impl Default for Config {
             device_index: 0,
             gain: 1.0,
             smoothing: SmoothingPreset::Stable,
+            median_window: 3,
             tracking_stream: StreamPref::Auto,
             invert_x: false,
             invert_y: false,
@@ -208,6 +200,7 @@ static CONFIG: RwLock<Config> = RwLock::new(Config {
     device_index: 0,
     gain: 1.0,
     smoothing: SmoothingPreset::Stable,
+    median_window: 3,
     tracking_stream: StreamPref::Auto,
     invert_x: false,
     invert_y: false,
@@ -291,6 +284,12 @@ unsafe extern "C" fn set_invert_z(v: c_int) {
     rw!().invert_z = v != 0;
 }
 
+unsafe extern "C" fn get_median_window() -> c_int {
+    current().median_window
+}
+unsafe extern "C" fn set_median_window(v: c_int) {
+    rw!().median_window = v;
+}
 unsafe extern "C" fn get_webcam_focal() -> f32 {
     current().webcam_focal_px
 }
@@ -496,6 +495,17 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32) {
             SMOOTHING_VALUES.0.as_ptr().cast_mut(),
             get_smoothing,
             set_smoothing,
+        ),
+        make_int_setting(
+            c"MedianWindow",
+            c"Median Window",
+            c"Frames of median pre-filtering that erase tracking spikes (1 = off); each extra frame adds ~17 ms of latency at 60 fps",
+            1,
+            9,
+            3,
+            std::ptr::null_mut(),
+            get_median_window,
+            set_median_window,
         ),
         make_int_setting(
             c"TrackingStream",

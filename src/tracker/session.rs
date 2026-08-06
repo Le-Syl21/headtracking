@@ -18,7 +18,7 @@ use super::kinect_v2::KinectV2Backend;
 use super::webcam::WebcamBackend;
 use super::{HeadTracker, Pose};
 use crate::config::{BackendKind, Config};
-use crate::filter::{OneEuroParams, OneEuroPose3D};
+use crate::filter::{MedianGate, OneEuroParams, OneEuroPose3D};
 
 /// Owns the tracker thread and exposes the latest pose.
 ///
@@ -79,6 +79,9 @@ impl TrackerSession {
             .spawn(move || {
                 info!(backend = backend_name, "tracker thread started");
                 let mut filter = OneEuroPose3D::new_per_axis(initial);
+                // Spike gate ahead of the One-Euro filter; the window size
+                // is a live setting (see MedianGate docs for the trade-off).
+                let mut gate = MedianGate::new(crate::config::current().median_window_frames());
                 while !stop_for_thread.load(Ordering::Relaxed) {
                     // The in-game settings page edits the preset LIVE:
                     // follow it without waiting for the next game.
@@ -88,11 +91,21 @@ impl TrackerSession {
                         filter.set_params_per_axis(to_params(&live));
                         info!(backend = backend_name, preset = ?active, "smoothing preset changed");
                     }
+                    if gate.window() != live.median_window_frames() {
+                        gate.set_window(live.median_window_frames());
+                        info!(
+                            backend = backend_name,
+                            window = gate.window(),
+                            "median window changed"
+                        );
+                    }
                     if reset_for_thread.swap(false, Ordering::Relaxed) {
                         filter.reset();
+                        gate.reset();
                     }
                     if let Some(raw) = backend.poll() {
-                        let smoothed = filter.update(raw.position_mm, raw.timestamp_us);
+                        let gated = gate.push(raw.position_mm);
+                        let smoothed = filter.update(gated, raw.timestamp_us);
                         latest_for_thread.store(Arc::new(Pose {
                             position_mm: smoothed,
                             ..raw
