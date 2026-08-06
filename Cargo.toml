@@ -38,13 +38,13 @@ crate-type = ["cdylib", "rlib"]
 # setting (Auto / Kinect v2 / Kinect v1 / Webcam) selects which one is used,
 # with Auto walking a v2 → v1 → webcam fallback chain.
 default = ["all-trackers"]
-# Kinect paths track the head (crate `head`, embedded SCUT-HEAD nano) and
-# anchor depth on its box; the webcam path stays on YuNet face landmarks for
-# IOD triangulation. `face` is still pulled on the Kinect features for the
-# hand-fiducial calibration step, which keys off eye/nose landmarks.
-kinect-v1 = ["dep:freenect", "dep:face", "dep:head"]
-kinect-v2 = ["dep:freenect2", "dep:face", "dep:head"]
-webcam = ["dep:libloading", "dep:face"]
+# Every backend runs the demo-validated pipeline: BlazePose (ort) finds the
+# body, the glabella is the POV point, depth comes from the sensor (Kinects)
+# or shoulder-width triangulation (webcam). The `anchor` crate provides the
+# cabinet auto-calibration on all of them.
+kinect-v1 = ["dep:freenect", "dep:blazepose", "dep:anchor"]
+kinect-v2 = ["dep:freenect2", "dep:blazepose", "dep:anchor"]
+webcam = ["dep:libloading", "dep:blazepose", "dep:anchor"]
 all-trackers = ["kinect-v1", "kinect-v2", "webcam"]
 
 [dependencies]
@@ -59,8 +59,8 @@ parking_lot = "0.12"
 thiserror = "2"
 freenect = { path = "crates/freenect", optional = true }
 freenect2 = { path = "crates/freenect2", optional = true }
-face = { path = "crates/face", optional = true }
-head = { path = "crates/head", optional = true }
+blazepose = { path = "crates/blazepose", optional = true }
+anchor = { path = "crates/anchor", optional = true }
 # libloading powers the runtime SDL3 lookup for the webcam backend: we
 # resolve symbols against `libSDL3.so` already loaded by VPX, instead of
 # linking SDL3 statically into the plugin and ending up with two SDL3

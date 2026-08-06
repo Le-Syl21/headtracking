@@ -38,11 +38,12 @@ impl TrackerSession {
     /// fails fast if the device isn't available.
     pub fn spawn(cfg: &Config) -> Result<Self, SpawnError> {
         let device_index = cfg.device_index.max(0) as usize;
+        let ir = cfg.tracking_stream == crate::config::StreamPref::Auto;
         let backend: Box<dyn HeadTracker> = match cfg.backend {
-            BackendKind::KinectV2 => open_kinect_v2(device_index)?,
-            BackendKind::KinectV1 => open_kinect_v1(device_index)?,
+            BackendKind::KinectV2 => open_kinect_v2(device_index, ir)?,
+            BackendKind::KinectV1 => open_kinect_v1(device_index, ir)?,
             BackendKind::Webcam => open_webcam(device_index)?,
-            BackendKind::Auto => open_auto(device_index)?,
+            BackendKind::Auto => open_auto(device_index, ir)?,
         };
         Self::spawn_with(backend, cfg)
     }
@@ -52,14 +53,15 @@ impl TrackerSession {
         let latest = Arc::new(ArcSwap::from_pointee(Pose::ZERO));
         let stop = Arc::new(AtomicBool::new(false));
 
-        // Snapshot filter params at spawn time; live tweaks land at the
-        // *next* OnGameStart so the running thread keeps coherent state.
-        let xy = OneEuroParams::default();
-        let z = OneEuroParams {
-            min_cutoff_hz: cfg.min_cutoff_hz,
-            beta: cfg.beta,
-            derivative_cutoff_hz: 1.0,
+        let to_params = |cfg: &Config| {
+            cfg.one_euro_params().map(|a| OneEuroParams {
+                min_cutoff_hz: a.min_cutoff_hz,
+                beta: a.beta,
+                derivative_cutoff_hz: 1.0,
+            })
         };
+        let mut active = cfg.smoothing;
+        let initial = to_params(cfg);
 
         let latest_for_thread = Arc::clone(&latest);
         let stop_for_thread = Arc::clone(&stop);
@@ -67,8 +69,16 @@ impl TrackerSession {
             .name(format!("headtracking-{backend_name}"))
             .spawn(move || {
                 info!(backend = backend_name, "tracker thread started");
-                let mut filter = OneEuroPose3D::new_per_axis([xy, xy, z]);
+                let mut filter = OneEuroPose3D::new_per_axis(initial);
                 while !stop_for_thread.load(Ordering::Relaxed) {
+                    // The in-game settings page edits the preset LIVE:
+                    // follow it without waiting for the next game.
+                    let live = crate::config::current();
+                    if live.smoothing != active {
+                        active = live.smoothing;
+                        filter.set_params_per_axis(to_params(&live));
+                        info!(backend = backend_name, preset = ?active, "smoothing preset changed");
+                    }
                     if let Some(raw) = backend.poll() {
                         let smoothed = filter.update(raw.position_mm, raw.timestamp_us);
                         latest_for_thread.store(Arc::new(Pose {
@@ -118,27 +128,33 @@ impl Drop for TrackerSession {
 // ============================================================ Backend openers
 
 #[cfg(feature = "kinect-v2")]
-fn open_kinect_v2(_device_index: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
+fn open_kinect_v2(_device_index: usize, ir: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
     // libfreenect2 only exposes `open_default()` today; multi-Kinect-v2
     // selection would need a cxx bridge change. Falling back to the first
     // device is fine for the pincab use-case.
-    let b = KinectV2Backend::open().map_err(SpawnError::OpenKinectV2)?;
+    use crate::tracker::pipeline::TrackingStream;
+    let stream = if ir {
+        TrackingStream::Ir
+    } else {
+        TrackingStream::Rgb
+    };
+    let b = KinectV2Backend::open(stream).map_err(SpawnError::OpenKinectV2)?;
     Ok(Box::new(b))
 }
 #[cfg(not(feature = "kinect-v2"))]
-fn open_kinect_v2(_: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
+fn open_kinect_v2(_: usize, _: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
     Err(SpawnError::BackendNotCompiled("kinect-v2"))
 }
 
 #[cfg(feature = "kinect-v1")]
-fn open_kinect_v1(_device_index: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
+fn open_kinect_v1(_device_index: usize, ir: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
     // TODO: thread `_device_index` through KinectV1Backend::open once we
     // need to support multi-v1 setups. libfreenect itself supports it.
-    let b = KinectV1Backend::open().map_err(SpawnError::OpenKinectV1)?;
+    let b = KinectV1Backend::open(ir).map_err(SpawnError::OpenKinectV1)?;
     Ok(Box::new(b))
 }
 #[cfg(not(feature = "kinect-v1"))]
-fn open_kinect_v1(_: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
+fn open_kinect_v1(_: usize, _: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
     Err(SpawnError::BackendNotCompiled("kinect-v1"))
 }
 
@@ -155,13 +171,13 @@ fn open_webcam(_: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
 /// Walk the v2 → v1 → webcam fallback chain. Each failure is logged so
 /// the user can tell from the VPX log why a particular backend was
 /// skipped (no device, USB error, model load, …).
-fn open_auto(device_index: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
-    if let Ok(b) = open_kinect_v2(device_index).inspect_err(|e| {
+fn open_auto(device_index: usize, ir: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
+    if let Ok(b) = open_kinect_v2(device_index, ir).inspect_err(|e| {
         warn!(?e, "auto: kinect-v2 unavailable, trying next");
     }) {
         return Ok(b);
     }
-    if let Ok(b) = open_kinect_v1(device_index).inspect_err(|e| {
+    if let Ok(b) = open_kinect_v1(device_index, ir).inspect_err(|e| {
         warn!(?e, "auto: kinect-v1 unavailable, trying next");
     }) {
         return Ok(b);

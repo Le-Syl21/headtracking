@@ -1372,12 +1372,12 @@ dependencies = [
 name = "headtracking"
 version = "0.0.26"
 dependencies = [
+ "anchor",
  "arc-swap",
  "bindgen",
- "face",
+ "blazepose",
  "freenect",
  "freenect2",
- "head",
  "libloading 0.9.0",
  "os_info",
  "parking_lot",

@@ -263,8 +263,8 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
             backend = ?cfg.backend,
             device_index = cfg.device_index,
             gain = cfg.gain,
-            min_cutoff_hz = cfg.min_cutoff_hz,
-            beta = cfg.beta,
+            smoothing = ?cfg.smoothing,
+            stream = ?cfg.tracking_stream,
             "spawning tracker session with current config"
         );
         match TrackerSession::spawn(&cfg) {

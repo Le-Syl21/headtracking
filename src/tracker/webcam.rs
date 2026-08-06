@@ -1,4 +1,4 @@
-//! Webcam head tracker backend (SDL3 capture via dlsym + YuNet face detection).
+//! Webcam head tracker backend (SDL3 capture via dlsym + BlazePose).
 //!
 //! Unlike `tools/headtracking-demo` which links SDL3 statically through the
 //! `webcam` workspace crate, the plugin resolves SDL3 symbols at runtime
@@ -12,18 +12,10 @@
 //! first SDL3 user. SDL3 internally refcounts subsystem inits, so calling
 //! `SDL_Init(SDL_INIT_CAMERA)` ourselves is safe regardless.
 //!
-//! Algorithm:
-//!   1. Poll the camera, run face detection (Ultraface RFB-320).
-//!   2. Run BlazePalm on the same frame for both hands (model TBA;
-//!      detector returns `[]` in scaffold mode — see
-//!      `crates/face/src/hand.rs`).
-//!   3. When both hands are visible, feed them into
-//!      [`crate::calibration::hand_fiducial`] to refine the focal
-//!      length estimate. Until then, the bootstrap `FOCAL_RATIO * width`
-//!      heuristic is the best we can do.
-//!   4. Triangulate Z from the inter-pupillary pixel distance using
-//!      the (possibly refined) focal, then deproject (X, Y) through
-//!      pinhole.
+//! Algorithm (demo-validated): BlazePose on each frame; distance from the
+//! shoulder width (a stable ~0.40 m span), glabella deprojected through the
+//! configured focal (`WebcamFocalPx` setting) or a nominal one derived from
+//! the frame width.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
@@ -31,11 +23,9 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use libloading::{Library, Symbol};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use super::face_depth::pick_largest_face;
 use super::{HeadTracker, Pose};
-use crate::calibration::hand_fiducial::{HandFiducialFrame, HandPair, LockbarGeometry, observe};
 
 // ============================================================ SDL3 ABI
 
@@ -227,7 +217,6 @@ fn sdl3() -> Result<&'static Sdl3Api, Error> {
 // for a small safety margin against the wide end of cheap cameras.
 // The hand-fiducial path (`hand_fiducial::observe`) refines this on
 // the fly once both player hands are detected.
-const FOCAL_RATIO: f32 = 0.85;
 
 struct OpenedCamera {
     handle: NonNull<c_void>,
@@ -391,44 +380,11 @@ unsafe fn copy_rgb24(surf: &SDL_Surface) -> Option<RgbFrame> {
 
 pub struct WebcamBackend {
     camera: OpenedCamera,
-    detector: face::Detector,
-    /// Hand detector for the lockbar-from-hands fiducial path. In
-    /// scaffold mode (no BlazePalm model embedded) this is constructed
-    /// successfully but `detect()` always returns `[]`, so the focal
-    /// refinement below is a no-op until the model lands.
-    hand_detector: face::hand::HandDetector,
-    last_faces: Vec<face::FaceDetection>,
-    last_hands: Vec<face::hand::HandDetection>,
-    /// Last hand-fiducial observation, kept around for the
-    /// headtracking-demo overlay to render. `None` until both hands
-    /// are detected at the same frame.
-    last_hand_observation: Option<HandFiducialFrame>,
-    /// Bootstrap focal — `FOCAL_RATIO * frame_width`. Used when no
-    /// hand-fiducial estimate is available yet (scaffold mode, or hands
-    /// momentarily not visible).
-    fx_bootstrap: f32,
-    /// EMA-smoothed focal estimate from the hand fiducial. Updated each
-    /// frame both hands are visible. `None` until the first valid
-    /// observation.
-    fx_ema: Option<f32>,
-    cx: f32,
-    cy: f32,
+    blaze: blazepose::BlazePose,
     started_at: Instant,
     /// Declared last: released only after the camera handle above closes.
     _hwlock: crate::hwlock::HwLock,
 }
-
-/// Smoothing weight on focal-length updates from hand fiducial
-/// observations. Higher = faster convergence but noisier estimate.
-/// 0.1 means the EMA reaches 90% of a step change in ~22 frames
-/// (≈0.7 s at 30 Hz), which matches our "hands stable for ~1 s before
-/// trusting the calibration" UX target.
-const FOCAL_EMA_ALPHA: f32 = 0.1;
-
-/// Reject hand-fiducial observations whose baseline tilt exceeds this
-/// (rad). The user is presumably playing in a non-standard stance —
-/// keeping the previous EMA value is safer than ingesting noise.
-const HAND_TILT_REJECT_RAD: f32 = 0.175; // ~10°
 
 impl WebcamBackend {
     pub fn open(index: usize) -> Result<Self, Error> {
@@ -437,148 +393,43 @@ impl WebcamBackend {
         let hwlock = crate::hwlock::HwLock::acquire("webcam").map_err(Error::Busy)?;
         let api = sdl3()?;
         let camera = OpenedCamera::open(api, index)?;
-        let detector = face::Detector::new()?;
-        let hand_detector = face::hand::HandDetector::new()?;
-        let w = camera.width;
-        let h = camera.height;
-        let fx_bootstrap = FOCAL_RATIO * w as f32;
-        let cx = w as f32 / 2.0;
-        let cy = h as f32 / 2.0;
+        let blaze = blazepose::BlazePose::new().map_err(|e| Error::Model(e.to_string()))?;
         info!(
             name = camera.name.as_str(),
-            width = w,
-            height = h,
-            fx_bootstrap,
-            hand_detector_ready = hand_detector.is_ready(),
-            "webcam backend ready"
+            width = camera.width,
+            height = camera.height,
+            "webcam backend ready (BlazePose + shoulder-width ranging)"
         );
         Ok(Self {
             camera,
-            detector,
-            hand_detector,
-            last_faces: Vec::new(),
-            last_hands: Vec::new(),
-            last_hand_observation: None,
-            fx_bootstrap,
-            fx_ema: None,
-            cx,
-            cy,
+            blaze,
             started_at: Instant::now(),
             _hwlock: hwlock,
         })
     }
 
-    /// Effective focal length used for triangulation: the EMA-smoothed
-    /// estimate from the hand fiducial when available, otherwise the
-    /// bootstrap heuristic (`FOCAL_RATIO * width`).
-    fn current_focal(&self) -> f32 {
-        self.fx_ema.unwrap_or(self.fx_bootstrap)
-    }
-
-    /// Latest computed hand-fiducial observation — exposed for the
-    /// headtracking-demo overlay; the plugin path doesn't read this.
-    pub fn last_hand_observation(&self) -> Option<HandFiducialFrame> {
-        self.last_hand_observation
-    }
-
-    /// Detected hands from the last frame, for overlay rendering.
-    pub fn last_hands(&self) -> &[face::hand::HandDetection] {
-        &self.last_hands
-    }
-
+    /// BlazePose on the frame, then the demo-validated webcam ranging:
+    /// distance from the shoulder width, glabella deprojected through the
+    /// configured (or nominal) focal.
     fn frame_to_pose(&mut self, frame: &RgbFrame) -> Option<Pose> {
-        self.last_faces = self.detector.detect(&frame.data, frame.width, frame.height);
-        // Hand detection is best-effort — if the detector errors we log
-        // and fall back to the bootstrap focal. In scaffold mode this
-        // returns Ok(vec![]).
-        self.last_hands = match self
-            .hand_detector
-            .detect(&frame.data, frame.width, frame.height)
-        {
-            Ok(h) => h,
-            Err(err) => {
-                warn!(?err, "hand detection failed; skipping focal refinement");
-                Vec::new()
+        let pose = match self.blaze.poll(&frame.data, frame.width, frame.height) {
+            Ok(p) => p?,
+            Err(e) => {
+                warn!("webcam: blazepose failed: {e}");
+                return None;
             }
         };
-
-        // Copy the largest face out so we don't keep a borrow into
-        // `self.last_faces` across the upcoming `&mut self` writes
-        // (`self.last_hand_observation = Some(obs)`).
-        let largest_face: Option<face::FaceDetection> =
-            pick_largest_face(&self.last_faces).copied();
-
-        // Update focal estimate from hand fiducial when both hands are
-        // visible. Geometry comes from the live config so users can
-        // tune `LockbarHandSpan` / `IPDmm` from VPX without restarting.
-        let cfg = crate::config::current();
-        let geom = LockbarGeometry {
-            hand_span_mm: cfg.lockbar_hand_span_mm,
-            lockbar_floor_height_mm: cfg.lockbar_floor_height_mm,
-            ipd_mm: cfg.ipd_mm,
-        };
-        if let Some((left, right)) = face::hand::sort_lr(self.last_hands.clone()) {
-            let pair = HandPair { left, right };
-            // Pass the current focal as a hint so observe() recovers
-            // a distance and (downstream) keeps face_distance_mm
-            // populated for the demo overlay.
-            let obs = observe(
-                &pair,
-                largest_face.as_ref(),
-                &geom,
-                None,
-                Some(self.current_focal()),
-            );
-            self.last_hand_observation = Some(obs);
-            // Refine the EMA only when the baseline isn't badly tilted
-            // (non-standard stance) AND when observe() actually
-            // produced a focal_px.
-            if obs.hand_tilt_radians.abs() <= HAND_TILT_REJECT_RAD
-                && let Some(focal_obs) = obs.focal_px
-            {
-                let next = match self.fx_ema {
-                    None => focal_obs,
-                    Some(prev) => prev * (1.0 - FOCAL_EMA_ALPHA) + focal_obs * FOCAL_EMA_ALPHA,
-                };
-                debug!(
-                    focal_obs,
-                    focal_ema = next,
-                    hand_span_px = obs.hand_span_px,
-                    "hand fiducial focal update"
-                );
-                self.fx_ema = Some(next);
-            }
-        } else {
-            // Hands not visible (one off the buttons, plunger pull,
-            // scaffold mode). Keep the last EMA, drop the observation
-            // diagnostic.
-            self.last_hand_observation = None;
-        }
-
-        let face = largest_face?;
-
-        // Z from inter-pupillary pixel distance, using whichever focal
-        // is currently most reliable (EMA when calibrated, bootstrap
-        // otherwise). Switch to `cfg.ipd_mm` for the IOD constant —
-        // user-tunable, replaces the previous compile-time `IOD_MM`.
-        let dx = face.left_eye_x - face.right_eye_x;
-        let dy = face.left_eye_y - face.right_eye_y;
-        let iod_px = (dx * dx + dy * dy).sqrt();
-        if iod_px < 8.0 {
-            return None;
-        }
-        let fx = self.current_focal();
-        let z_mm = cfg.ipd_mm * fx / iod_px;
-
-        let u = (face.left_eye_x + face.right_eye_x) * 0.5;
-        let v = (face.left_eye_y + face.right_eye_y) * 0.5;
-        let x_mm = (u - self.cx) * z_mm / fx;
-        let y_mm = (v - self.cy) * z_mm / fx;
-
+        let focal = crate::config::current().webcam_focal_px;
+        let head = crate::tracker::pipeline::head_pixel_from_pose_webcam(
+            &pose,
+            frame.width,
+            frame.height,
+            focal,
+        )?;
         Some(Pose {
-            position_mm: [x_mm, y_mm, z_mm],
+            position_mm: [head.x_mm, head.y_mm, head.depth_mm],
             timestamp_us: self.started_at.elapsed().as_micros() as u64,
-            confidence: face.confidence.clamp(0.0, 1.0),
+            confidence: pose.presence.clamp(0.0, 1.0),
         })
     }
 }
@@ -611,14 +462,8 @@ pub enum Error {
     Enumerate(String),
     #[error("no webcam available")]
     NoDevice,
-    #[error("face detector init: {0}")]
-    Face(String),
+    #[error("pose model init: {0}")]
+    Model(String),
     #[error("{0}")]
     Busy(String),
-}
-
-impl From<face::Error> for Error {
-    fn from(e: face::Error) -> Self {
-        Self::Face(e.to_string())
-    }
 }

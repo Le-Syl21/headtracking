@@ -1,53 +1,62 @@
 //! Kinect v2 head tracker backend (libfreenect2 via the `freenect2` crate).
 //!
-//! Algorithm:
+//! The demo-validated pipeline:
 //!
-//! 1. Poll the colour stream (1920×1080 BGRX) and run YuNet face detection
-//!    on each new frame. The bbox of the largest detected face is cached.
-//! 2. Poll the depth stream (512×424 f32 mm). Map the cached face bbox
-//!    from RGB pixel coords into depth pixel coords by linear rescale,
-//!    sample valid depth pixels inside the bbox, take the median (robust
-//!    to outliers).
-//! 3. Deproject the bbox centre through the IR camera intrinsics returned
-//!    by libfreenect2 to produce a (x, y, z) pose in millimetres.
+//! * **IR-first** (default): only the depth pipeline streams
+//!   (`start_streams(false, true)`) — IR rides the same listener. The IR
+//!   frame is auto-levelled and fed to BlazePose; the head point then
+//!   samples the depth grid **directly** (IR and depth share the sensor and
+//!   the 512×424 grid — no registration involved). Actively illuminated IR
+//!   holds 30 fps in a dark game room where auto-exposed colour drops to 15.
+//! * **Colour fallback**: BlazePose runs on the 1920×1080 BGRX stream and
+//!   depth is sampled through libfreenect2's factory registration
+//!   (`bigdepth`, depth expressed in colour pixels), deprojected with the
+//!   **colour** intrinsics.
 //!
-//! No face detected this frame ⇒ no pose. The earlier "closest valid
-//! pixel" heuristic is gone — it tripped on hands, lockbar edges, and
-//! stray noise pixels in the play frustum.
+//! Either way the v2 frame is mirrored vs the v1 — X is negated so
+//! left/right POV travel matches across backends.
 
 use std::time::Instant;
 
 use tracing::{info, warn};
 
-use freenect2::{Context, DepthFrame, Device};
+use freenect2::{BIGDEPTH_LEN, Context, Device, Registration};
 
-use super::face_depth::{Intrinsics, bgrx_to_rgb888, head_from_region, pick_largest_head};
+use super::pipeline::{
+    BIGDEPTH_H, BIGDEPTH_W, DEPTH_MIN_SAMPLES, HeadPixel, Intrinsics, TrackingStream,
+    autolevel_gray8_raw, bgrx_to_rgb888, gray8_to_rgb888, head_pixel_from_bigdepth,
+    head_pixel_from_pose_depth,
+};
 use super::{HeadTracker, Pose};
-
-/// Kinect v2 RGB sensor resolution. The colour stream we receive from
-/// libfreenect2 is always 1920×1080 BGRX.
-const RGB_W: u32 = 1920;
-const RGB_H: u32 = 1080;
 
 pub struct KinectV2Backend {
     // Drop order matters: `device` must run its destructor before `_ctx` so
     // libfreenect2's Freenect2Device shutdown still has a live Freenect2.
     // Rust drops struct fields in declaration order, so list `device` first.
     device: Device,
+    registration: Option<Registration>,
     _ctx: Context,
-    intrinsics: Intrinsics,
-    detector: head::Detector,
-    last_heads: Vec<head::HeadAnchor>,
+    blaze: blazepose::BlazePose,
+    stream: TrackingStream,
+    ir_intr: Intrinsics,
+    color_intr: Intrinsics,
+    /// Latest BlazePose fix + the dimensions of the frame it was found in.
+    last_pose: Option<blazepose::Pose>,
+    pose_src: (u32, u32),
+    /// Scratch for the registration output (colour mode only).
+    bigdepth: Vec<f32>,
+    /// Zeroed BGRX scratch: `Registration::apply` demands a colour buffer,
+    /// but `bigdepth` is computed from depth alone — zeros are fine.
+    rgb_zero: Vec<u8>,
     started_at: Instant,
     /// Declared last: released only after the device handle above closes.
     _hwlock: crate::hwlock::HwLock,
 }
 
 impl KinectV2Backend {
-    /// Open the first Kinect v2 found on USB and start the depth + colour
-    /// streams. Returns an error if no device is connected, libfreenect2
-    /// fails to start, or the head ONNX model can't be loaded into tract.
-    pub fn open() -> Result<Self, Error> {
+    /// Open the first Kinect v2 found on USB and start the streams the
+    /// selected tracking mode needs.
+    pub fn open(stream: TrackingStream) -> Result<Self, Error> {
         // Cross-process exclusivity (demo, cron capture, second VPX): fail
         // fast with a readable message instead of a USB-level fight.
         let hwlock = crate::hwlock::HwLock::acquire("kinect-v2").map_err(Error::Busy)?;
@@ -57,70 +66,155 @@ impl KinectV2Backend {
             return Err(Error::Freenect2(freenect2::Error::NoDevice));
         }
         let device = ctx.open_default()?;
-        device.start()?;
+        match stream {
+            // IR rides the depth pipeline; skipping colour halves the USB
+            // load and the per-frame CPU (no 8 MB BGRX to convert).
+            TrackingStream::Ir => device.start_streams(false, true)?,
+            TrackingStream::Rgb => device.start()?,
+        }
         let ir = device.ir_params();
-        let intrinsics = Intrinsics {
+        let ir_intr = Intrinsics {
             fx: ir.fx,
             fy: ir.fy,
             cx: ir.cx,
             cy: ir.cy,
         };
-        let detector = head::Detector::new()?;
+        let color = device.color_params();
+        let color_intr = Intrinsics {
+            fx: color.fx,
+            fy: color.fy,
+            cx: color.cx,
+            cy: color.cy,
+        };
+        let registration = match stream {
+            TrackingStream::Rgb => Some(device.registration()),
+            TrackingStream::Ir => None,
+        };
+        let blaze = blazepose::BlazePose::new()?;
         info!(
             n_devices = count,
-            fx = intrinsics.fx,
-            fy = intrinsics.fy,
-            cx = intrinsics.cx,
-            cy = intrinsics.cy,
+            ?stream,
+            ir_fx = ir_intr.fx,
+            color_fx = color_intr.fx,
             "kinect-v2: device opened"
         );
         Ok(Self {
             device,
+            registration,
             _ctx: ctx,
-            intrinsics,
-            detector,
-            last_heads: Vec::new(),
+            blaze,
+            stream,
+            ir_intr,
+            color_intr,
+            last_pose: None,
+            pose_src: (0, 0),
+            bigdepth: vec![0.0; BIGDEPTH_LEN],
+            rgb_zero: vec![0u8; BIGDEPTH_W * BIGDEPTH_H * 4],
             started_at: Instant::now(),
             _hwlock: hwlock,
         })
     }
 
-    fn refresh_head_from_rgb(&mut self) {
-        // poll_rgb is non-blocking; only re-run the head detector if a fresh
-        // frame arrived. If not, keep the previous detections.
-        if let Some(rgb) = self.device.poll_rgb() {
-            let rgb888 = bgrx_to_rgb888(&rgb.data);
-            self.last_heads = self.detector.detect(&rgb888, rgb.width, rgb.height);
+    /// Feed the newest video frame (IR or colour per mode) to BlazePose.
+    fn refresh_pose(&mut self) {
+        match self.stream {
+            TrackingStream::Ir => {
+                if let Some(ir) = self.device.poll_ir() {
+                    // v2 IR is a wide-range f32 intensity; round to u16 and
+                    // auto-level, or the untouched high byte is nearly black.
+                    let raw: Vec<u16> = ir.data.iter().map(|&v| v as u16).collect();
+                    let gray = autolevel_gray8_raw(&raw, false);
+                    let rgb888 = gray8_to_rgb888(&gray);
+                    match self.blaze.poll(&rgb888, ir.width, ir.height) {
+                        Ok(pose) => {
+                            if pose.is_some() {
+                                self.pose_src = (ir.width, ir.height);
+                            }
+                            self.last_pose = pose;
+                        }
+                        Err(e) => warn!("kinect-v2: blazepose failed on IR: {e}"),
+                    }
+                }
+            }
+            TrackingStream::Rgb => {
+                if let Some(rgb) = self.device.poll_rgb() {
+                    let rgb888 = bgrx_to_rgb888(&rgb.data);
+                    match self.blaze.poll(&rgb888, rgb.width, rgb.height) {
+                        Ok(pose) => {
+                            if pose.is_some() {
+                                self.pose_src = (rgb.width, rgb.height);
+                            }
+                            self.last_pose = pose;
+                        }
+                        Err(e) => warn!("kinect-v2: blazepose failed on colour: {e}"),
+                    }
+                }
+            }
         }
     }
 
-    fn frame_to_pose(&self, frame: &DepthFrame) -> Option<Pose> {
-        let head = pick_largest_head(&self.last_heads)?;
-        let xyz = head_from_region(
-            head.cx,
-            head.cy,
-            head.width,
-            head.height,
-            RGB_W,
-            RGB_H,
-            &frame.data,
-            frame.width,
-            frame.height,
-            &self.intrinsics,
-        )?;
-        Some(Pose {
-            position_mm: xyz,
-            timestamp_us: self.started_at.elapsed().as_micros() as u64,
-            confidence: head.confidence.clamp(0.0, 1.0),
+    fn head_from_depth(&mut self, depth: &freenect2::DepthFrame) -> Option<HeadPixel> {
+        let pose = self.last_pose.as_ref()?;
+        let head = match self.stream {
+            // Pose already lives in the depth camera's own grid (IR and
+            // depth are the same sensor, pixel aligned) — exact sampling.
+            TrackingStream::Ir => head_pixel_from_pose_depth(
+                pose,
+                self.pose_src,
+                &depth.data,
+                (depth.width, depth.height),
+                &self.ir_intr,
+                DEPTH_MIN_SAMPLES,
+            ),
+            TrackingStream::Rgb => {
+                let reg_ok = self.registration.as_mut().is_some_and(|reg| {
+                    reg.bigdepth(&self.rgb_zero, &depth.data, &mut self.bigdepth)
+                });
+                if reg_ok {
+                    head_pixel_from_bigdepth(
+                        pose,
+                        &self.bigdepth,
+                        &self.color_intr,
+                        DEPTH_MIN_SAMPLES,
+                    )
+                } else {
+                    // Registration unavailable: linear rescale into the raw
+                    // depth grid — cross-sensor parallax uncorrected, still
+                    // better than nothing.
+                    head_pixel_from_pose_depth(
+                        pose,
+                        self.pose_src,
+                        &depth.data,
+                        (depth.width, depth.height),
+                        &self.ir_intr,
+                        DEPTH_MIN_SAMPLES,
+                    )
+                }
+            }
+        };
+        // v2 frames are mirrored → negate X so left/right POV travel
+        // matches the v1 (bigdepth inherits the colour framing, the IR grid
+        // shares the depth sensor — the correction applies to all paths).
+        head.map(|mut h| {
+            h.x_mm = -h.x_mm;
+            h
         })
     }
 }
 
 impl HeadTracker for KinectV2Backend {
     fn poll(&mut self) -> Option<Pose> {
-        self.refresh_head_from_rgb();
-        let frame = self.device.poll_depth()?;
-        self.frame_to_pose(&frame)
+        self.refresh_pose();
+        let depth = self.device.poll_depth()?;
+        let head = self.head_from_depth(&depth)?;
+        Some(Pose {
+            position_mm: [head.x_mm, head.y_mm, head.depth_mm],
+            timestamp_us: self.started_at.elapsed().as_micros() as u64,
+            confidence: self
+                .last_pose
+                .as_ref()
+                .map_or(0.0, |p| p.presence.clamp(0.0, 1.0)),
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -134,15 +228,13 @@ impl HeadTracker for KinectV2Backend {
     }
 }
 
-/// Errors returned by [`KinectV2Backend::open`]. Consolidates the libfreenect2
-/// failure modes with the head model load path so the session thread has
-/// a single error type to surface in logs.
+/// Errors returned by [`KinectV2Backend::open`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("libfreenect2: {0}")]
     Freenect2(#[from] freenect2::Error),
-    #[error("head detector init: {0}")]
-    Head(#[from] head::Error),
+    #[error("blazepose init: {0}")]
+    Blaze(#[from] blazepose::Error),
     #[error("{0}")]
     Busy(String),
 }
