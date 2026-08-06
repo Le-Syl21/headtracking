@@ -25,10 +25,12 @@ nalgebra = "0.35"
 # raw_input before egui sees it and the tessellated primitives before the
 # paint — a seam eframe doesn't expose. Needed for the physically-rotated
 # pincab display (270° default, ⟳ button cycles 90°).
-egui = "0.35"
-egui_glow = "0.35"
-egui-winit = { version = "0.35", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
-egui-rotate = { version = "2.0", features = ["software-cursor"] }
+egui = "0.36"
+egui_glow = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+# TODO(release): flip back to `version = "3.0"` once egui-rotate 3.0.0
+# is published on crates.io (tag exists, publish pending).
+egui-rotate = { git = "https://github.com/Le-Syl21/egui-rotate", tag = "v3.0.0", features = ["software-cursor"] }
 glow = "0.17"
 glutin = "0.32"
 glutin-winit = "0.5"

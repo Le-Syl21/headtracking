@@ -975,7 +975,7 @@ impl DemoShell {
 
         // 3. Run the UI. The plugin rotates input + shapes and draws the cursor.
         let app = &mut self.app;
-        let full_output = ctx.run_ui(raw_input, |ui| app.ui(ui));
+        let mut full_output = ctx.run_ui(raw_input, |ui| app.ui(ui));
 
         // 4. If the software cursor was released to the OS (soft-lock breakout
         //    or a no-lock edge contact), warp the real cursor to the exit point.
@@ -998,8 +998,12 @@ impl DemoShell {
         let clipped = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
         let painter = self.painter.as_mut().unwrap();
-        for (id, image_delta) in &full_output.textures_delta.set {
-            painter.set_texture(*id, image_delta);
+        // egui 0.36: several `ImageDelta` can be batched per texture id —
+        // apply them in order.
+        for (id, image_deltas) in &full_output.textures_delta.set {
+            for image_delta in image_deltas {
+                painter.set_texture(*id, image_delta);
+            }
         }
         // SAFETY: glow calls on the current GL context, on the UI thread.
         unsafe {
@@ -1012,6 +1016,9 @@ impl DemoShell {
         for id in &full_output.textures_delta.free {
             painter.free_texture(*id);
         }
+        // egui 0.36: a TexturesDelta dropped non-empty debug-asserts —
+        // everything above has been applied, say so.
+        full_output.textures_delta.clear();
 
         self.gl_window.as_ref().unwrap().swap_buffers().unwrap();
         // Count this present toward the render-rate metric (every repaint, not
@@ -4226,7 +4233,7 @@ impl App {
             // Y flipped by default: Kinect Y points down, the eye's Y is up.
             // Z inverted so moving closer (head depth shrinks) pulls the eye
             // toward the screen → the scene grows, the fish-tank expectation.
-            parallax_invert: [false, true, true],
+            parallax_invert: [false, false, false],
             parallax_panel_rect: None,
             parallax_mouse_z: PX_DVIEW_MM,
             parallax_aspect: 16.0 / 9.0,
@@ -4760,10 +4767,15 @@ impl App {
                     let (ct, st) = (theta.cos(), theta.sin());
                     let dy_t = dy * ct + dz * st;
                     let dz_t = -dy * st + dz * ct;
+                    // Axis conventions settled by field testing (2026-08-06):
+                    // Y passes straight through, and moving TOWARD the cab
+                    // brings the eye closer (the baked `-` on Z). The ±X/Y/Z
+                    // toggles stay all-off by default — they exist for exotic
+                    // camera mountings, not to fix the normal case.
                     self.parallax_eye = [
                         sign(0) * dx * g,
                         sign(1) * dy_t * g,
-                        (PX_DVIEW_MM + sign(2) * dz_t * g).clamp(150.0, 1500.0),
+                        (PX_DVIEW_MM - sign(2) * dz_t * g).clamp(150.0, 1500.0),
                     ];
                 } else {
                     self.parallax_eye = [0.0, 0.0, PX_DVIEW_MM];
@@ -4836,13 +4848,10 @@ impl App {
                         entries.truncate(3);
                     }
                 }
-                // Salt the id with the entry count: egui persists the popup
-                // Area's size across opens, and its ScrollArea clamps content
-                // to that stored size — so a popup once opened with N entries
-                // stays N entries tall forever (scrollbar instead of growing)
-                // after a rescan adds a camera. A fresh id per count = a
-                // fresh size negotiation.
-                let combo_resp = ComboBox::from_id_salt(format!("backend-{}", entries.len()))
+                // (egui 0.36 reruns the popup sizing pass on reopen — the
+                // 0.35-era workaround of salting the id with the entry count
+                // is gone; upstream fix: emilk/egui#8315.)
+                let combo_resp = ComboBox::from_id_salt("backend")
                     .width(combo_w)
                     .height(popup_h)
                     .selected_text(selected_label)
@@ -4882,9 +4891,21 @@ impl App {
                         ui.spacing().button_padding.y,
                         ui.spacing().item_spacing.y,
                     );
-                    // Keep the popup permanently open so layout can be
-                    // inspected/screenshotted without a mouse.
-                    egui::Popup::open_id(ui.ctx(), combo_resp.response.id.with("popup"));
+                    // Keep the popup open so layout can be inspected without a
+                    // mouse — EXCEPT, in grow mode, during a short window
+                    // around the 6 s entry-count change: the real-world flow
+                    // (open → Rescan → reopen) closes the popup in between,
+                    // and egui's reopen sizing pass (0.36, emilk/egui#8315)
+                    // only runs on that closed→open transition.
+                    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+                    let elapsed = T0.get_or_init(Instant::now).elapsed().as_secs_f32();
+                    let grow_gap =
+                        combo_debug_var.as_deref() == Some("grow") && (5.0..7.0).contains(&elapsed);
+                    if grow_gap {
+                        egui::Popup::close_id(ui.ctx(), combo_resp.response.id.with("popup"));
+                    } else {
+                        egui::Popup::open_id(ui.ctx(), combo_resp.response.id.with("popup"));
+                    }
                 }
                 if ui.button("Rescan").clicked() {
                     self.refresh_available();
