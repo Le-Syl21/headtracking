@@ -107,7 +107,10 @@ pub fn pose_delta_to_view_delta(current: &Pose, baseline: &Pose, p: &MappingPara
         // the oblique projection from there.
         ViewMode::Window => ViewDelta {
             dx: mm_to_vpu(dx_mm),
-            dy: mm_to_vpu(dz_mm),  // away from cab = away from screen
+            // The eye sits on the NEGATIVE-Y side of the screen plane
+            // (field-verified: ScreenPlayerY is negative in VPX configs) —
+            // stepping back from the cab pushes viewY further negative.
+            dy: mm_to_vpu(-dz_mm),
             dz: mm_to_vpu(-dy_mm), // camera Y is down; player Z is up
         },
         // Camera/Legacy: `viewX/Y/Z` is a flying camera in table space —
@@ -178,9 +181,9 @@ mod tests {
 
     #[test]
     fn window_mode_maps_eye_axes() {
-        // Stepping BACK from the cab must move the
-        // eye away from the screen (+dy), and standing taller must raise it
-        // (+dz) — the whole point of the Window frame.
+        // The eye lives on the negative-Y side of the screen: stepping BACK
+        // from the cab pushes viewY further negative (-dy), and standing
+        // taller must raise it (+dz) — the whole point of the Window frame.
         let p = MappingParams {
             invert: [false; 3],
             mode: ViewMode::Window,
@@ -189,8 +192,8 @@ mod tests {
         let back = pose(0.0, 0.0, 800.0); // 100 mm away from the camera/cab
         let d = pose_delta_to_view_delta(&back, &base, &p);
         assert!(
-            d.dy > 0.0,
-            "stepping back must grow the eye distance: {d:?}"
+            d.dy < 0.0,
+            "stepping back must push viewY further negative: {d:?}"
         );
         let up = pose(0.0, -50.0, 700.0); // camera Y is down
         let d = pose_delta_to_view_delta(&up, &base, &p);
