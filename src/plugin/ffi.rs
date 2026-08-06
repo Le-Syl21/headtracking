@@ -580,7 +580,8 @@ fn startup_note(device: &str, backend: &str, cfg: &config::Config) -> Option<std
     }
     text.push_str(
         "\nCheck your VPX setup: lockbar width + screen inclination \
-         (Cabinet settings), POV layout 'Window' with rotation 0",
+         (Cabinet settings), POV layout 'Window' with rotation 0, \
+         cabinet autofit 'Fit Table'",
     );
     std::ffi::CString::new(text).ok()
 }
