@@ -35,7 +35,7 @@ use egui::{
 use egui_rotate::{Rotation, RotationPlugin, SoftwareCursor};
 use egui_winit::winit;
 use nalgebra::Matrix4;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 use tracing::{error, info, warn};
@@ -2110,6 +2110,8 @@ struct App {
     /// felt laggy on quick lateral moves, so it's tunable from the bench row.
     head_filter_min_cutoff: f32,
     head_filter_beta: f32,
+    /// Median spike-gate window in frames (odd, 1 = off).
+    median_window_frames: usize,
     /// Debug: bypass everything between raw detection and the pose — the 1€
     /// filter, the lockbar-centred picker (→ largest head), and most of the
     /// depth-sample gate — to see which stage is dropping the head.
@@ -2370,6 +2372,8 @@ struct Capture {
     blaze_worker: BlazePoseWorker,
     anchor_worker: AnchorWorker,
     pose_filter: filter_alias::OneEuroPose3D,
+    /// Median spike gate ahead of the 1€ (same component as the plugin).
+    median_gate: headtracking::filter::MedianGate,
     started_at: Instant,
     baseline: Option<Baseline>,
     last_pose: Option<blazepose::Pose>,
@@ -2451,7 +2455,8 @@ impl Capture {
     /// pixel), so it stays tighter. This preserves the per-axis profile from
     /// [`make_pose_filter`] instead of flattening all three axes to the UI
     /// values, which silently discarded the Z tuning.
-    fn set_filter_params(&mut self, min_cutoff: f32, beta: f32) {
+    fn set_filter_params(&mut self, min_cutoff: f32, beta: f32, median_window: usize) {
+        self.median_gate.set_window(median_window);
         let xy = filter_alias::OneEuroParams {
             min_cutoff_hz: min_cutoff,
             beta,
@@ -2675,8 +2680,13 @@ impl Capture {
                                 h.x_mm = -h.x_mm;
                                 h
                             });
-                        let smoothed =
-                            smooth_head(head, &mut self.pose_filter, self.started_at, bypass);
+                        let smoothed = smooth_head(
+                            head,
+                            &mut self.pose_filter,
+                            &mut self.median_gate,
+                            self.started_at,
+                            bypass,
+                        );
                         capture_baseline(&mut self.baseline, smoothed);
                         self.last_head = smoothed;
                     }
@@ -2750,8 +2760,13 @@ impl Capture {
                                 depth_min,
                             )
                         });
-                        let smoothed =
-                            smooth_head(head, &mut self.pose_filter, self.started_at, bypass);
+                        let smoothed = smooth_head(
+                            head,
+                            &mut self.pose_filter,
+                            &mut self.median_gate,
+                            self.started_at,
+                            bypass,
+                        );
                         capture_baseline(&mut self.baseline, smoothed);
                         self.last_head = smoothed;
                     }
@@ -2777,8 +2792,13 @@ impl Capture {
                             .last_pose
                             .as_ref()
                             .and_then(|p| head_pixel_from_pose_webcam(p, rgb.width, rgb.height));
-                        let smoothed =
-                            smooth_head(head, &mut self.pose_filter, self.started_at, bypass);
+                        let smoothed = smooth_head(
+                            head,
+                            &mut self.pose_filter,
+                            &mut self.median_gate,
+                            self.started_at,
+                            bypass,
+                        );
                         capture_baseline(&mut self.baseline, smoothed);
                         self.last_head = smoothed;
                     }
@@ -3007,6 +3027,7 @@ struct CaptureWorker {
     startup: Arc<Mutex<Startup>>,
     filter_min_cutoff: Arc<AtomicU32>,
     filter_beta: Arc<AtomicU32>,
+    median_window: Arc<AtomicUsize>,
     bypass: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -3020,14 +3041,16 @@ impl CaptureWorker {
         let startup = Arc::new(Mutex::new(Startup::Pending));
         let filter_min_cutoff = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let filter_beta = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        let median_window = Arc::new(AtomicUsize::new(3));
         let bypass = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let (latest_t, tilt_t, startup_t, mc_t, beta_t, byp_t, stop_t) = (
+        let (latest_t, tilt_t, startup_t, mc_t, beta_t, mw_t, byp_t, stop_t) = (
             Arc::clone(&latest),
             Arc::clone(&tilt_state),
             Arc::clone(&startup),
             Arc::clone(&filter_min_cutoff),
             Arc::clone(&filter_beta),
+            Arc::clone(&median_window),
             Arc::clone(&bypass),
             Arc::clone(&stop),
         );
@@ -3035,7 +3058,7 @@ impl CaptureWorker {
             .name("capture".into())
             .spawn(move || {
                 capture_thread_loop(
-                    backend, cmd_rx, &latest_t, &tilt_t, &startup_t, &mc_t, &beta_t, &byp_t,
+                    backend, cmd_rx, &latest_t, &tilt_t, &startup_t, &mc_t, &beta_t, &mw_t, &byp_t,
                     &stop_t,
                 );
             })
@@ -3048,6 +3071,7 @@ impl CaptureWorker {
             startup,
             filter_min_cutoff,
             filter_beta,
+            median_window,
             bypass,
             stop,
             handle: Some(handle),
@@ -3055,10 +3079,11 @@ impl CaptureWorker {
     }
 
     /// Hand the live 1€ / bypass knobs to the capture thread (cheap atomics).
-    fn set_filter(&self, min_cutoff: f32, beta: f32, bypass: bool) {
+    fn set_filter(&self, min_cutoff: f32, beta: f32, median_window: usize, bypass: bool) {
         self.filter_min_cutoff
             .store(min_cutoff.to_bits(), Ordering::Relaxed);
         self.filter_beta.store(beta.to_bits(), Ordering::Relaxed);
+        self.median_window.store(median_window, Ordering::Relaxed);
         self.bypass.store(bypass, Ordering::Relaxed);
     }
 }
@@ -3089,6 +3114,7 @@ fn capture_thread_loop(
     startup: &Arc<Mutex<Startup>>,
     filter_min_cutoff: &Arc<AtomicU32>,
     filter_beta: &Arc<AtomicU32>,
+    median_window: &Arc<AtomicUsize>,
     bypass: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
 ) {
@@ -3252,6 +3278,7 @@ fn capture_thread_loop(
         cap.set_filter_params(
             f32::from_bits(filter_min_cutoff.load(Ordering::Relaxed)),
             f32::from_bits(filter_beta.load(Ordering::Relaxed)),
+            median_window.load(Ordering::Relaxed),
         );
         let byp = bypass.load(Ordering::Relaxed);
         if cap.poll_once(byp, true) {
@@ -4210,6 +4237,7 @@ impl App {
             should_quit: false,
             lockbar_width_mm: headtracking::calibration::LOCKBAR_WIDTH_MM,
             head_filter_min_cutoff: 1.0,
+            median_window_frames: 3,
             // beta=0 would disable the 1€ filter's velocity adaptation — its
             // whole point — and make fast head moves lag behind. Small but
             // non-zero keeps stillness smooth AND fast moves responsive.
@@ -4500,6 +4528,7 @@ impl App {
         active.worker.set_filter(
             self.head_filter_min_cutoff,
             self.head_filter_beta,
+            self.median_window_frames,
             self.bypass_filters,
         );
         // Consume the latest processed frame the capture thread published. IN
@@ -4559,16 +4588,18 @@ impl App {
 fn smooth_head(
     raw: Option<HeadPixel>,
     filter: &mut filter_alias::OneEuroPose3D,
+    gate: &mut headtracking::filter::MedianGate,
     started_at: Instant,
     bypass: bool,
 ) -> Option<HeadPixel> {
     let head = raw?;
     if bypass {
-        return Some(head); // raw pose, no 1€ smoothing
+        return Some(head); // raw pose, no median gate, no 1€ smoothing
     }
     let mut head = head;
     let t_us = started_at.elapsed().as_micros() as u64;
-    let smoothed = filter.update([head.x_mm, head.y_mm, head.depth_mm], t_us);
+    let gated = gate.push([head.x_mm, head.y_mm, head.depth_mm]);
+    let smoothed = filter.update(gated, t_us);
     head.x_mm = smoothed[0];
     head.y_mm = smoothed[1];
     head.depth_mm = smoothed[2];
@@ -5275,6 +5306,16 @@ impl App {
                 .on_hover_text(
                     "When you move fast: further right = catches up quicker, the \
                      view sticks to your head.",
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.median_window_frames, 1..=9)
+                        .step_by(2.0)
+                        .text("Median (frames)"),
+                )
+                .on_hover_text(
+                    "Median window applied before the smoothing filter: erases isolated \
+                     tracking spikes completely. 1 = off; each extra frame adds one frame \
+                     of latency.",
                 );
                 ui.toggle_value(&mut self.bypass_filters, "no filter")
                     .on_hover_text(
@@ -6141,6 +6182,7 @@ fn new_capture(backend: Backend, intrinsics: Intrinsics, inner: Inner) -> Captur
         blaze_worker: BlazePoseWorker::spawn(),
         anchor_worker: AnchorWorker::spawn(),
         pose_filter: make_pose_filter(),
+        median_gate: headtracking::filter::MedianGate::new(3),
         started_at: Instant::now(),
         baseline: None,
         last_pose: None,
