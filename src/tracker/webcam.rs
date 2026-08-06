@@ -209,6 +209,48 @@ fn sdl3() -> Result<&'static Sdl3Api, Error> {
         .map_err(Clone::clone)
 }
 
+/// Enumerate the cameras SDL currently sees — product names in SDL order,
+/// which is exactly the `DeviceIndex` space used by [`OpenedCamera::open`].
+/// Called at plugin load to label the setting's dropdown with real names;
+/// returns an empty list when SDL (or any camera) is unavailable.
+pub fn list_cameras() -> Vec<String> {
+    let Ok(api) = sdl3() else {
+        return Vec::new();
+    };
+    let mut count: c_int = 0;
+    // SAFETY: same contract as `OpenedCamera::open` — pump then snapshot
+    // the camera list; the returned array is ours to free with SDL_free.
+    let raw = unsafe {
+        (api.sdl_pump_events)();
+        (api.sdl_get_cameras)(&mut count)
+    };
+    if raw.is_null() || count <= 0 {
+        if !raw.is_null() {
+            // SAFETY: allocated by SDL_GetCameras.
+            unsafe { (api.sdl_free)(raw.cast::<c_void>()) };
+        }
+        return Vec::new();
+    }
+    let names = (0..count as isize)
+        .map(|i| {
+            // SAFETY: 0 <= i < count; name pointer per SDL contract.
+            let id: SDL_CameraID = unsafe { *raw.offset(i) };
+            let ptr = unsafe { (api.sdl_get_camera_name)(id) };
+            if ptr.is_null() {
+                format!("Camera #{id}")
+            } else {
+                // SAFETY: non-null NUL-terminated string per SDL contract.
+                unsafe { CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        })
+        .collect();
+    // SAFETY: allocated by SDL_GetCameras.
+    unsafe { (api.sdl_free)(raw.cast::<c_void>()) };
+    names
+}
+
 // ============================================================ Camera + backend
 
 // Bootstrap focal-length heuristic when no calibration is available

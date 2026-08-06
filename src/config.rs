@@ -446,9 +446,31 @@ fn make_bool_setting(
 /// # Safety
 /// `api` must be a valid pointer obtained from VPX's plugin loader, and
 /// `endpoint_id` must be the plugin endpoint VPX assigned us at load time.
-pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32) {
+pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_names: &[String]) {
     let Some(register) = api.RegisterSetting else {
         return;
+    };
+
+    // When the webcam backend enumerated devices at load time, DeviceIndex
+    // becomes a dropdown labelled with the real product names (the index
+    // semantics — SDL order — stay identical, so ini values carry over).
+    // The labels are leaked: the host keeps the pointers for the process
+    // lifetime, exactly like the &'static arrays below.
+    let (device_values, device_max): (*mut *const c_char, c_int) = if webcam_names.is_empty() {
+        (std::ptr::null_mut(), 7)
+    } else {
+        let mut ptrs: Vec<*const c_char> = webcam_names
+            .iter()
+            .map(|n| {
+                let cleaned: String = n.chars().filter(|c| *c != '\0').collect();
+                let label =
+                    std::ffi::CString::new(cleaned).expect("NULs filtered out of camera name");
+                Box::leak(label.into_boxed_c_str()).as_ptr()
+            })
+            .collect();
+        ptrs.push(std::ptr::null());
+        let max = (webcam_names.len() - 1) as c_int;
+        (Box::leak(ptrs.into_boxed_slice()).as_mut_ptr(), max)
     };
 
     let defs = [
@@ -465,12 +487,12 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32) {
         ),
         make_int_setting(
             c"DeviceIndex",
-            c"Device Index",
-            c"0-based index when the host has several webcams (Kinects always use the first device)",
+            c"Camera",
+            c"Camera used by the Webcam backend (Kinects always use the first Kinect found)",
             0,
-            7,
+            device_max,
             0,
-            std::ptr::null_mut(),
+            device_values,
             get_device_index,
             set_device_index,
         ),

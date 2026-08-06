@@ -270,7 +270,16 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     // (or the declared default when the key is missing), so by the time
     // OnGameStart fires the config snapshot is already populated.
     // SAFETY: api_ptr is non-null and live for the plugin session.
-    unsafe { config::register_settings(&*api_ptr, session_id) };
+    // Enumerate the webcams once at load so the Camera setting can show
+    // real product names instead of a bare index.
+    #[cfg(feature = "webcam")]
+    let webcam_names = crate::tracker::webcam::list_cameras();
+    #[cfg(not(feature = "webcam"))]
+    let webcam_names: Vec<String> = Vec::new();
+    if !webcam_names.is_empty() {
+        info!(cameras = ?webcam_names, "webcams enumerated for the settings dropdown");
+    }
+    unsafe { config::register_settings(&*api_ptr, session_id, &webcam_names) };
 
     *STATE.lock() = Some(PluginState {
         msg_api: api_ptr,
