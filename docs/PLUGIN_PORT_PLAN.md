@@ -155,3 +155,16 @@ Removed settings: `IPDmm`, `LockbarHandSpan`, `LockbarFloorHeight`
      distortion compensation.
 - Windows ARM re-enable (falls out of tract removal).
 - Multi-camera fusion, prediction.
+
+## Release doctrine — the demo is the setup companion
+
+The plugin `.so`/`.dll` stays lean; **`headtracking-demo` is the official
+installer/diagnostic step** users run once before enabling the plugin:
+
+- **Windows**: the demo detects a driverless Kinect (yellow banner) and
+  offers the one-click **Install Kinect drivers (UAC)** button — WinUSB
+  binding, with the documented "breaks MS-SDK/BAM until reverted" caveat.
+- **Linux**: the demo (and INSTALL.md) carries the udev rules to
+  copy-paste; without them VPX fails silently as non-root.
+- Seeing yourself tracked in the demo = the plugin will work in VPX; the
+  demo is also where captures are contributed and calibration verified.
