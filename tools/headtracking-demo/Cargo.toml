@@ -28,9 +28,7 @@ nalgebra = "0.35"
 egui = "0.36"
 egui_glow = "0.36"
 egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
-# TODO(release): flip back to `version = "3.0"` once egui-rotate 3.0.0
-# is published on crates.io (tag exists, publish pending).
-egui-rotate = { git = "https://github.com/Le-Syl21/egui-rotate", tag = "v3.0.0", features = ["software-cursor"] }
+egui-rotate = { version = "3.1", features = ["software-cursor"] }
 glow = "0.17"
 glutin = "0.32"
 glutin-winit = "0.5"
