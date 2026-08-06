@@ -90,6 +90,10 @@ const TRACKING_STALE: Duration = Duration::from_millis(400);
 /// ~0.94^60 ≈ 2 % after one second at 60 fps: a calm glide home.
 const LOST_DECAY: f32 = 0.94;
 
+/// How long the startup notification stays on screen — it carries the
+/// active camera plus the setup reminders, so give it time to be read.
+const STARTUP_NOTE_MS: i32 = 15_000;
+
 #[derive(Clone, Copy)]
 struct Baseline {
     pose: Pose,
@@ -346,10 +350,11 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
         match TrackerSession::spawn(&cfg) {
             Ok(tracker) => {
                 let backend = tracker.backend_name();
-                // Host-side cabinet geometry + hand-fixed anchor calibration
-                // → a one-shot notification so the player sees the plugin
-                // located its camera without opening a single menu.
-                let pending_note = calibration_note(backend, &cfg);
+                // One-shot startup notification: which camera the plugin is
+                // tracking on, the derived camera pose when a fixed anchor
+                // calibration exists, and the host settings worth checking —
+                // all without the player opening a single menu.
+                let pending_note = startup_note(tracker.device_label(), backend, &cfg);
                 *GAME.lock() = Some(GameSession {
                     tracker,
                     baseline: None,
@@ -449,12 +454,13 @@ fn apply_pose_to_view() {
         return;
     };
 
-    // One-shot calibration notification (built at game start).
+    // One-shot startup notification (built at game start). Long enough to
+    // read the setup reminders without pausing the game.
     if let Some(note) = game.pending_note.take()
         && let Some(notify) = vpx.PushNotification
     {
         // SAFETY: NUL-terminated CString kept alive across the call.
-        unsafe { notify(note.as_ptr(), 6000) };
+        unsafe { notify(note.as_ptr(), STARTUP_NOTE_MS) };
     }
 
     // Long-press recenter: re-baseline on the CURRENT head position and
@@ -563,11 +569,27 @@ fn apply_pose_to_view() {
     unsafe { setter(&raw mut view) };
 }
 
+/// Build the one-shot startup notification: the camera the plugin tracks
+/// on, the derived camera pose when a fixed anchor calibration exists, and
+/// the VPX settings the head-tracking experience depends on.
+fn startup_note(device: &str, backend: &str, cfg: &config::Config) -> Option<std::ffi::CString> {
+    let mut text = format!("Head tracking: {device} active");
+    if let Some(summary) = calibration_summary(backend, cfg) {
+        text.push('\n');
+        text.push_str(&summary);
+    }
+    text.push_str(
+        "\nCheck your VPX setup: lockbar width + screen inclination \
+         (Cabinet settings), POV layout 'Window' with rotation 0",
+    );
+    std::ffi::CString::new(text).ok()
+}
+
 /// Read the host cabinet geometry and the hand-fixed anchor calibration,
-/// and format the notification summary. `None` when no calibration is
+/// and format the camera-pose summary. `None` when no calibration is
 /// available (the plugin still tracks — relative deltas need no anchor).
 #[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
-fn calibration_note(backend: &str, cfg: &config::Config) -> Option<std::ffi::CString> {
+fn calibration_summary(backend: &str, cfg: &config::Config) -> Option<String> {
     let (vpx_path, pref_path) = {
         let state = STATE.lock();
         let s = state.as_ref()?;
@@ -586,11 +608,11 @@ fn calibration_note(backend: &str, cfg: &config::Config) -> Option<std::ffi::CSt
         cfg.webcam_focal_px,
     )?;
     info!(%summary, "fixed anchor calibration active");
-    std::ffi::CString::new(summary).ok()
+    Some(summary)
 }
 
 #[cfg(not(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam")))]
-fn calibration_note(_backend: &str, _cfg: &config::Config) -> Option<std::ffi::CString> {
+fn calibration_summary(_backend: &str, _cfg: &config::Config) -> Option<String> {
     None
 }
 

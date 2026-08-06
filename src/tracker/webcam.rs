@@ -250,22 +250,34 @@ impl OpenedCamera {
             return Err(Error::NoDevice);
         }
 
+        // List every camera SDL sees — the user picks one with the
+        // DeviceIndex setting, so give them the full menu in the logs.
+        let device_name = |cam_id: SDL_CameraID| -> String {
+            // SAFETY: valid camera id just read from SDL_GetCameras; SDL3
+            // returns a NUL-terminated string with stable lifetime until
+            // the camera is closed.
+            let name_ptr = unsafe { (api.sdl_get_camera_name)(cam_id) };
+            if name_ptr.is_null() {
+                format!("Camera #{cam_id}")
+            } else {
+                // SAFETY: non-null NUL-terminated string per above.
+                unsafe { CStr::from_ptr(name_ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        for i in 0..count as isize {
+            // SAFETY: 0 <= i < count, raw is non-null.
+            let id: SDL_CameraID = unsafe { *raw.offset(i) };
+            info!(device_index = i, id, name = %device_name(id), "webcam: available camera");
+        }
+
         // Pick the n-th device, falling back to the first when the index
         // overshoots (so DeviceIndex=0 always works).
         let pick_idx = (index as isize).min(count as isize - 1).max(0);
         // SAFETY: 0 <= pick_idx < count, raw is non-null.
         let cam_id: SDL_CameraID = unsafe { *raw.offset(pick_idx) };
-        // SAFETY: valid camera id just read from SDL_GetCameras.
-        let name_ptr = unsafe { (api.sdl_get_camera_name)(cam_id) };
-        let name = if name_ptr.is_null() {
-            format!("Camera #{cam_id}")
-        } else {
-            // SAFETY: SDL3 returns a NUL-terminated string with stable
-            // lifetime until the camera is closed.
-            unsafe { CStr::from_ptr(name_ptr) }
-                .to_string_lossy()
-                .into_owned()
-        };
+        let name = device_name(cam_id);
         // SAFETY: array allocated by SDL_GetCameras; SDL_free is the
         // matching deallocator.
         unsafe { (api.sdl_free)(raw.cast::<c_void>()) };
@@ -443,6 +455,10 @@ impl HeadTracker for WebcamBackend {
 
     fn name(&self) -> &'static str {
         "webcam"
+    }
+
+    fn device_label(&self) -> String {
+        self.camera.name.clone()
     }
 
     fn shutdown(&mut self) {

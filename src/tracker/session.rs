@@ -29,6 +29,8 @@ pub struct TrackerSession {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     backend_name: &'static str,
+    /// User-facing device label (webcam product name, Kinect model+stream).
+    device_label: String,
     /// Set by the recenter path; the tracker loop consumes it and resets
     /// the One-Euro filter so the fresh baseline isn't dragged from the
     /// old smoothed position.
@@ -54,6 +56,7 @@ impl TrackerSession {
 
     fn spawn_with(mut backend: Box<dyn HeadTracker>, cfg: &Config) -> Result<Self, SpawnError> {
         let backend_name = backend.name();
+        let device_label = backend.device_label();
         let latest = Arc::new(ArcSwap::from_pointee(Pose::ZERO));
         let stop = Arc::new(AtomicBool::new(false));
         let reset_filter = Arc::new(AtomicBool::new(false));
@@ -109,6 +112,7 @@ impl TrackerSession {
             stop,
             handle: Some(handle),
             backend_name,
+            device_label,
             reset_filter,
         })
     }
@@ -121,6 +125,11 @@ impl TrackerSession {
 
     pub fn backend_name(&self) -> &'static str {
         self.backend_name
+    }
+
+    /// User-facing device label for notifications.
+    pub fn device_label(&self) -> &str {
+        &self.device_label
     }
 
     /// Ask the tracker thread to reset its smoothing filter (recenter).

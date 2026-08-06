@@ -221,6 +221,13 @@ impl HeadTracker for KinectV2Backend {
         "kinect-v2"
     }
 
+    fn device_label(&self) -> String {
+        match self.stream {
+            TrackingStream::Ir => "Kinect v2 (IR stream)".to_string(),
+            TrackingStream::Rgb => "Kinect v2 (color stream)".to_string(),
+        }
+    }
+
     fn shutdown(&mut self) {
         if let Err(e) = self.device.stop() {
             warn!(?e, "kinect-v2: stop failed");

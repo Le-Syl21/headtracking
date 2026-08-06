@@ -148,6 +148,13 @@ impl HeadTracker for KinectV1Backend {
         "kinect-v1"
     }
 
+    fn device_label(&self) -> String {
+        match self.stream {
+            TrackingStream::Ir => "Kinect v1 (IR stream)".to_string(),
+            TrackingStream::Rgb => "Kinect v1 (color stream)".to_string(),
+        }
+    }
+
     fn shutdown(&mut self) {
         if let Err(e) = self.device.stop() {
             warn!(?e, "kinect-v1: stop failed");

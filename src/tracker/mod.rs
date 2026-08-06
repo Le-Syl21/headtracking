@@ -50,6 +50,13 @@ pub trait HeadTracker: Send {
     /// Human-readable backend name (used in logs and config).
     fn name(&self) -> &'static str;
 
+    /// Device label for user-facing notifications (e.g. the webcam's UVC
+    /// product name, or the Kinect model + active stream). Defaults to
+    /// [`Self::name`].
+    fn device_label(&self) -> String {
+        self.name().to_string()
+    }
+
     /// Release device handles. Must be safe to call multiple times.
     fn shutdown(&mut self);
 }
