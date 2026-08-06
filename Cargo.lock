@@ -237,7 +237,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "ort",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "ureq 2.12.1",
 ]
 
@@ -3176,15 +3176,15 @@ checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
 
 [[package]]
 name = "sdl3-src"
-version = "3.4.12"
+version = "3.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f0adb191c684688f845f1dab6f5a2b36428885d01aa3afd7ec32faa3fb0b7ca"
+checksum = "e75661ac9dbedc58da5ce739e9688be6bf9d5542a282d89e7e29fdb7dcb43936"
 
 [[package]]
 name = "sdl3-sys"
-version = "0.6.7+SDL-3.4.12"
+version = "0.6.8+SDL-3.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e89cde1ff23eb110e348da9b5be904381235163272a424938a2c99c86ea33041"
+checksum = "b97e3d18c4994224aec3fb2d3d189f5fc88af0958fb8ed7b569272fde558f033"
 dependencies = [
  "cc",
  "cmake",
@@ -3533,7 +3533,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
