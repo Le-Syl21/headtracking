@@ -20,7 +20,7 @@ use super::messages::{
 use super::vpx_sys::{
     MsgPluginAPI, VPXAction_VPXACTION_Lockbar, VPXActionEvent, VPXPluginAPI, VPXViewSetupDef,
 };
-use crate::camera::mapping::{MappingParams, pose_delta_to_view_delta};
+use crate::camera::mapping::{MappingParams, ViewMode, pose_delta_to_view_delta};
 use crate::config;
 use crate::tracker::Pose;
 use crate::tracker::session::TrackerSession;
@@ -503,8 +503,22 @@ fn apply_pose_to_view() {
             x = pose.position_mm[0],
             y = pose.position_mm[1],
             z = pose.position_mm[2],
+            view_mode = view.viewMode,
             "tracker baseline captured"
         );
+        if ViewMode::from_i32(view.viewMode) != ViewMode::Window
+            && let Some(notify) = vpx.PushNotification
+        {
+            // Camera/Legacy translate the whole render — the table slides on
+            // the screen. True in-table parallax needs the Window layout.
+            // SAFETY: static NUL-terminated string.
+            unsafe {
+                notify(
+                    c"Head tracking: set this table's POV layout to 'Window' for true in-table parallax".as_ptr(),
+                    8000,
+                )
+            };
+        }
         return;
     };
 
@@ -526,11 +540,12 @@ fn apply_pose_to_view() {
         adjusted_baseline_pose.position_mm[1] += cfg.baseline_offset_y_mm;
         adjusted_baseline_pose.position_mm[2] += cfg.baseline_offset_z_mm;
 
-        // The playfield incline comes from the HOST's view setup — the
-        // axis rotation "the player looks DOWN at the table" keys off it.
+        // The playfield incline and layout mode come from the HOST's view
+        // setup — the axis math keys off both.
         let params = MappingParams {
             incline_deg: view.screenInclination,
             invert: [cfg.invert_x, cfg.invert_y, cfg.invert_z],
+            mode: ViewMode::from_i32(view.viewMode),
         };
         let delta = pose_delta_to_view_delta(&pose, &adjusted_baseline_pose, &params);
         game.applied = [

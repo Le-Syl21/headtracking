@@ -44,6 +44,29 @@ pub struct ViewDelta {
     pub dz: f32,
 }
 
+/// VPX view layout mode (mirror of `ViewLayoutMode` in `ViewSetup.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Legacy,
+    Camera,
+    /// The cab / head-tracking mode: the screen is a fixed window into the
+    /// cabinet, `viewX/Y/Z` is the PLAYER's eye relative to the screen's
+    /// bottom centre, and VPX derives an oblique projection — the fish-tank
+    /// effect happens INSIDE the table instead of the table sliding around.
+    Window,
+}
+
+impl ViewMode {
+    #[must_use]
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            2 => Self::Window,
+            1 => Self::Camera,
+            _ => Self::Legacy,
+        }
+    }
+}
+
 /// How head-space deltas turn into view-space deltas.
 #[derive(Debug, Clone, Copy)]
 pub struct MappingParams {
@@ -52,6 +75,8 @@ pub struct MappingParams {
     pub incline_deg: f32,
     /// Per-axis sign flips (camera-frame X/Y/Z) for exotic mountings.
     pub invert: [bool; 3],
+    /// Active view layout mode — read from `VPXViewSetupDef::viewMode`.
+    pub mode: ViewMode,
 }
 
 impl Default for MappingParams {
@@ -59,6 +84,7 @@ impl Default for MappingParams {
         Self {
             incline_deg: 6.5,
             invert: [false; 3],
+            mode: ViewMode::Camera,
         }
     }
 }
@@ -71,22 +97,44 @@ pub fn pose_delta_to_view_delta(current: &Pose, baseline: &Pose, p: &MappingPara
     let dy_mm = (current.position_mm[1] - baseline.position_mm[1]) * sign(1);
     let dz_mm = (current.position_mm[2] - baseline.position_mm[2]) * sign(2);
 
-    // The camera faces the standing player (~vertical), but the screen is
-    // the near-flat playfield. Tilt the head's vertical/depth motion by
-    // (90° − incline) so the parallax feels right on the laid-flat screen.
-    // X (left/right) is unaffected.
-    let theta = (90.0 - p.incline_deg).to_radians();
-    let (ct, st) = (theta.cos(), theta.sin());
-    let dy_t = dy_mm * ct + dz_mm * st;
-    let dz_t = -dy_mm * st + dz_mm * ct;
-
-    ViewDelta {
-        dx: mm_to_vpu(dx_mm),
-        // Camera Y is downward; VPX Z is upward → flip.
-        dz: -mm_to_vpu(dy_t),
-        // Camera Z grows away from the sensor; in VPX +Y is forward (away
-        // from the player) → moving closer pulls the view toward the player.
-        dy: -mm_to_vpu(dz_t),
+    match p.mode {
+        ViewMode::Window => {
+            // In Window mode `viewX/Y/Z` is the player's EYE in the screen
+            // frame: X lateral, Y away from the screen (toward the standing
+            // player), Z up. VPX's own conversion
+            // (`ViewSetup::SetViewPosFromPlayerPosition`) applies
+            // `RotateX(screen_slope − incline)` to the player position; for
+            // deltas the constant terms cancel and the slope term (not
+            // exposed to plugins) is negligible, leaving RotateX(−incline).
+            let px = dx_mm; // lateral
+            let py = dz_mm; // camera depth: away from cab = away from screen
+            let pz = -dy_mm; // camera Y is down; player Z is up
+            let theta = (-p.incline_deg).to_radians();
+            let (ct, st) = (theta.cos(), theta.sin());
+            ViewDelta {
+                dx: mm_to_vpu(px),
+                dy: mm_to_vpu(py * ct - pz * st),
+                dz: mm_to_vpu(py * st + pz * ct),
+            }
+        }
+        ViewMode::Legacy | ViewMode::Camera => {
+            // The camera faces the standing player (~vertical), but the
+            // screen is the near-flat playfield. Tilt the head's
+            // vertical/depth motion by (90° − incline) so the parallax
+            // feels right on the laid-flat screen. X is unaffected.
+            let theta = (90.0 - p.incline_deg).to_radians();
+            let (ct, st) = (theta.cos(), theta.sin());
+            let dy_t = dy_mm * ct + dz_mm * st;
+            let dz_t = -dy_mm * st + dz_mm * ct;
+            ViewDelta {
+                dx: mm_to_vpu(dx_mm),
+                // Camera Y is downward; VPX Z is upward → flip.
+                dz: -mm_to_vpu(dy_t),
+                // Camera Z grows away from the sensor; +Y is forward (away
+                // from the player) → moving closer pulls the view back.
+                dy: -mm_to_vpu(dz_t),
+            }
+        }
     }
 }
 
@@ -107,6 +155,7 @@ mod tests {
     const FLAT: MappingParams = MappingParams {
         incline_deg: 90.0,
         invert: [false; 3],
+        mode: ViewMode::Camera,
     };
 
     #[test]
@@ -153,6 +202,7 @@ mod tests {
         let p = MappingParams {
             incline_deg: 6.5,
             invert: [false; 3],
+            mode: ViewMode::Camera,
         };
         let base = pose(0.0, 0.0, 700.0);
         let cur = pose(0.0, -100.0, 700.0); // 100 mm straight up
@@ -169,12 +219,36 @@ mod tests {
     }
 
     #[test]
+    fn window_mode_maps_eye_axes() {
+        // Flat screen (incline 0): stepping BACK from the cab must move the
+        // eye away from the screen (+dy), and standing taller must raise it
+        // (+dz) — the whole point of the Window frame.
+        let p = MappingParams {
+            incline_deg: 0.0,
+            invert: [false; 3],
+            mode: ViewMode::Window,
+        };
+        let base = pose(0.0, 0.0, 700.0);
+        let back = pose(0.0, 0.0, 800.0); // 100 mm away from the camera/cab
+        let d = pose_delta_to_view_delta(&back, &base, &p);
+        assert!(
+            d.dy > 0.0,
+            "stepping back must grow the eye distance: {d:?}"
+        );
+        let up = pose(0.0, -50.0, 700.0); // camera Y is down
+        let d = pose_delta_to_view_delta(&up, &base, &p);
+        assert!(d.dz > 0.0, "standing taller must raise the eye: {d:?}");
+        assert!(d.dy.abs() < 1e-4, "pure height change at 0 incline: {d:?}");
+    }
+
+    #[test]
     fn invert_flags_flip_each_axis() {
         let base = pose(0.0, 0.0, 700.0);
         let cur = pose(50.0, 0.0, 700.0);
         let inv = MappingParams {
             incline_deg: 90.0,
             invert: [true, false, false],
+            mode: ViewMode::Camera,
         };
         let d = pose_delta_to_view_delta(&cur, &base, &inv);
         assert!(d.dx < 0.0, "inverted X must flip the sign: {d:?}");
