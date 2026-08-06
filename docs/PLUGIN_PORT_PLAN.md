@@ -81,9 +81,12 @@ Replace the tract-era detection with the demo's validated pipeline in
   `SetViewPosFromPlayerPosition` math since only table-frame
   `viewX/Y/Z` is writable.
 - `DisableStaticPrerendering(1)` on game start when tracking is live.
-- Recenter: `VPXACTION_VRRecenter` is unmapped upstream → own trigger:
-  auto-baseline (first stable pose) + a configurable action via
-  `OnActionChanged`, plus filter reset on recenter.
+- Recenter: `VPXACTION_VRRecenter` is unmapped upstream, but
+  `VPXACTION_Lockbar` IS in the plugin enum (VPXPlugin.h:223) and every
+  cab has the button mapped → recenter = **long-press on the lockbar
+  button** (duration setting, default ~2 s; observed via
+  `OnActionChanged` without consuming the action), plus auto-baseline
+  on first stable pose and filter reset on recenter.
 - Loss-of-tracking policy: ease back toward baseline instead of
   freezing the last offset.
 - Status via notifications (tracker up, anchor locked, device busy).
@@ -102,12 +105,17 @@ Level 2 (advanced):
 - `InvertX/Y/Z`: bools, default false (defaults field-validated).
 - `WebcamFocalPx`: 0 = auto (playfield-rectangle homography when it
   lands; measured value persisted via `SaveSetting`), else manual.
-- `LockbarWidthMm`: default 610 — kept as a plugin setting until the
-  exact VPX host source is confirmed (screen geometry is host-side;
-  whether it can stand in for the lockbar metric is an open point).
+(no lockbar setting: see below)
 
 Read from VPX, never asked: table incline, screen geometry,
-`realToVirtualScale`, view mode.
+`realToVirtualScale`, view mode — and the **cabinet lockbar geometry**:
+`[Player] LockbarWidth` / `LockbarHeight` (cm; Settings_properties.inl:620-621)
+read from `<VPXInfo.prefPath>/VPinballX.ini`. Width = the anchor's
+metric reference; height (ground → top of lockbar) = a vertical sanity
+check for the derived camera pose. VPX's own VR cab model anchors on
+the lockbar too (`pintable.h:778`) — same reference frame. Candidate
+upstream patch: expose cabinet geometry through the plugin API instead
+of ini parsing.
 
 Removed settings: `IPDmm`, `LockbarHandSpan`, `LockbarFloorHeight`
 (dead paths). `BaselineOffsetX/Y/Z` stay (recenter trim).
