@@ -151,12 +151,12 @@ impl Config {
         let (xy, z) = match self.smoothing {
             SmoothingPreset::Stable => (
                 AxisParams {
-                    min_cutoff_hz: 0.6,
-                    beta: 0.005,
+                    min_cutoff_hz: 0.4,
+                    beta: 0.003,
                 },
                 AxisParams {
-                    min_cutoff_hz: 0.25,
-                    beta: 0.02,
+                    min_cutoff_hz: 0.15,
+                    beta: 0.01,
                 },
             ),
             SmoothingPreset::Normal => (
