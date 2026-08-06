@@ -143,7 +143,16 @@ Removed settings: `IPDmm`, `LockbarHandSpan`, `LockbarFloorHeight`
 
 ## Out of scope (tracked, later)
 
-- Upstream patches: expose playerPos↔viewPos, wire `VRRecenter`, IPD
-  read-write, Window-mode distortion compensation.
+- Upstream patches, in priority order:
+  1. **Make `viewMode` settable by plugins** (or a `SetViewLayoutMode`) —
+     head tracking NEEDS `VLM_WINDOW`; today the plugin can only nudge
+     the user via a notification (`SetActiveViewSetup` ignores
+     everything but `viewX/Y/Z`).
+  2. **Expose the playerPos↔viewPos conversion** — then the plugin hands
+     VPX a raw eye position and inclined-screen cabs are handled
+     natively (the plugin is deliberately inclination-free: decision
+     2026-08-06, VPX owns all screen geometry).
+  3. `VRRecenter` wiring, IPD read-write, Window-mode perspective
+     distortion compensation.
 - Windows ARM re-enable (falls out of tract removal).
 - Multi-camera fusion, prediction.

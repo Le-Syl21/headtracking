@@ -68,11 +68,15 @@ impl ViewMode {
 }
 
 /// How head-space deltas turn into view-space deltas.
+///
+/// Deliberately inclination-free: VPX owns the screen geometry (it builds
+/// the Window-mode oblique projection itself), so the plugin's whole job
+/// is relabeling camera axes into the frame VPX expects. Inclined-screen
+/// cabs need VPX's internal player→view converter exposed to plugins
+/// (upstream patch candidate, tracked in the port plan) — no trigonometry
+/// belongs here.
 #[derive(Debug, Clone, Copy)]
 pub struct MappingParams {
-    /// Playfield inclination vs horizontal, degrees — read from the host's
-    /// `VPXViewSetupDef::screenInclination`.
-    pub incline_deg: f32,
     /// Per-axis sign flips (camera-frame X/Y/Z) for exotic mountings.
     pub invert: [bool; 3],
     /// Active view layout mode — read from `VPXViewSetupDef::viewMode`.
@@ -82,7 +86,6 @@ pub struct MappingParams {
 impl Default for MappingParams {
     fn default() -> Self {
         Self {
-            incline_deg: 6.5,
             invert: [false; 3],
             mode: ViewMode::Camera,
         }
@@ -98,43 +101,25 @@ pub fn pose_delta_to_view_delta(current: &Pose, baseline: &Pose, p: &MappingPara
     let dz_mm = (current.position_mm[2] - baseline.position_mm[2]) * sign(2);
 
     match p.mode {
-        ViewMode::Window => {
-            // In Window mode `viewX/Y/Z` is the player's EYE in the screen
-            // frame: X lateral, Y away from the screen (toward the standing
-            // player), Z up. VPX's own conversion
-            // (`ViewSetup::SetViewPosFromPlayerPosition`) applies
-            // `RotateX(screen_slope − incline)` to the player position; for
-            // deltas the constant terms cancel and the slope term (not
-            // exposed to plugins) is negligible, leaving RotateX(−incline).
-            let px = dx_mm; // lateral
-            let py = dz_mm; // camera depth: away from cab = away from screen
-            let pz = -dy_mm; // camera Y is down; player Z is up
-            let theta = (-p.incline_deg).to_radians();
-            let (ct, st) = (theta.cos(), theta.sin());
-            ViewDelta {
-                dx: mm_to_vpu(px),
-                dy: mm_to_vpu(py * ct - pz * st),
-                dz: mm_to_vpu(py * st + pz * ct),
-            }
-        }
-        ViewMode::Legacy | ViewMode::Camera => {
-            // The camera faces the standing player (~vertical), but the
-            // screen is the near-flat playfield. Tilt the head's
-            // vertical/depth motion by (90° − incline) so the parallax
-            // feels right on the laid-flat screen. X is unaffected.
-            let theta = (90.0 - p.incline_deg).to_radians();
-            let (ct, st) = (theta.cos(), theta.sin());
-            let dy_t = dy_mm * ct + dz_mm * st;
-            let dz_t = -dy_mm * st + dz_mm * ct;
-            ViewDelta {
-                dx: mm_to_vpu(dx_mm),
-                // Camera Y is downward; VPX Z is upward → flip.
-                dz: -mm_to_vpu(dy_t),
-                // Camera Z grows away from the sensor; +Y is forward (away
-                // from the player) → moving closer pulls the view back.
-                dy: -mm_to_vpu(dz_t),
-            }
-        }
+        // In Window mode `viewX/Y/Z` is the player's EYE in the screen
+        // frame: X lateral, Y away from the screen (toward the standing
+        // player), Z up — a pure relabeling of the camera axes. VPX builds
+        // the oblique projection from there.
+        ViewMode::Window => ViewDelta {
+            dx: mm_to_vpu(dx_mm),
+            dy: mm_to_vpu(dz_mm),  // away from cab = away from screen
+            dz: mm_to_vpu(-dy_mm), // camera Y is down; player Z is up
+        },
+        // Camera/Legacy: `viewX/Y/Z` is a flying camera in table space —
+        // the degraded path (the plugin nudges the user toward Window).
+        ViewMode::Legacy | ViewMode::Camera => ViewDelta {
+            dx: mm_to_vpu(dx_mm),
+            // Camera Y is downward; VPX Z is upward → flip.
+            dz: -mm_to_vpu(dy_mm),
+            // Camera Z grows away from the sensor; +Y is forward (away
+            // from the player) → moving closer pulls the view back.
+            dy: -mm_to_vpu(dz_mm),
+        },
     }
 }
 
@@ -150,10 +135,7 @@ mod tests {
         }
     }
 
-    /// Incline 90° collapses the rotation to identity on (y, z) — handy to
-    /// test the raw axis mapping alone.
     const FLAT: MappingParams = MappingParams {
-        incline_deg: 90.0,
         invert: [false; 3],
         mode: ViewMode::Camera,
     };
@@ -195,36 +177,11 @@ mod tests {
     }
 
     #[test]
-    fn incline_rotation_mixes_vertical_into_depth() {
-        // At a realistic 6.5° incline, θ = 83.5°: pure vertical head motion
-        // must land mostly on the depth axis (dy), with a small dz share —
-        // the "player looks down at the playfield" decomposition.
-        let p = MappingParams {
-            incline_deg: 6.5,
-            invert: [false; 3],
-            mode: ViewMode::Camera,
-        };
-        let base = pose(0.0, 0.0, 700.0);
-        let cur = pose(0.0, -100.0, 700.0); // 100 mm straight up
-        let d = pose_delta_to_view_delta(&cur, &base, &p);
-        assert!(
-            d.dy.abs() > d.dz.abs(),
-            "vertical motion should mostly become forward motion on an \
-             inclined playfield: {d:?}"
-        );
-        assert!(
-            d.dz > 0.0,
-            "and the residual vertical share stays up: {d:?}"
-        );
-    }
-
-    #[test]
     fn window_mode_maps_eye_axes() {
-        // Flat screen (incline 0): stepping BACK from the cab must move the
+        // Stepping BACK from the cab must move the
         // eye away from the screen (+dy), and standing taller must raise it
         // (+dz) — the whole point of the Window frame.
         let p = MappingParams {
-            incline_deg: 0.0,
             invert: [false; 3],
             mode: ViewMode::Window,
         };
@@ -238,7 +195,7 @@ mod tests {
         let up = pose(0.0, -50.0, 700.0); // camera Y is down
         let d = pose_delta_to_view_delta(&up, &base, &p);
         assert!(d.dz > 0.0, "standing taller must raise the eye: {d:?}");
-        assert!(d.dy.abs() < 1e-4, "pure height change at 0 incline: {d:?}");
+        assert!(d.dy.abs() < 1e-4, "pure height change: {d:?}");
     }
 
     #[test]
@@ -246,7 +203,6 @@ mod tests {
         let base = pose(0.0, 0.0, 700.0);
         let cur = pose(50.0, 0.0, 700.0);
         let inv = MappingParams {
-            incline_deg: 90.0,
             invert: [true, false, false],
             mode: ViewMode::Camera,
         };

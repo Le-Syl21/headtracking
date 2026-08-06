@@ -540,10 +540,10 @@ fn apply_pose_to_view() {
         adjusted_baseline_pose.position_mm[1] += cfg.baseline_offset_y_mm;
         adjusted_baseline_pose.position_mm[2] += cfg.baseline_offset_z_mm;
 
-        // The playfield incline and layout mode come from the HOST's view
-        // setup — the axis math keys off both.
+        // The layout mode comes from the HOST's view setup; VPX owns the
+        // screen geometry (inclination included) — the mapping is a pure
+        // axis relabeling.
         let params = MappingParams {
-            incline_deg: view.screenInclination,
             invert: [cfg.invert_x, cfg.invert_y, cfg.invert_z],
             mode: ViewMode::from_i32(view.viewMode),
         };
