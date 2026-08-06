@@ -15,22 +15,19 @@
 //!   +Z  : depth into the scene           -Y  : forward (away from player)
 //! ```
 //!
-//! **Incline rotation.** A cab player does not face the screen like a desktop
-//! head-tracking setup: they look DOWN at a playfield inclined by a few
-//! degrees from horizontal. Physical vertical/depth head motion therefore
-//! decomposes into the playfield's up/forward axes through a rotation by
-//! `90° − incline` (field-validated in the demo's parallax bench). The
-//! incline comes from the HOST (`VPXViewSetupDef::screenInclination`), never
-//! from a plugin setting.
-//!
-//! **Window mode.** `VLM_WINDOW` positions the view with the same table-frame
-//! `viewX/Y/Z` writes; VPX's internal player↔view conversion
-//! (`ViewSetup::SetViewPosFromPlayerPosition`) applies
-//! `RotateX(atan2(windowTopZOfs − windowBottomZOfs, table_length) − incline)`
-//! and a constant `windowBottomZOfs` shift. For *deltas* the constant shift
-//! cancels, and the table-length term isn't exposed to plugins (upstream API
-//! gap, tracked in the port plan) — the remaining dominant rotation is the
-//! same incline rotation used here. So one mapping serves both modes today.
+//! **Window mode frame (verified in `ComputeMVP`).** `viewX/Y/Z` is NOT the
+//! raw player position: the translation is applied BEFORE the inclination
+//! rotation, so the stored view position lives in the PLAYFIELD-PLANE frame
+//! (X lateral, Y along the inclined playfield, Z perpendicular to it). VPX's
+//! own converter `SetViewPosFromPlayerPosition` maps the real-world player
+//! position into that frame with `RotateX(atan2(windowTopZOfs −
+//! windowBottomZOfs, table_length) − screenInclination)`; deltas must follow
+//! the same rotation ([`MappingParams::window_rot_rad`]). The constant
+//! `windowBottomZOfs` shift cancels for deltas. The table length is not
+//! exposed directly, but `realToVirtualScale` encodes the hypotenuse
+//! (`GetRealToVirtualScale`: `r2v = (VPUTOCM(L)/cos(inc))/screenWidth_cm`),
+//! so the angle is `asin(ΔZ / CMTOVPU(r2v · screenWidth))` — computed in
+//! `plugin/ffi.rs` from host-exposed fields only.
 
 use crate::camera::units::mm_to_vpu;
 use crate::tracker::Pose;
@@ -69,18 +66,22 @@ impl ViewMode {
 
 /// How head-space deltas turn into view-space deltas.
 ///
-/// Deliberately inclination-free: VPX owns the screen geometry (it builds
-/// the Window-mode oblique projection itself), so the plugin's whole job
-/// is relabeling camera axes into the frame VPX expects. Inclined-screen
-/// cabs need VPX's internal player→view converter exposed to plugins
-/// (upstream patch candidate, tracked in the port plan) — no trigonometry
-/// belongs here.
+/// The plugin relabels camera axes into the PLAYER frame, then applies the
+/// host's own player→view rotation (Window mode) — no other trigonometry.
 #[derive(Debug, Clone, Copy)]
 pub struct MappingParams {
     /// Per-axis sign flips (camera-frame X/Y/Z) for exotic mountings.
     pub invert: [bool; 3],
     /// Active view layout mode — read from `VPXViewSetupDef::viewMode`.
     pub mode: ViewMode,
+    /// Window mode only: rotation (radians) from the PLAYER frame (X
+    /// lateral, Y horizontal away from the screen, Z gravity-up) into the
+    /// PLAYFIELD-plane frame `viewX/Y/Z` actually lives in. This mirrors
+    /// VPX's own `SetViewPosFromPlayerPosition`:
+    /// `RotateX(atan2(windowTopZOfs − windowBottomZOfs, table_length) −
+    /// screenInclination)` — the host converts the player position this
+    /// way before storing the view position, so deltas must follow.
+    pub window_rot_rad: f32,
 }
 
 impl Default for MappingParams {
@@ -88,6 +89,7 @@ impl Default for MappingParams {
         Self {
             invert: [false; 3],
             mode: ViewMode::Camera,
+            window_rot_rad: 0.0,
         }
     }
 }
@@ -101,21 +103,29 @@ pub fn pose_delta_to_view_delta(current: &Pose, baseline: &Pose, p: &MappingPara
     let dz_mm = (current.position_mm[2] - baseline.position_mm[2]) * sign(2);
 
     match p.mode {
-        // In Window mode `viewX/Y/Z` is the player's EYE in the screen
-        // frame: X lateral, Y away from the screen (toward the standing
-        // player), Z up — a pure relabeling of the camera axes. VPX builds
-        // the oblique projection from there.
-        ViewMode::Window => ViewDelta {
-            // The camera FACES the player, so its image is mirrored
-            // relative to the player frame VPX expects: the player's
-            // rightward move shows up leftward in camera X.
-            dx: mm_to_vpu(-dx_mm),
-            // The eye sits on the NEGATIVE-Y side of the screen plane
-            // (field-verified: ScreenPlayerY is negative in VPX configs) —
-            // stepping back from the cab pushes viewY further negative.
-            dy: mm_to_vpu(-dz_mm),
-            dz: mm_to_vpu(-dy_mm), // camera Y is down; player Z is up
-        },
+        // Window mode: build the delta in the PLAYER frame, then rotate
+        // it into the playfield-plane frame `viewX/Y/Z` lives in (see the
+        // module docs). VPX builds the oblique projection from there.
+        ViewMode::Window => {
+            // Player-frame delta first. The camera FACES the player, so
+            // its image is mirrored relative to the player frame (the
+            // player's rightward move shows up leftward in camera X); the
+            // eye sits on the NEGATIVE-Y side of the screen plane
+            // (field-verified: ScreenPlayerY is negative in VPX configs),
+            // so stepping back pushes Y further negative; camera Y is
+            // down while player Z is up.
+            let dxp = mm_to_vpu(-dx_mm);
+            let dyp = mm_to_vpu(-dz_mm);
+            let dzp = mm_to_vpu(-dy_mm);
+            // Then the host's own player→view rotation (same VPX RotateX
+            // convention: y' = y·cos − z·sin, z' = y·sin + z·cos).
+            let (s, c) = p.window_rot_rad.sin_cos();
+            ViewDelta {
+                dx: dxp,
+                dy: dyp * c - dzp * s,
+                dz: dyp * s + dzp * c,
+            }
+        }
         // Camera/Legacy: `viewX/Y/Z` is a flying camera in table space —
         // the degraded path (the plugin nudges the user toward Window).
         ViewMode::Legacy | ViewMode::Camera => ViewDelta {
@@ -146,6 +156,7 @@ mod tests {
     const FLAT: MappingParams = MappingParams {
         invert: [false; 3],
         mode: ViewMode::Camera,
+        window_rot_rad: 0.0,
     };
 
     #[test]
@@ -194,6 +205,7 @@ mod tests {
         let p = MappingParams {
             invert: [false; 3],
             mode: ViewMode::Window,
+            window_rot_rad: 0.0,
         };
         let base = pose(0.0, 0.0, 700.0);
         let back = pose(0.0, 0.0, 800.0); // 100 mm away from the camera/cab
@@ -209,12 +221,37 @@ mod tests {
     }
 
     #[test]
+    fn window_rotation_mixes_depth_and_height_like_vpx() {
+        // 90° rotation edge case: a pure step-back (player −Y) must become
+        // a pure view +Z... following y'=y·cos−z·sin, z'=y·sin+z·cos with
+        // y = −step: y'=0, z'=−step·sin(90°)=−step.
+        let p = MappingParams {
+            invert: [false; 3],
+            mode: ViewMode::Window,
+            window_rot_rad: std::f32::consts::FRAC_PI_2,
+        };
+        let base = pose(0.0, 0.0, 700.0);
+        let back = pose(0.0, 0.0, 800.0); // 100 mm away from the cab
+        let d = pose_delta_to_view_delta(&back, &base, &p);
+        assert!(d.dy.abs() < 1e-4, "depth must rotate out of Y: {d:?}");
+        assert!(d.dz < 0.0, "rotated depth lands on Z: {d:?}");
+        // Small angles: mostly unchanged, slight cross-coupling.
+        let p = MappingParams {
+            window_rot_rad: 0.1,
+            ..p
+        };
+        let d = pose_delta_to_view_delta(&back, &base, &p);
+        assert!(d.dy < 0.0 && d.dz < 0.0, "small-angle coupling: {d:?}");
+    }
+
+    #[test]
     fn invert_flags_flip_each_axis() {
         let base = pose(0.0, 0.0, 700.0);
         let cur = pose(50.0, 0.0, 700.0);
         let inv = MappingParams {
             invert: [true, false, false],
             mode: ViewMode::Camera,
+            window_rot_rad: 0.0,
         };
         let d = pose_delta_to_view_delta(&cur, &base, &inv);
         // The mirrored default maps camera +X to negative view X;

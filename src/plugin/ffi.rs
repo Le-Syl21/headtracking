@@ -572,12 +572,13 @@ fn apply_pose_to_view() {
         adjusted_baseline_pose.position_mm[1] += cfg.baseline_offset_y_mm;
         adjusted_baseline_pose.position_mm[2] += cfg.baseline_offset_z_mm;
 
-        // The layout mode comes from the HOST's view setup; VPX owns the
-        // screen geometry (inclination included) — the mapping is a pure
-        // axis relabeling.
+        // The layout mode and the player→view rotation both come from the
+        // HOST's view setup — nothing about the screen geometry is asked
+        // of the user.
         let params = MappingParams {
             invert: [cfg.invert_x, cfg.invert_y, cfg.invert_z],
             mode: ViewMode::from_i32(view.viewMode),
+            window_rot_rad: window_player_rotation(&view),
         };
         let delta = pose_delta_to_view_delta(&pose, &adjusted_baseline_pose, &params);
         game.applied = [
@@ -593,6 +594,28 @@ fn apply_pose_to_view() {
 
     // SAFETY: setter follows the FFI contract; we own `view`.
     unsafe { setter(&raw mut view) };
+}
+
+/// The rotation VPX's `SetViewPosFromPlayerPosition` applies between the
+/// real-world player frame and the stored `viewX/Y/Z` (playfield-plane)
+/// frame: `atan2(windowTopZOfs − windowBottomZOfs, table_length) −
+/// screenInclination`. The table length isn't exposed, but
+/// `GetRealToVirtualScale` makes `CMTOVPU(realToVirtualScale ·
+/// screenWidth_cm)` the HYPOTENUSE `√(L² + ΔZ²)`, so the slope is
+/// `asin(ΔZ / hyp)`. Degenerate host data (unset screen size or scale)
+/// falls back to the physical inclination alone.
+fn window_player_rotation(view: &VPXViewSetupDef) -> f32 {
+    if ViewMode::from_i32(view.viewMode) != ViewMode::Window {
+        return 0.0;
+    }
+    let dz = view.windowTopZOfs - view.windowBottomZOfs;
+    let hyp = crate::camera::units::mm_to_vpu(view.realToVirtualScale * view.screenWidth * 10.0);
+    let slope = if hyp > 1.0 && hyp.abs() > dz.abs() {
+        (dz / hyp).asin()
+    } else {
+        0.0
+    };
+    slope - view.screenInclination.to_radians()
 }
 
 /// Build the one-shot startup notification: the camera the plugin tracks
