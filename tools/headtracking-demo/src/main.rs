@@ -398,7 +398,7 @@ const PX_DVIEW_MM: f32 = 600.0;
 /// window (fish-tank VR). Owns an FBO (colour texture registered with
 /// egui's painter so egui-rotate rotates it for free, + depth renderbuffer),
 /// a minimal shader program, and the static scene geometry: a receding
-/// wireframe "shadow box" and three depth layers of target points. Each
+/// wireframe "shadow box" and a pinball-table diorama. Each
 /// frame it renders the scene with an *off-axis* projection derived from
 /// the supplied eye position (Kooima 2008), so moving the eye looks around
 /// the window edges. See `docs/parallax-validation-window.md`.
@@ -415,7 +415,7 @@ struct ParallaxScene {
     /// per-vertex colour through) and its `u_mvp` uniform location.
     program: glow::Program,
     u_mvp: Option<glow::UniformLocation>,
-    /// Wireframe shadow box (`GL_LINES`) and solid 3D cube markers
+    /// Wireframe shadow box (`GL_LINES`) and the pinball diorama
     /// (`GL_TRIANGLES`): a VAO + VBO each, plus the vertex count to draw.
     box_vao: glow::VertexArray,
     box_vbo: glow::Buffer,
@@ -453,7 +453,7 @@ impl ParallaxScene {
             // the real panel aspect on the first frame.
             let aspect0 = Self::W as f32 / Self::H as f32;
             let (box_vao, box_vbo, box_count) = upload_mesh(gl, &parallax_box_mesh(aspect0));
-            let (pts_vao, pts_vbo, pts_count) = upload_mesh(gl, &parallax_cube_mesh(aspect0));
+            let (pts_vao, pts_vbo, pts_count) = upload_mesh(gl, &parallax_table_mesh(aspect0));
 
             let mut scene = Self {
                 fbo,
@@ -577,7 +577,7 @@ impl ParallaxScene {
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.box_vbo));
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, f32_as_bytes(&bm), glow::DYNAMIC_DRAW);
                 self.box_count = (bm.len() / 6) as i32;
-                let tm = parallax_cube_mesh(aspect);
+                let tm = parallax_table_mesh(aspect);
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.pts_vbo));
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, f32_as_bytes(&tm), glow::DYNAMIC_DRAW);
                 self.pts_count = (tm.len() / 6) as i32;
@@ -596,7 +596,7 @@ impl ParallaxScene {
             gl.use_program(Some(self.program));
             gl.uniform_matrix_4_f32_slice(self.u_mvp.as_ref(), false, mvp.as_slice());
 
-            // Wireframe shadow box (lines) + solid 3D cube markers (triangles).
+            // Wireframe shadow box (lines) + pinball diorama (triangles).
             gl.bind_vertex_array(Some(self.box_vao));
             gl.draw_arrays(glow::LINES, 0, self.box_count);
             gl.bind_vertex_array(Some(self.pts_vao));
@@ -779,83 +779,244 @@ fn parallax_box_mesh(aspect: f32) -> Vec<f32> {
     v
 }
 
-/// Three 3×3 grids of solid **3D cubes** (`GL_TRIANGLES`) at increasing
-/// depth, warm (near) → cool (far). Each face gets a fixed shade (fake
-/// top-light) baked into its vertex colour, so the cubes read as volumes
-/// without a lighting pass — far clearer than flat points/squares, and the
-/// faces reveal 3D as the eye moves. Positions span the panel aspect; the
-/// cube size is fixed (so perspective scales them near→far). Depth-tested,
-/// no culling needed.
-fn parallax_cube_mesh(aspect: f32) -> Vec<f32> {
-    let layers = [
-        (-150.0f32, [1.0f32, 0.62, 0.25]), // near, warm
-        (-400.0, [0.45, 0.90, 0.45]),      // mid, green
-        (-800.0, [0.40, 0.62, 1.00]),      // far, cool
-    ];
-    let (hw, hh) = parallax_screen_half(aspect);
-    let (tx, ty) = (hw * 0.66, hh * 0.66);
-    let hsz = 30.0f32; // cube half-size, mm (fixed)
-    let n = 3i32;
-    let mut v: Vec<f32> = Vec::new();
-    // Two triangles (a,b,c)+(a,c,d) for a quad face, all in one colour.
-    let mut quad = |a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], col: [f32; 3]| {
-        for p in [a, b, c, a, c, d] {
-            v.extend_from_slice(&[p[0], p[1], p[2], col[0], col[1], col[2]]);
+/// Pinball diorama (`GL_TRIANGLES`): an inclined playfield receding into
+/// the shadow box, dressed with the depth cues a pinball player knows by
+/// heart — side rails, flipper bats, pop bumpers, drop targets and a
+/// ball. Judging fish-tank parallax on these reads far closer to a VPX
+/// table than abstract cube grids. Real-world sizes in mm; fake top-light
+/// baked into per-face vertex colours (no lighting pass).
+fn parallax_table_mesh(aspect: f32) -> Vec<f32> {
+    use std::f32::consts::TAU;
+
+    fn push_tri(v: &mut Vec<f32>, pts: [[f32; 3]; 3], col: [f32; 3], shade: f32) {
+        for p in pts {
+            v.extend_from_slice(&[
+                p[0],
+                p[1],
+                p[2],
+                col[0] * shade,
+                col[1] * shade,
+                col[2] * shade,
+            ]);
         }
-    };
-    for (z, base) in layers {
-        for iy in 0..n {
-            for ix in 0..n {
-                let cx = (ix as f32 / (n - 1) as f32 * 2.0 - 1.0) * tx;
-                let cy = (iy as f32 / (n - 1) as f32 * 2.0 - 1.0) * ty;
-                let p = |sx: f32, sy: f32, sz: f32| [cx + sx * hsz, cy + sy * hsz, z + sz * hsz];
-                let shade = |s: f32| [base[0] * s, base[1] * s, base[2] * s];
-                // Fake top-light: brightest top, darkest bottom.
-                quad(
-                    p(-1., -1., 1.),
-                    p(1., -1., 1.),
-                    p(1., 1., 1.),
-                    p(-1., 1., 1.),
-                    shade(0.88),
-                ); // +Z front
-                quad(
-                    p(1., -1., -1.),
-                    p(-1., -1., -1.),
-                    p(-1., 1., -1.),
-                    p(1., 1., -1.),
-                    shade(0.50),
-                ); // -Z back
-                quad(
-                    p(-1., 1., 1.),
-                    p(1., 1., 1.),
-                    p(1., 1., -1.),
-                    p(-1., 1., -1.),
-                    shade(1.0),
-                ); // +Y top
-                quad(
-                    p(-1., -1., -1.),
-                    p(1., -1., -1.),
-                    p(1., -1., 1.),
-                    p(-1., -1., 1.),
-                    shade(0.40),
-                ); // -Y bottom
-                quad(
-                    p(1., -1., 1.),
-                    p(1., -1., -1.),
-                    p(1., 1., -1.),
-                    p(1., 1., 1.),
-                    shade(0.70),
-                ); // +X right
-                quad(
-                    p(-1., -1., -1.),
-                    p(-1., -1., 1.),
-                    p(-1., 1., 1.),
-                    p(-1., 1., -1.),
-                    shade(0.60),
-                ); // -X left
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn push_quad(
+        v: &mut Vec<f32>,
+        a: [f32; 3],
+        b: [f32; 3],
+        c: [f32; 3],
+        d: [f32; 3],
+        col: [f32; 3],
+        shade: f32,
+    ) {
+        push_tri(v, [a, b, c], col, shade);
+        push_tri(v, [a, c, d], col, shade);
+    }
+
+    type At<'a> = &'a dyn Fn(f32, f32, f32) -> [f32; 3];
+
+    /// Box standing on the plane, rotated by `phi` around the plane normal
+    /// (flipper bats). `wx`/`wl` are half-sizes across/along the slope.
+    #[allow(clippy::too_many_arguments)]
+    fn boxed(
+        v: &mut Vec<f32>,
+        at: At,
+        x0: f32,
+        t0: f32,
+        phi: f32,
+        wx: f32,
+        wl: f32,
+        hgt: f32,
+        col: [f32; 3],
+    ) {
+        let (c, s) = (phi.cos(), phi.sin());
+        let corner = |dx: f32, dt: f32, dh: f32| {
+            at(
+                x0 + dx * wx * c - dt * wl * s,
+                t0 + dx * wx * s + dt * wl * c,
+                dh * hgt,
+            )
+        };
+        let p = [
+            corner(-1.0, -1.0, 0.0),
+            corner(1.0, -1.0, 0.0),
+            corner(1.0, 1.0, 0.0),
+            corner(-1.0, 1.0, 0.0),
+            corner(-1.0, -1.0, 1.0),
+            corner(1.0, -1.0, 1.0),
+            corner(1.0, 1.0, 1.0),
+            corner(-1.0, 1.0, 1.0),
+        ];
+        push_quad(v, p[4], p[5], p[6], p[7], col, 1.0); // top
+        push_quad(v, p[0], p[1], p[5], p[4], col, 0.78); // front (player side)
+        push_quad(v, p[3], p[2], p[6], p[7], col, 0.45); // back
+        push_quad(v, p[0], p[3], p[7], p[4], col, 0.58); // left
+        push_quad(v, p[1], p[2], p[6], p[5], col, 0.66); // right
+    }
+
+    /// Upright cylinder (pop bumper): shaded sides + a bright cap fan.
+    #[allow(clippy::too_many_arguments)]
+    fn cyl(
+        v: &mut Vec<f32>,
+        at: At,
+        x0: f32,
+        t0: f32,
+        r: f32,
+        hgt: f32,
+        col: [f32; 3],
+        cap: [f32; 3],
+    ) {
+        const SEG: usize = 14;
+        for i in 0..SEG {
+            let a0 = i as f32 / SEG as f32 * TAU;
+            let a1 = (i + 1) as f32 / SEG as f32 * TAU;
+            let (xa, ta) = (x0 + r * a0.cos(), t0 + r * a0.sin());
+            let (xb, tb) = (x0 + r * a1.cos(), t0 + r * a1.sin());
+            let shade = 0.62 + 0.28 * a0.cos();
+            push_quad(
+                v,
+                at(xa, ta, 0.0),
+                at(xb, tb, 0.0),
+                at(xb, tb, hgt),
+                at(xa, ta, hgt),
+                col,
+                shade,
+            );
+            push_tri(
+                v,
+                [at(x0, t0, hgt), at(xa, ta, hgt), at(xb, tb, hgt)],
+                cap,
+                1.0,
+            );
+        }
+    }
+
+    /// Low-poly sphere in world coordinates (the ball).
+    fn ball(v: &mut Vec<f32>, c: [f32; 3], r: f32, col: [f32; 3]) {
+        use std::f32::consts::PI;
+        const SL: usize = 10;
+        const ST: usize = 5;
+        let pt = |i: usize, j: usize| -> ([f32; 3], f32) {
+            let phi = (j as f32 / ST as f32 - 0.5) * PI;
+            let theta = i as f32 / SL as f32 * TAU;
+            let p = [
+                c[0] + r * phi.cos() * theta.cos(),
+                c[1] + r * phi.sin(),
+                c[2] + r * phi.cos() * theta.sin(),
+            ];
+            let shade = 0.45 + 0.55 * phi.sin().max(0.0) + 0.10 * phi.cos();
+            (p, shade.min(1.0))
+        };
+        for j in 0..ST {
+            for i in 0..SL {
+                let (a, sa) = pt(i, j);
+                let (b, _) = pt(i + 1, j);
+                let (cc, _) = pt(i + 1, j + 1);
+                let (d, sd) = pt(i, j + 1);
+                push_quad(v, a, b, cc, d, col, (sa + sd) * 0.5);
             }
         }
     }
+
+    let (hw, hh) = parallax_screen_half(aspect);
+    let mut v: Vec<f32> = Vec::new();
+
+    // Playfield frame: front edge low near the window, back edge high and
+    // deep. `u` = unit up-slope vector, `n` = plane normal (toward viewer),
+    // both in the Y-Z plane.
+    let front = [-0.78 * hh, -110.0f32]; // (y, z) of the front edge
+    let back = [0.42 * hh, -0.93 * PX_BOX_DEPTH_MM];
+    let (dy, dz) = (back[0] - front[0], back[1] - front[1]);
+    let len = dy.hypot(dz);
+    let u = [dy / len, dz / len];
+    let n = [-dz / len, dy / len];
+    let wpf = hw * 0.80; // playfield half-width
+
+    // A point at lateral `x`, `t` mm up the slope, `h` mm above the plane.
+    let at = move |x: f32, t: f32, h: f32| -> [f32; 3] {
+        [
+            x,
+            front[0] + u[0] * t + n[0] * h,
+            front[1] + u[1] * t + n[1] * h,
+        ]
+    };
+
+    const WOOD: [f32; 3] = [0.45, 0.30, 0.18];
+    const RAIL: [f32; 3] = [0.26, 0.17, 0.10];
+    const CREAM: [f32; 3] = [0.95, 0.90, 0.72];
+    const RED: [f32; 3] = [0.85, 0.16, 0.14];
+    const WHITE: [f32; 3] = [0.95, 0.95, 0.90];
+    const YELLOW: [f32; 3] = [0.95, 0.78, 0.10];
+    const STEEL: [f32; 3] = [0.78, 0.80, 0.85];
+
+    // Playfield surface.
+    push_quad(
+        &mut v,
+        at(-wpf, 0.0, 0.0),
+        at(wpf, 0.0, 0.0),
+        at(wpf, len, 0.0),
+        at(-wpf, len, 0.0),
+        WOOD,
+        0.92,
+    );
+    // Side rails + back wall.
+    boxed(
+        &mut v,
+        &at,
+        -(wpf - 9.0),
+        len * 0.5,
+        0.0,
+        9.0,
+        len * 0.5,
+        24.0,
+        RAIL,
+    );
+    boxed(
+        &mut v,
+        &at,
+        wpf - 9.0,
+        len * 0.5,
+        0.0,
+        9.0,
+        len * 0.5,
+        24.0,
+        RAIL,
+    );
+    boxed(&mut v, &at, 0.0, len - 8.0, 0.0, wpf, 8.0, 32.0, RAIL);
+    // Flipper bats, angled inward toward the drain.
+    boxed(
+        &mut v,
+        &at,
+        -0.30 * wpf,
+        80.0,
+        -0.42,
+        36.0,
+        9.0,
+        15.0,
+        CREAM,
+    );
+    boxed(&mut v, &at, 0.30 * wpf, 80.0, 0.42, 36.0, 9.0, 15.0, CREAM);
+    // Pop bumpers (red, white caps).
+    cyl(&mut v, &at, -0.42 * wpf, 0.62 * len, 34.0, 44.0, RED, WHITE);
+    cyl(&mut v, &at, 0.0, 0.74 * len, 34.0, 44.0, RED, WHITE);
+    cyl(&mut v, &at, 0.42 * wpf, 0.62 * len, 34.0, 44.0, RED, WHITE);
+    // A bank of three drop targets.
+    for k in -1i32..=1 {
+        boxed(
+            &mut v,
+            &at,
+            k as f32 * 95.0,
+            0.88 * len,
+            0.0,
+            16.0,
+            4.0,
+            40.0,
+            YELLOW,
+        );
+    }
+    // The ball, resting mid-table.
+    ball(&mut v, at(0.18 * wpf, 0.30 * len, 13.5), 13.5, STEEL);
     v
 }
 
