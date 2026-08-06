@@ -29,6 +29,10 @@ use crate::tracker::session::TrackerSession;
 struct PluginState {
     msg_api: *const MsgPluginAPI,
     vpx_api: *mut VPXPluginAPI,
+    /// VPX install path and per-user preference path, copied out of
+    /// `GetVpxInfo` at load time (host strings are copied immediately).
+    vpx_path: Option<std::path::PathBuf>,
+    pref_path: Option<std::path::PathBuf>,
     /// Reserved for cross-thread API calls (`RunOnMainThread`, `SendMsg`).
     #[allow(dead_code)]
     endpoint_id: u32,
@@ -70,6 +74,9 @@ struct GameSession {
     /// Lockbar-button hold tracking for the long-press recenter.
     lockbar_held_since: Option<Instant>,
     recentered_this_hold: bool,
+    /// One-shot text pushed as a native VPX notification on the next
+    /// frame (calibration summary; built off the main thread).
+    pending_note: Option<std::ffi::CString>,
 }
 
 /// Hold the (already mapped everywhere) lockbar button this long to
@@ -195,6 +202,28 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     }
     info!("VPX plugin API resolved");
 
+    // Copy the host paths now — the plugin later reads VPinballX.ini
+    // (cabinet lockbar geometry) and anchor_fixed.json from them.
+    let (vpx_path, pref_path) = {
+        let mut info = super::vpx_sys::VPXInfo::default();
+        // SAFETY: vpx_api verified non-null; `info` is a valid out-pointer.
+        if let Some(get_info) = unsafe { (*vpx_api).GetVpxInfo } {
+            unsafe { get_info(&raw mut info) };
+        }
+        let to_path = |p: *const std::ffi::c_char| {
+            if p.is_null() {
+                None
+            } else {
+                // SAFETY: host guarantees a NUL-terminated string for the
+                // duration of the call; we copy it right away.
+                let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+                (!s.is_empty()).then(|| std::path::PathBuf::from(s.into_owned()))
+            }
+        };
+        (to_path(info.path), to_path(info.prefPath))
+    };
+    info!(?vpx_path, ?pref_path, "host paths");
+
     // Wire the tracing → VPX console bridge as soon as MsgPluginAPI is
     // available. From this point on every `info!` / `warn!` / `error!`
     // emitted by the plugin appears in VPX's plugin log panel as well
@@ -242,6 +271,8 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     *STATE.lock() = Some(PluginState {
         msg_api: api_ptr,
         vpx_api,
+        vpx_path,
+        pref_path,
         endpoint_id: session_id,
         msg_ids,
     });
@@ -315,6 +346,10 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
         match TrackerSession::spawn(&cfg) {
             Ok(tracker) => {
                 let backend = tracker.backend_name();
+                // Host-side cabinet geometry + hand-fixed anchor calibration
+                // → a one-shot notification so the player sees the plugin
+                // located its camera without opening a single menu.
+                let pending_note = calibration_note(backend, &cfg);
                 *GAME.lock() = Some(GameSession {
                     tracker,
                     baseline: None,
@@ -323,6 +358,7 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
                     last_pose_seen: Instant::now(),
                     lockbar_held_since: None,
                     recentered_this_hold: false,
+                    pending_note,
                 });
                 // A continuously moving camera invalidates VPX's static
                 // prerender pass — disable it like the in-game POV page does.
@@ -413,6 +449,14 @@ fn apply_pose_to_view() {
         return;
     };
 
+    // One-shot calibration notification (built at game start).
+    if let Some(note) = game.pending_note.take()
+        && let Some(notify) = vpx.PushNotification
+    {
+        // SAFETY: NUL-terminated CString kept alive across the call.
+        unsafe { notify(note.as_ptr(), 6000) };
+    }
+
     // Long-press recenter: re-baseline on the CURRENT head position and
     // reset the smoothing filter so the new neutral isn't dragged from
     // the old smoothed state. One recenter per hold.
@@ -502,6 +546,37 @@ fn apply_pose_to_view() {
 
     // SAFETY: setter follows the FFI contract; we own `view`.
     unsafe { setter(&raw mut view) };
+}
+
+/// Read the host cabinet geometry and the hand-fixed anchor calibration,
+/// and format the notification summary. `None` when no calibration is
+/// available (the plugin still tracks — relative deltas need no anchor).
+#[cfg(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam"))]
+fn calibration_note(backend: &str, cfg: &config::Config) -> Option<std::ffi::CString> {
+    let (vpx_path, pref_path) = {
+        let state = STATE.lock();
+        let s = state.as_ref()?;
+        (s.vpx_path.clone(), s.pref_path.clone())
+    };
+    let geo = pref_path
+        .as_deref()
+        .map(crate::plugin::host_settings::read_cab_geometry)
+        .unwrap_or_default();
+    let entry =
+        crate::calibration::anchor_fixed::load(backend, vpx_path.as_deref(), pref_path.as_deref())?;
+    let summary = crate::calibration::anchor_fixed::camera_pose_summary(
+        backend,
+        &entry,
+        geo.lockbar_width_mm,
+        cfg.webcam_focal_px,
+    )?;
+    info!(%summary, "fixed anchor calibration active");
+    std::ffi::CString::new(summary).ok()
+}
+
+#[cfg(not(any(feature = "kinect-v1", feature = "kinect-v2", feature = "webcam")))]
+fn calibration_note(_backend: &str, _cfg: &config::Config) -> Option<std::ffi::CString> {
+    None
 }
 
 fn init_tracing_once() {

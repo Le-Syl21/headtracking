@@ -62,14 +62,26 @@ Replace the tract-era detection with the demo's validated pipeline in
   the plugin → unblocks Windows ARM later), `face_depth.rs`,
   `hand_fiducial.rs`, depth-based `detect_lockbar`.
 
-## Phase 2 — calibration
+## Phase 2 — calibration [DELIVERED 2026-08-06, scope note below]
 
-- Port the AnchorWorker (throttled ~400 ms, warmup, freeze-on-lock).
-- `anchor_fixed.json` loader; search order: next to the plugin library
-  (`<VPX>/plugins/headtracking/`), then `VPXInfo.prefPath`.
-- `anchor::camera_pose` as diagnostics first (not in the control loop),
-  surfaced via `PushNotification` ("anchor locked — camera 1.30 m from
+- `anchor_fixed.json` loader (`src/calibration/anchor_fixed.rs`); search
+  order: next to the plugin library (`<VPX>/plugins/headtracking/`),
+  then `VPXInfo.prefPath`. Same format and webcam-slug fallback as the
+  demo.
+- Host cabinet geometry (`src/plugin/host_settings.rs`): `[Player]
+  LockbarWidth/Height` read from `<prefPath>/VPinballX.ini` (cm → mm),
+  VPX defaults as fallback. Unit-tested.
+- `anchor::camera_pose` as diagnostics: computed from the fixed
+  calibration at game start with per-backend nominal focals, pushed
+  once as a native VPX notification ("Head tracking: camera 1.30 m from
   the lockbar…").
+- **Scope cut (deliberate): the live in-plugin AnchorWorker is
+  deferred.** In the default IR tracking mode no RGB frames stream, and
+  the anchor model wants RGB — the honest design is "calibrate on RGB at
+  session start, then switch the stream to IR", which is its own piece
+  (stream restart choreography per backend). Tracked as follow-up; the
+  fixed-file path fully covers cabs calibrated once (cameras are
+  bolted), and RGB-mode live anchoring can ride the same worker later.
 
 ## Phase 3 — VPX integration
 

@@ -55,6 +55,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # is not enough to triage user reports.
 os_info = { version = "3", default-features = false }
 arc-swap = "1"
+# anchor_fixed.json (hand-fixed calibration) parsing.
+serde_json = "1"
 parking_lot = "0.12"
 thiserror = "2"
 freenect = { path = "crates/freenect", optional = true }
