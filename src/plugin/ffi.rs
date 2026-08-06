@@ -94,11 +94,6 @@ const LOST_DECAY: f32 = 0.94;
 /// active camera plus the setup reminders, so give it time to be read.
 const STARTUP_NOTE_MS: i32 = 15_000;
 
-/// Attenuation applied on top of the user gain to the depth and height
-/// axes. Lateral parallax stays 1:1; depth/height at full strength skew
-/// the Window-mode oblique projection into "twisted table" territory.
-const DEPTH_HEIGHT_GAIN: f32 = 0.5;
-
 #[derive(Clone, Copy)]
 struct Baseline {
     pose: Pose,
@@ -559,14 +554,10 @@ fn apply_pose_to_view() {
             mode: ViewMode::from_i32(view.viewMode),
         };
         let delta = pose_delta_to_view_delta(&pose, &adjusted_baseline_pose, &params);
-        // Depth and height drive the oblique-projection skew and get
-        // uncomfortable well before lateral parallax does (field-tested on
-        // the cab: full-strength height/depth "twists" the table). Lateral
-        // X stays 1:1 with the head — that's the fish-tank effect.
         game.applied = [
             delta.dx * cfg.gain,
-            delta.dy * cfg.gain * DEPTH_HEIGHT_GAIN,
-            delta.dz * cfg.gain * DEPTH_HEIGHT_GAIN,
+            delta.dy * cfg.gain,
+            delta.dz * cfg.gain,
         ];
     }
 
