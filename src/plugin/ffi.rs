@@ -11,12 +11,16 @@ use std::ptr;
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
 
+use std::time::{Duration, Instant};
+
 use super::messages::{
-    VPXPI_EVT_ON_GAME_END, VPXPI_EVT_ON_GAME_START, VPXPI_EVT_ON_PREPARE_FRAME, VPXPI_MSG_GET_API,
-    VPXPI_NAMESPACE,
+    VPXPI_EVT_ON_ACTION_CHANGED, VPXPI_EVT_ON_GAME_END, VPXPI_EVT_ON_GAME_START,
+    VPXPI_EVT_ON_PREPARE_FRAME, VPXPI_MSG_GET_API, VPXPI_NAMESPACE,
 };
-use super::vpx_sys::{MsgPluginAPI, VPXPluginAPI, VPXViewSetupDef};
-use crate::camera::mapping::pose_delta_to_view_delta;
+use super::vpx_sys::{
+    MsgPluginAPI, VPXAction_VPXACTION_Lockbar, VPXActionEvent, VPXPluginAPI, VPXViewSetupDef,
+};
+use crate::camera::mapping::{MappingParams, pose_delta_to_view_delta};
 use crate::config;
 use crate::tracker::Pose;
 use crate::tracker::session::TrackerSession;
@@ -37,6 +41,7 @@ struct SubscribedMsgs {
     on_game_start: u32,
     on_game_end: u32,
     on_prepare_frame: u32,
+    on_action_changed: u32,
 }
 
 // SAFETY: pointers live for the lifetime of the host process and are only
@@ -54,7 +59,29 @@ struct GameSession {
     /// snapshot. Subsequent frames apply the head-motion delta on top of this
     /// baseline so the table's authored POV is the neutral resting state.
     baseline: Option<Baseline>,
+    /// View delta applied on the previous frame — the easing state used to
+    /// settle back toward the baseline when tracking is lost.
+    applied: [f32; 3],
+    /// Timestamp of the newest pose sample and when it last changed —
+    /// an unchanged sample for [`TRACKING_STALE`] means the tracker lost
+    /// the player (backends keep publishing nothing, the ArcSwap holds).
+    last_pose_ts: u64,
+    last_pose_seen: Instant,
+    /// Lockbar-button hold tracking for the long-press recenter.
+    lockbar_held_since: Option<Instant>,
+    recentered_this_hold: bool,
 }
+
+/// Hold the (already mapped everywhere) lockbar button this long to
+/// recenter the head-tracking baseline.
+const RECENTER_HOLD: Duration = Duration::from_secs(2);
+
+/// A pose sample unchanged for this long counts as lost tracking.
+const TRACKING_STALE: Duration = Duration::from_millis(400);
+
+/// Per-frame decay applied to the view delta while tracking is lost —
+/// ~0.94^60 ≈ 2 % after one second at 60 fps: a calm glide home.
+const LOST_DECAY: f32 = 0.94;
 
 #[derive(Clone, Copy)]
 struct Baseline {
@@ -143,6 +170,12 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
                 VPXPI_EVT_ON_PREPARE_FRAME.as_ptr(),
             )
         },
+        on_action_changed: unsafe {
+            get_msg_id(
+                VPXPI_NAMESPACE.as_ptr(),
+                VPXPI_EVT_ON_ACTION_CHANGED.as_ptr(),
+            )
+        },
     };
 
     // Resolve the VPXPluginAPI via the GetAPI broadcast — the host responds
@@ -189,6 +222,12 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
             session_id,
             msg_ids.on_prepare_frame,
             Some(on_prepare_frame),
+            ptr::null_mut(),
+        );
+        subscribe(
+            session_id,
+            msg_ids.on_action_changed,
+            Some(on_action_changed),
             ptr::null_mut(),
         );
     }
@@ -245,9 +284,15 @@ unsafe fn do_unload() {
                 Some(on_prepare_frame),
                 ptr::null_mut(),
             );
+            unsubscribe(
+                state.msg_ids.on_action_changed,
+                Some(on_action_changed),
+                ptr::null_mut(),
+            );
             release(state.msg_ids.on_game_start);
             release(state.msg_ids.on_game_end);
             release(state.msg_ids.on_prepare_frame);
+            release(state.msg_ids.on_action_changed);
             release(state.msg_ids.get_vpx_api);
         }
     } else {
@@ -273,8 +318,23 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
                 *GAME.lock() = Some(GameSession {
                     tracker,
                     baseline: None,
+                    applied: [0.0; 3],
+                    last_pose_ts: 0,
+                    last_pose_seen: Instant::now(),
+                    lockbar_held_since: None,
+                    recentered_this_hold: false,
                 });
-                info!(backend, "tracker session active");
+                // A continuously moving camera invalidates VPX's static
+                // prerender pass — disable it like the in-game POV page does.
+                let vpx_ptr = STATE.lock().as_ref().map_or(ptr::null_mut(), |s| s.vpx_api);
+                if !vpx_ptr.is_null() {
+                    // SAFETY: API pointer valid for the plugin session.
+                    if let Some(disable) = unsafe { (*vpx_ptr).DisableStaticPrerendering } {
+                        // SAFETY: plain int argument per the FFI contract.
+                        unsafe { disable(1) };
+                    }
+                }
+                info!(backend, "tracker session active (static prerender off)");
             }
             Err(err) => {
                 warn!(?err, "tracker session failed to start; running passthrough");
@@ -295,6 +355,36 @@ extern "C" fn on_prepare_frame(_msg_id: u32, _context: *mut c_void, _data: *mut 
     let _ = catch_unwind(AssertUnwindSafe(apply_pose_to_view));
 }
 
+/// Observe the lockbar button (mapped on every cabinet): holding it
+/// [`RECENTER_HOLD`] recenters the head-tracking baseline. The event is
+/// observed, never consumed — VPX and the table keep seeing the button.
+extern "C" fn on_action_changed(_msg_id: u32, _context: *mut c_void, data: *mut c_void) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if data.is_null() {
+            return;
+        }
+        // SAFETY: the host guarantees `data` points at a live VPXActionEvent
+        // for the duration of this synchronous callback.
+        let ev = unsafe { &*data.cast::<VPXActionEvent>() };
+        if ev.action != VPXAction_VPXACTION_Lockbar {
+            return;
+        }
+        let mut game_guard = GAME.lock();
+        let Some(game) = game_guard.as_mut() else {
+            return;
+        };
+        if ev.isPressed != 0 {
+            if game.lockbar_held_since.is_none() {
+                game.lockbar_held_since = Some(Instant::now());
+                game.recentered_this_hold = false;
+            }
+        } else {
+            game.lockbar_held_since = None;
+            game.recentered_this_hold = false;
+        }
+    }));
+}
+
 fn apply_pose_to_view() {
     // 1. Snapshot the VPX API pointer (brief lock on STATE).
     let vpx_api_ptr = match STATE.lock().as_ref() {
@@ -313,11 +403,6 @@ fn apply_pose_to_view() {
         return;
     };
 
-    let pose = game.tracker.latest_pose();
-    if pose.confidence <= 0.0 {
-        return;
-    }
-
     // SAFETY: vpx_api_ptr was set non-null at load time and the host keeps
     // the API live through the plugin session.
     let vpx = unsafe { &*vpx_api_ptr };
@@ -328,28 +413,55 @@ fn apply_pose_to_view() {
         return;
     };
 
+    // Long-press recenter: re-baseline on the CURRENT head position and
+    // reset the smoothing filter so the new neutral isn't dragged from
+    // the old smoothed state. One recenter per hold.
+    if let Some(held) = game.lockbar_held_since
+        && !game.recentered_this_hold
+        && held.elapsed() >= RECENTER_HOLD
+    {
+        game.baseline = None;
+        game.applied = [0.0; 3];
+        game.tracker.reset_filter();
+        game.recentered_this_hold = true;
+        info!("lockbar long-press: head-tracking recentered");
+        if let Some(notify) = vpx.PushNotification {
+            // SAFETY: static NUL-terminated message, length per contract.
+            unsafe { notify(c"Head tracking recentered".as_ptr(), 2000) };
+        }
+    }
+
+    let pose = game.tracker.latest_pose();
+
+    // Staleness: backends only publish when they SEE the player, so an
+    // unchanged sample means lost tracking (looked away, left the cab).
+    if pose.timestamp_us != game.last_pose_ts {
+        game.last_pose_ts = pose.timestamp_us;
+        game.last_pose_seen = Instant::now();
+    }
+    let lost = pose.confidence <= 0.0 || game.last_pose_seen.elapsed() > TRACKING_STALE;
+
     let mut view = VPXViewSetupDef::default();
     // SAFETY: `view` is a valid out-pointer; getter follows the FFI contract.
     unsafe { getter(&raw mut view) };
 
-    let baseline = match game.baseline {
-        Some(b) => b,
-        None => {
-            // First frame with a real pose: capture both anchors and skip
-            // applying any delta — the table's authored POV stands.
-            let new_baseline = Baseline {
-                pose: *pose,
-                view_xyz: [view.viewX, view.viewY, view.viewZ],
-            };
-            game.baseline = Some(new_baseline);
-            info!(
-                x = pose.position_mm[0],
-                y = pose.position_mm[1],
-                z = pose.position_mm[2],
-                "tracker baseline captured"
-            );
-            return;
+    let Some(baseline) = game.baseline else {
+        if lost {
+            return; // nothing to do until the first stable pose
         }
+        // First frame with a real pose: capture both anchors and skip
+        // applying any delta — the table's authored POV stands.
+        game.baseline = Some(Baseline {
+            pose: *pose,
+            view_xyz: [view.viewX, view.viewY, view.viewZ],
+        });
+        info!(
+            x = pose.position_mm[0],
+            y = pose.position_mm[1],
+            z = pose.position_mm[2],
+            "tracker baseline captured"
+        );
+        return;
     };
 
     // Read the live config every frame. The lock is uncontended (only the
@@ -357,18 +469,36 @@ fn apply_pose_to_view() {
     // is essentially a memcpy.
     let cfg = config::current();
 
-    // Apply the user's BaselineOffset before computing the delta so the
-    // offset acts as a manual recenter of the neutral pose, not a
-    // post-gain bias.
-    let mut adjusted_baseline_pose = baseline.pose;
-    adjusted_baseline_pose.position_mm[0] += cfg.baseline_offset_x_mm;
-    adjusted_baseline_pose.position_mm[1] += cfg.baseline_offset_y_mm;
-    adjusted_baseline_pose.position_mm[2] += cfg.baseline_offset_z_mm;
+    if lost {
+        // Glide calmly back toward the authored POV instead of freezing
+        // on the last offset.
+        game.applied = game.applied.map(|v| v * LOST_DECAY);
+    } else {
+        // Apply the user's BaselineOffset before computing the delta so
+        // the offset acts as a manual recenter of the neutral pose, not
+        // a post-gain bias.
+        let mut adjusted_baseline_pose = baseline.pose;
+        adjusted_baseline_pose.position_mm[0] += cfg.baseline_offset_x_mm;
+        adjusted_baseline_pose.position_mm[1] += cfg.baseline_offset_y_mm;
+        adjusted_baseline_pose.position_mm[2] += cfg.baseline_offset_z_mm;
 
-    let delta = pose_delta_to_view_delta(&pose, &adjusted_baseline_pose);
-    view.viewX = baseline.view_xyz[0] + delta.dx * cfg.gain;
-    view.viewY = baseline.view_xyz[1] + delta.dy * cfg.gain;
-    view.viewZ = baseline.view_xyz[2] + delta.dz * cfg.gain;
+        // The playfield incline comes from the HOST's view setup — the
+        // axis rotation "the player looks DOWN at the table" keys off it.
+        let params = MappingParams {
+            incline_deg: view.screenInclination,
+            invert: [cfg.invert_x, cfg.invert_y, cfg.invert_z],
+        };
+        let delta = pose_delta_to_view_delta(&pose, &adjusted_baseline_pose, &params);
+        game.applied = [
+            delta.dx * cfg.gain,
+            delta.dy * cfg.gain,
+            delta.dz * cfg.gain,
+        ];
+    }
+
+    view.viewX = baseline.view_xyz[0] + game.applied[0];
+    view.viewY = baseline.view_xyz[1] + game.applied[1];
+    view.viewZ = baseline.view_xyz[2] + game.applied[2];
 
     // SAFETY: setter follows the FFI contract; we own `view`.
     unsafe { setter(&raw mut view) };

@@ -29,6 +29,10 @@ pub struct TrackerSession {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     backend_name: &'static str,
+    /// Set by the recenter path; the tracker loop consumes it and resets
+    /// the One-Euro filter so the fresh baseline isn't dragged from the
+    /// old smoothed position.
+    reset_filter: Arc<AtomicBool>,
 }
 
 impl TrackerSession {
@@ -52,6 +56,7 @@ impl TrackerSession {
         let backend_name = backend.name();
         let latest = Arc::new(ArcSwap::from_pointee(Pose::ZERO));
         let stop = Arc::new(AtomicBool::new(false));
+        let reset_filter = Arc::new(AtomicBool::new(false));
 
         let to_params = |cfg: &Config| {
             cfg.one_euro_params().map(|a| OneEuroParams {
@@ -65,6 +70,7 @@ impl TrackerSession {
 
         let latest_for_thread = Arc::clone(&latest);
         let stop_for_thread = Arc::clone(&stop);
+        let reset_for_thread = Arc::clone(&reset_filter);
         let handle = thread::Builder::new()
             .name(format!("headtracking-{backend_name}"))
             .spawn(move || {
@@ -78,6 +84,9 @@ impl TrackerSession {
                         active = live.smoothing;
                         filter.set_params_per_axis(to_params(&live));
                         info!(backend = backend_name, preset = ?active, "smoothing preset changed");
+                    }
+                    if reset_for_thread.swap(false, Ordering::Relaxed) {
+                        filter.reset();
                     }
                     if let Some(raw) = backend.poll() {
                         let smoothed = filter.update(raw.position_mm, raw.timestamp_us);
@@ -100,6 +109,7 @@ impl TrackerSession {
             stop,
             handle: Some(handle),
             backend_name,
+            reset_filter,
         })
     }
 
@@ -111,6 +121,11 @@ impl TrackerSession {
 
     pub fn backend_name(&self) -> &'static str {
         self.backend_name
+    }
+
+    /// Ask the tracker thread to reset its smoothing filter (recenter).
+    pub fn reset_filter(&self) {
+        self.reset_filter.store(true, Ordering::Relaxed);
     }
 }
 

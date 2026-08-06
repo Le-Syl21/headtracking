@@ -22,6 +22,7 @@ pub const VPXPI_MSG_GET_API: &CStr = cstr!("GetAPI");
 pub const VPXPI_EVT_ON_GAME_START: &CStr = cstr!("OnGameStart");
 pub const VPXPI_EVT_ON_GAME_END: &CStr = cstr!("OnGameEnd");
 pub const VPXPI_EVT_ON_PREPARE_FRAME: &CStr = cstr!("OnPrepareFrame");
+pub const VPXPI_EVT_ON_ACTION_CHANGED: &CStr = cstr!("OnActionChanged");
 
 // LoggingPlugin.h
 // NB: upstream `#define LOGPI_NAMESPACE "Login"` — yes, the typo (Login,

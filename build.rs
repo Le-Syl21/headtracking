@@ -90,6 +90,7 @@ fn main() {
         .allowlist_type("VPXTableInfo")
         .allowlist_type("VPXTexture.*")
         .allowlist_type("VPXAction")
+        .allowlist_type("VPXActionEvent")
         .allowlist_type("VPXAuxiliaryRenderer")
         .allowlist_type("VPXNudgeState")
         .allowlist_type("VPXPlungerState")
