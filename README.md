@@ -98,7 +98,8 @@ and it's absurdly cheap since Microsoft discontinued it:
   stainless pieces — 7 lengths from 5/16" to 1", spacers and wrench
   included) is all it takes to fix the sensor on top of the backglass or
   the topper. In a hurry? Both the adapter and the screw kit ship with
-  Prime — next-day delivery.
+  Prime — next-day delivery. And the sensor itself? leboncoin hand-to-hand
+  pickup can put a Kinect in your cab the very same day if you hustle. 😄
 
 The **Kinect v1** (Xbox 360) is even cheaper and field-tested too — lower
 resolution but perfectly usable. And a plain **webcam** costs nothing if you
@@ -326,7 +327,9 @@ obligatoire. Pour la fixer sur le backglass ou le topper : un
 [kit d'assortiment de vis 1/4"-20](https://amzn.eu/d/05Pmh3l6) (~11 € les
 40 pièces inox — 7 longueurs de 5/16" à 1", entretoises et clé incluses)
 suffit. Pour les pressés : adaptateur et visserie sont **Prime** —
-livrés le lendemain. La Kinect v1 (encore moins chère) et une simple
+livrés le lendemain. Et le capteur ? En remise en main propre sur
+leboncoin, la Kinect peut être sur ton cab dans la journée si tu te
+démerdes. 😄 La Kinect v1 (encore moins chère) et une simple
 webcam marchent aussi — l'auto-calibration reconstruit la 3D depuis la
 webcam, c'est tout l'objet du projet.
 

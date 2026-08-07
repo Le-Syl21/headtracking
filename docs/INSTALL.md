@@ -15,7 +15,8 @@ USB 3.0 port (see the [bandwidth note](#v2-needs-usb-30-root-port-bandwidth)).
 To mount it on the backglass or topper, a
 [1/4"-20 screw assortment kit](https://amzn.eu/d/05Pmh3l6) (~€11 for 40
 stainless pieces, 7 lengths + spacers + wrench) does the job — both the
-adapter and the kit ship with Prime for the impatient. Kinect v1 and plain webcams are fully
+adapter and the kit ship with Prime for the impatient (and leboncoin
+hand-to-hand pickup can get you the sensor the same day). Kinect v1 and plain webcams are fully
 supported too.
 
 ### Install the plugin
@@ -356,7 +357,9 @@ USB 3.0 dédié obligatoire (voir la note bande passante plus bas). Pour la
 fixation sur le backglass ou le topper, un
 [kit d'assortiment de vis 1/4"-20](https://amzn.eu/d/05Pmh3l6) (~11 € les
 40 pièces inox, 7 longueurs + entretoises + clé) fait l'affaire — pour
-les pressés, adaptateur et visserie sont Prime (livrés le lendemain). La Kinect v1 et les simples webcams sont
+les pressés, adaptateur et visserie sont Prime (livrés le lendemain), et
+la remise en main propre leboncoin peut fournir le capteur dans la
+journée. La Kinect v1 et les simples webcams sont
 aussi pleinement supportées.
 
 ### Installation du plugin
