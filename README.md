@@ -76,6 +76,8 @@ model — lives in **[`tools/anchor/`](tools/anchor/)** with its own guide.
 
 ## 🎥 Which camera? Grab a second-hand Kinect v2
 
+<img src="docs/images/kinect-v2.png" alt="Kinect v2 (Xbox One) sensor bar" width="440" align="right"/>
+
 Every backend works, but the sweet spot is a used **Kinect v2 (Xbox One)** —
 and it's absurdly cheap since Microsoft discontinued it:
 
@@ -90,6 +92,10 @@ and it's absurdly cheap since Microsoft discontinued it:
   check before buying. Total ~€50 all-in.
 - Plug it into a **dedicated USB 3.0 port** on the motherboard's back panel
   (it won't enumerate behind a shared hub).
+- Mounting on the cab: a
+  [standard 1/4" (Kodak) screw kit](https://amzn.eu/d/07wd6UjW) —
+  13 mm (1/2"), 25 mm (1") and 51 mm (2") lengths — is all it takes to fix
+  the sensor on top of the backglass or the topper.
 
 The **Kinect v1** (Xbox 360) is even cheaper and field-tested too — lower
 resolution but perfectly usable. And a plain **webcam** costs nothing if you
@@ -312,9 +318,11 @@ noir) et son **capteur de profondeur** mesure la distance de tête en vrais
 millimètres. ⚠️ Prévoir l'**adaptateur Kinect** (alim + USB 3.0,
 [~29 € neuf](https://amzn.eu/d/08mV466T)) si l'annonce ne l'inclut pas —
 vérifiez avant d'acheter. ~50 € tout compris, port **USB 3.0 dédié**
-obligatoire. La Kinect v1 (encore moins chère) et une simple webcam
-marchent aussi — l'auto-calibration reconstruit la 3D depuis la webcam,
-c'est tout l'objet du projet.
+obligatoire. Pour la fixer sur le backglass ou le topper : un
+[kit de vis au pas Kodak standard 1/4"](https://amzn.eu/d/07wd6UjW)
+(13 / 25 / 51 mm) suffit. La Kinect v1 (encore moins chère) et une simple
+webcam marchent aussi — l'auto-calibration reconstruit la 3D depuis la
+webcam, c'est tout l'objet du projet.
 
 **État :** début de développement, publié en **beta**. Ça compile pour Linux,
 Windows et macOS, et la chaîne complète — caméra → auto-calibration → POV
