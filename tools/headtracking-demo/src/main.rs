@@ -1767,6 +1767,11 @@ impl Backend {
 struct BackendEntry {
     backend: Backend,
     label: String,
+    /// The sensor is on the USB bus but its OS access prerequisite is
+    /// missing (Windows WinUSB binding / Linux udev rule): shown greyed
+    /// out so the user sees the hardware IS detected, with the fix
+    /// banner right above. Cleared by the automatic post-install rescan.
+    needs_drivers: bool,
 }
 
 /// Probe USB for connected sensors. Always returns `None (off)` first; the
@@ -1782,9 +1787,15 @@ struct BackendEntry {
 ///     prefix in both the stderr stream and the in-app log panel).
 fn detect_backends() -> Vec<BackendEntry> {
     info!("scan: probing USB backends");
+    // One probe for the whole scan: any present Kinect function without
+    // its access prerequisite marks the Kinect entries as needing drivers.
+    // HT_FORCE_ACCESS_HINT forces it, like the banner, for UI testing.
+    let kinect_blocked = std::env::var_os("HT_FORCE_ACCESS_HINT").is_some_and(|v| v != "0")
+        || kinect_present_but_not_set_up();
     let mut out = vec![BackendEntry {
         backend: Backend::None,
         label: "None (off)".to_string(),
+        needs_drivers: false,
     }];
 
     // ---- Kinect v2 (libfreenect2)
@@ -1803,6 +1814,7 @@ fn detect_backends() -> Vec<BackendEntry> {
                 out.push(BackendEntry {
                     backend: Backend::KinectV2,
                     label: "Kinect v2".to_string(),
+                    needs_drivers: kinect_blocked,
                 });
             }
         }
@@ -1827,6 +1839,7 @@ fn detect_backends() -> Vec<BackendEntry> {
                 out.push(BackendEntry {
                     backend: Backend::KinectV1,
                     label: "Kinect v1".to_string(),
+                    needs_drivers: kinect_blocked,
                 });
             } else {
                 info!(
@@ -1859,6 +1872,7 @@ fn detect_backends() -> Vec<BackendEntry> {
                 out.push(BackendEntry {
                     backend: Backend::Webcam(cam.id),
                     label,
+                    needs_drivers: false,
                 });
             }
         }
@@ -1877,6 +1891,7 @@ fn detect_backends() -> Vec<BackendEntry> {
             out.push(BackendEntry {
                 backend: Backend::Webcam(90_000 + i),
                 label: format!("Fake camera #{i} (HT_FAKE_CAMS)"),
+                needs_drivers: false,
             });
         }
     }
@@ -5047,7 +5062,23 @@ impl App {
                         // stretches to exactly the number of entries.
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         for entry in &entries {
-                            ui.selectable_value(&mut self.selected, entry.backend, &entry.label);
+                            if entry.needs_drivers {
+                                // Visible but not selectable: the hardware IS
+                                // detected, only the driver is missing — the
+                                // fix banner above has the one-click install,
+                                // and the auto-rescan re-enables the entry.
+                                ui.add_enabled_ui(false, |ui| {
+                                    let _ = ui.selectable_label(
+                                        false,
+                                        format!(
+                                            "{} — install drivers first (see ⚠ banner)",
+                                            entry.label
+                                        ),
+                                    );
+                                });
+                            } else {
+                                ui.selectable_value(&mut self.selected, entry.backend, &entry.label);
+                            }
                         }
                         if combo_debug {
                             // Measured from INSIDE the popup: whatever style /
