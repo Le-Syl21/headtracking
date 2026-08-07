@@ -43,6 +43,9 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+// DISPLAY range only (turbo colormap normalisation) — head-distance
+// sampling has no plausibility window any more, see
+// `headtracking::tracker::pipeline` for the rationale.
 const DEPTH_MIN_MM: f32 = 500.0;
 const DEPTH_MAX_MM: f32 = 2_500.0;
 /// Nominal webcam focal length as a fraction of the frame width (~58° HFOV).
@@ -3923,7 +3926,7 @@ fn head_pixel_from_bigdepth(
                 continue;
             }
             let z = bigdepth[row + u as usize];
-            if z.is_finite() && (DEPTH_MIN_MM..=DEPTH_MAX_MM).contains(&z) {
+            if z.is_finite() && z > 0.0 {
                 samples.push(z);
             }
         }
@@ -4005,7 +4008,7 @@ where
                 continue;
             }
             let z = f32::from(depth_data[row + u as usize]);
-            if (DEPTH_MIN_MM..=DEPTH_MAX_MM).contains(&z) {
+            if z.is_finite() && z > 0.0 {
                 samples.push(z);
             }
         }

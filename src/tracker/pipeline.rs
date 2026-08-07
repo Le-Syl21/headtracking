@@ -32,9 +32,15 @@ pub struct HeadPixel {
     pub y_mm: f32,
 }
 
-/// Plausible head-distance window for a standing player (mm).
-pub const DEPTH_MIN_MM: f32 = 500.0;
-pub const DEPTH_MAX_MM: f32 = 2_500.0;
+// NOTE: there is deliberately NO plausibility window on head distance any
+// more (an earlier 0.5–2.5 m gate is gone). It was a crutch for the old
+// head finders, which could land the sampling point off the head entirely
+// (the classic failure: sampling "the sidebar" and reading the door 2 m
+// behind it). BlazePose's glabella is reliably mid-face, so the ±8 px
+// median window stays on the face at any playable distance, and residual
+// single-frame spikes are the median gate + One-Euro's job downstream.
+// Only sensor validity is filtered: 0 = no reading (v1), ±inf = unmapped
+// (v2 bigdepth).
 
 /// Webcams report no intrinsics; assume a nominal focal from the frame
 /// width (~55° horizontal FOV, typical for a webcam).
@@ -76,7 +82,7 @@ pub const BIGDEPTH_ROW_OFFSET: usize = 1;
 /// very error the registration removes.
 ///
 /// Unmapped pixels come back `+inf` from libfreenect2 (not `0`), so the
-/// validity gate checks `is_finite()` before the range test.
+/// validity gate checks `is_finite()` on top of the `> 0` no-reading test.
 #[must_use]
 pub fn head_pixel_from_bigdepth(
     pose: &blazepose::Pose,
@@ -104,7 +110,7 @@ pub fn head_pixel_from_bigdepth(
                 continue;
             }
             let z = bigdepth[row + u as usize];
-            if z.is_finite() && (DEPTH_MIN_MM..=DEPTH_MAX_MM).contains(&z) {
+            if z.is_finite() && z > 0.0 {
                 samples.push(z);
             }
         }
@@ -168,7 +174,7 @@ where
                 continue;
             }
             let z = f32::from(depth_data[row + u as usize]);
-            if (DEPTH_MIN_MM..=DEPTH_MAX_MM).contains(&z) {
+            if z.is_finite() && z > 0.0 {
                 samples.push(z);
             }
         }

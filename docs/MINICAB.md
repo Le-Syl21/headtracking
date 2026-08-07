@@ -18,13 +18,12 @@ picking a camera and a mounting spot.
 | **Kinect v1** | **~0.8 m** | Hard: lower bound of its structured-light depth (0.8–4 m in standard mode) |
 | **Webcam** | **~0.4–0.5 m** | Soft: head **and shoulders** must fit in the frame — depth is triangulated from shoulder width; a wide-angle lens lowers the limit |
 
-Two extra constraints that apply to every camera:
+Also worth knowing, whatever the camera:
 
-- **On the Kinects, the pipeline gates depth samples to 0.5–2.5 m** —
-  this is background rejection (it keeps the wall behind you out of the
-  head-distance median), and its floor sits at/below the sensors' own
-  hardware floors anyway. The **webcam path has no software floor**: its
-  shoulder-width triangulation works as close as the framing allows.
+- **There is no software distance limit** — the pipeline only filters
+  invalid sensor readings; the floors in the table above are the sensors'
+  own hardware limits. The webcam's shoulder-width triangulation works as
+  close as the framing allows.
 - **The pose model is a body detector, not a face detector.** When the
   camera is so close that it only sees a face without shoulders, tracking
   degrades and eventually drops. Whatever the sensor: the player's bust
@@ -72,14 +71,13 @@ savoir avant de choisir la caméra et son emplacement.
 | **Kinect v1** | **~0,8 m** | Dure : limite basse de son depth par lumière structurée (0,8–4 m en mode standard) |
 | **Webcam** | **~0,4–0,5 m** | Souple : la tête **et les épaules** doivent tenir dans le cadre — la profondeur est triangulée sur la largeur d'épaules ; un objectif grand-angle abaisse la limite |
 
-Deux contraintes supplémentaires valables pour toutes les caméras :
+À savoir aussi, quelle que soit la caméra :
 
-- **Sur les Kinect, le pipeline filtre les échantillons de profondeur
-  à 0,5–2,5 m** — c'est du rejet de fond (ça tient le mur derrière vous
-  hors de la médiane de distance de tête), et son plancher est au niveau
-  ou sous les planchers matériels des capteurs de toute façon. Le
-  **chemin webcam n'a aucun plancher logiciel** : sa triangulation par
-  largeur d'épaules fonctionne d'aussi près que le cadrage le permet.
+- **Il n'y a aucune limite de distance logicielle** — le pipeline ne
+  filtre que les lectures capteur invalides ; les planchers du tableau
+  ci-dessus sont les limites matérielles des capteurs eux-mêmes. La
+  triangulation par largeur d'épaules de la webcam fonctionne d'aussi
+  près que le cadrage le permet.
 - **Le modèle de pose détecte un corps, pas un visage.** Quand la caméra
   est si proche qu'elle ne voit qu'un visage sans épaules, le tracking se
   dégrade puis décroche. Quel que soit le capteur : le buste du joueur
