@@ -21,6 +21,17 @@ impatient (and leboncoin hand-to-hand pickup can get you the sensor the
 same day). Kinect v1 and plain webcams are fully
 supported too.
 
+
+> [!IMPORTANT]
+> **The Kinect v2 devours USB bandwidth.** It streams *everything at
+> once*: colour **1920×1080 @ 30 fps** (JPEG on the wire), infrared
+> **512×424 @ 30 fps** and depth **512×424 @ 30 fps** — those last two as
+> **raw uncompressed** phase data — plus the 4-microphone audio array.
+> That's close to saturating a USB 3.0 link on its own. So before blaming
+> the camera or the adapter: make sure it's on a **dedicated USB 3.0 root
+> port** on the motherboard — no hub, no front-panel port, no cheap
+> extension cable.
+
 ### Install the plugin
 
 Grab the binary for your OS from the
@@ -364,6 +375,17 @@ et visserie sont regroupés dans une
 lendemain pour les pressés) — et la remise en main propre leboncoin peut
 fournir le capteur dans la journée. La Kinect v1 et les simples webcams sont
 aussi pleinement supportées.
+
+
+> [!IMPORTANT]
+> **La Kinect v2 dévore la bande passante USB.** Elle transfère *tout en
+> même temps* : couleur **1920×1080 @ 30 fps** (JPEG sur le câble),
+> infrarouge **512×424 @ 30 fps** et profondeur **512×424 @ 30 fps** —
+> ces deux-là en **données de phase brutes non compressées** — plus le
+> réseau de 4 micros. À elle seule, elle frôle la saturation d'un lien
+> USB 3.0. Donc avant d'accuser la caméra ou l'adaptateur : vérifiez
+> qu'elle est sur un **port USB 3.0 racine dédié** de la carte mère —
+> pas de hub, pas de port de façade, pas de rallonge douteuse.
 
 ### Installation du plugin
 
