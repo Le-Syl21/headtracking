@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "headtracking"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "anchor",
  "arc-swap",
@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "headtracking-demo"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "anchor",
  "arc-swap",
