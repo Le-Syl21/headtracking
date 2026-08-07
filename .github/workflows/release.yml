@@ -63,8 +63,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The models almost never change (the URLs pin an exact HF
+      # revision), so a cache keyed on build.rs — where the URLs live —
+      # makes reruns hit Hugging Face zero times. Changing a model URL
+      # changes the key, so the cache can never serve stale models.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        id: models-cache
+        with:
+          path: crates/blazepose/models
+          key: onnx-models-${{ hashFiles('crates/blazepose/build.rs') }}
+
       # Single source of truth for names/URLs: blazepose's build.rs.
       - name: Download models with retry/backoff
+        if: steps.models-cache.outputs.cache-hit != 'true'
         run: |
           python3 - <<'EOF'
           import pathlib, re, time, urllib.request

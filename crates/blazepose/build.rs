@@ -3,11 +3,17 @@
 //! pre-seeded checkouts don't hit the network.
 use std::path::Path;
 
+// URLs pin an exact HF revision, not `main`: upstream can force-push
+// `main` and silently swap the model weights under us, while a revision
+// URL is immutable — every build (and the CI model cache keyed on this
+// file) gets byte-identical models. Verified sha256 at this revision:
+//   pose_detection.onnx      72081da8481170bc6d8fafa716455ee210b61a8cefed84c67fcbbf889a4c38cf
+//   pose_landmark_full.onnx  ae17ee8f076a5bbc28f65b939f46139c10f10c51ec4392a011e56d06d3f76c5d
 const MODELS: &[(&str, &str)] = &[
     ("pose_detection.onnx",
-     "https://huggingface.co/unity/inference-engine-blaze-pose/resolve/main/models/pose_detection.onnx?download=true"),
+     "https://huggingface.co/unity/inference-engine-blaze-pose/resolve/d96e13766db93eaaac6ad398d7b01f1c94c7ff6e/models/pose_detection.onnx?download=true"),
     ("pose_landmark_full.onnx",
-     "https://huggingface.co/unity/inference-engine-blaze-pose/resolve/main/models/pose_landmarks_detector_full.onnx?download=true"),
+     "https://huggingface.co/unity/inference-engine-blaze-pose/resolve/d96e13766db93eaaac6ad398d7b01f1c94c7ff6e/models/pose_landmarks_detector_full.onnx?download=true"),
 ];
 
 /// Hugging Face rate-limits bursts (HTTP 429) — CI builds all matrix
