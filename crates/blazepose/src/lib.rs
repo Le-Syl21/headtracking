@@ -13,6 +13,8 @@
 use ort::session::Session;
 use ort::value::Tensor;
 
+pub mod smoothing;
+
 /// Embedded models (see `crates/blazepose/models/`). ~12–15 MB each.
 const DETECTOR_ONNX: &[u8] = include_bytes!("../models/pose_detection.onnx");
 const LANDMARK_ONNX: &[u8] = include_bytes!("../models/pose_landmark_full.onnx");
@@ -192,14 +194,17 @@ fn roi_from_points(c: [f32; 2], a: [f32; 2]) -> ([f32; 2], f32, f32) {
     (c, box_size, angle)
 }
 
-// NOTE on smoothing: this crate deliberately ships NO landmark smoothing
-// (MediaPipe's `smooth_landmarks` was ported here once, then removed). The
-// consumer applies a single tunable One-Euro filter on its derived output
-// (head position in mm, Z included — which never went through 2D landmark
-// smoothing anyway). Two cascaded One-Euro stages doubled the latency and
-// made the UI filter knobs control only half the smoothing. Landmarks
-// returned by [`BlazePose::poll`] are the raw model output; ROI-jump jitter
-// is already killed by detect-once-then-track below.
+// NOTE on smoothing: an earlier landmark-smoothing port was removed because
+// two cascaded One-Euro stages (2D landmarks here + the consumer's mm-space
+// filter) doubled the perceived lag and split the smoothing across two
+// places. The current port avoids that trap by using MediaPipe's stock
+// `pose_landmark_filtering.pbtxt` parameters: beta 80 on the visible
+// landmarks means the filter follows any real motion within a frame or two
+// and only attenuates near-static sub-pixel noise — it is source
+// *de-noising*, while response shaping stays entirely in the consumer's
+// tunable mm-space filter. The auxiliary ROI points get their own stiffer
+// bank (beta 10), which stabilises the landmark model's INPUT crop —
+// removing jitter before it is even produced, with zero output lag.
 
 pub struct BlazePose {
     detector: Session,
@@ -208,6 +213,12 @@ pub struct BlazePose {
     /// The two auxiliary ROI points (landmarks 33 & 34) from the last successful
     /// frame — the seed for the next frame's ROI so we track without re-detecting.
     last_aux: Option<([f32; 2], [f32; 2])>,
+    /// MediaPipe-style smoothing banks (see `smoothing`): visible landmarks…
+    lm_smooth: smoothing::PointBank<33>,
+    /// …and the auxiliary ROI points, which stabilise the tracking crop.
+    aux_smooth: smoothing::PointBank<2>,
+    /// Monotonic time base for the One-Euro timestamps.
+    clock: std::time::Instant,
 }
 
 impl BlazePose {
@@ -248,7 +259,44 @@ impl BlazePose {
             landmark,
             anchors: generate_anchors(),
             last_aux: None,
+            lm_smooth: smoothing::PointBank::new(
+                smoothing::LANDMARK_MIN_CUTOFF,
+                smoothing::LANDMARK_BETA,
+            ),
+            aux_smooth: smoothing::PointBank::new(smoothing::AUX_MIN_CUTOFF, smoothing::AUX_BETA),
+            clock: std::time::Instant::now(),
         })
+    }
+
+    /// Apply the MediaPipe smoothing banks to a fresh landmark result: the 33
+    /// visible landmarks for the output, the 2 auxiliary points for the next
+    /// frame's tracking ROI. Speeds are normalised by the subject's on-screen
+    /// size, like MediaPipe's `LandmarksSmoothingCalculator`.
+    fn smooth_tracked(
+        &mut self,
+        mut pose: Pose,
+        aux0: [f32; 2],
+        aux1: [f32; 2],
+    ) -> (Pose, [f32; 2], [f32; 2]) {
+        let t = self.clock.elapsed().as_secs_f64();
+        let scale = 1.0 / smoothing::object_scale(pose.landmarks.iter().map(|l| [l.x, l.y]));
+        for (i, lm) in pose.landmarks.iter_mut().enumerate() {
+            let [x, y, z] = self.lm_smooth.apply(i, t, scale, [lm.x, lm.y, lm.z]);
+            lm.x = x;
+            lm.y = y;
+            lm.z = z;
+        }
+        let a0 = self.aux_smooth.apply(0, t, scale, [aux0[0], aux0[1], 0.0]);
+        let a1 = self.aux_smooth.apply(1, t, scale, [aux1[0], aux1[1], 0.0]);
+        (pose, [a0[0], a0[1]], [a1[0], a1[1]])
+    }
+
+    /// Forget smoothing history — the subject was (re)acquired by the
+    /// detector, so the filters must re-initialise instead of dragging the
+    /// output from wherever the previous subject was.
+    fn reset_smoothing(&mut self) {
+        self.lm_smooth.reset();
+        self.aux_smooth.reset();
     }
 
     /// Run the detector and return the best person detection (score-thresholded,
@@ -324,6 +372,10 @@ impl BlazePose {
     pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Option<Pose>, Error> {
         match self.detect_full(rgb, w, h)? {
             Some((pose, a0, a1)) => {
+                // One-shot = a fresh acquisition: restart the smoothing
+                // banks (their first sample passes through unchanged).
+                self.reset_smoothing();
+                let (pose, a0, a1) = self.smooth_tracked(pose, a0, a1);
                 self.last_aux = Some((a0, a1));
                 Ok(Some(pose))
             }
@@ -346,14 +398,18 @@ impl BlazePose {
                 self.run_landmarks(rgb, w, h, center, box_size, angle)?
             {
                 if pose.presence >= TRACK_MIN_PRESENCE {
+                    let (pose, na0, na1) = self.smooth_tracked(pose, na0, na1);
                     self.last_aux = Some((na0, na1));
                     return Ok(Some(pose));
                 }
             }
         }
-        // No track yet, or tracking lost → re-acquire with the detector.
+        // No track yet, or tracking lost → re-acquire with the detector,
+        // restarting the smoothing banks on the fresh subject.
         match self.detect_full(rgb, w, h)? {
             Some((pose, a0, a1)) => {
+                self.reset_smoothing();
+                let (pose, a0, a1) = self.smooth_tracked(pose, a0, a1);
                 self.last_aux = Some((a0, a1));
                 Ok(Some(pose))
             }
