@@ -50,8 +50,53 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
+  # The ONNX models are platform-agnostic: fetch them ONCE here and fan
+  # them out to the whole matrix as a workflow artifact, instead of four
+  # parallel fresh checkouts each hitting Hugging Face (2 files × 4
+  # targets = 8 downloads — which is exactly how the v0.0.27-preview
+  # Windows leg got HTTP 429'd). blazepose's build.rs skips the download
+  # when the files are already present, and keeps its own retry/backoff
+  # as the fallback for local builds.
+  fetch-models:
+    name: Fetch ONNX models (shared)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Single source of truth for names/URLs: blazepose's build.rs.
+      - name: Download models with retry/backoff
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re, time, urllib.request
+
+          src = pathlib.Path("crates/blazepose/build.rs").read_text()
+          pairs = re.findall(r'\("([^"]+\.onnx)",\s*"(https://[^"]+)"\)', src, re.S)
+          assert pairs, "no model (name, url) pairs found in build.rs"
+          out = pathlib.Path("crates/blazepose/models")
+          out.mkdir(parents=True, exist_ok=True)
+          for name, url in pairs:
+              for wait in (0, 10, 30, 60):
+                  time.sleep(wait)
+                  try:
+                      urllib.request.urlretrieve(url, out / name)
+                      print(f"ok: {name} ({(out / name).stat().st_size} bytes)")
+                      break
+                  except Exception as e:  # noqa: BLE001 — retry everything
+                      print(f"retry {name}: {e}")
+              else:
+                  raise SystemExit(f"failed to download {name}")
+          EOF
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnx-models
+          path: crates/blazepose/models/
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: Build ${{ matrix.suffix }}
+    needs: fetch-models
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -256,6 +301,14 @@ jobs:
           echo "PKG_CONFIG_PATH=${installed}/lib/pkgconfig" >> $GITHUB_ENV
 
       # ---------- Build ----------
+
+      # Pre-seed the ONNX models fetched once by `fetch-models` —
+      # blazepose's build.rs sees them and skips its own download.
+      - name: Restore shared ONNX models
+        uses: actions/download-artifact@v8
+        with:
+          name: onnx-models
+          path: crates/blazepose/models
 
       - name: Build plugin (cargo)
         shell: bash
