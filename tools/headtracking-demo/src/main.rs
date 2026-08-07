@@ -4333,7 +4333,7 @@ impl App {
             // with no camera and no need to move — switch to Live on the cab.
             parallax_eye_mode: ParallaxEye::Live,
             parallax_eye: [0.0, 0.0, PX_DVIEW_MM],
-            parallax_gain: 0.5,
+            parallax_gain: 1.0,
             table_incl_deg: DEFAULT_TABLE_INCL_DEG,
             // Y flipped by default: Kinect Y points down, the eye's Y is up.
             // Z inverted so moving closer (head depth shrinks) pulls the eye
