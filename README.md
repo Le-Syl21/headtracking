@@ -74,6 +74,28 @@ deprojects into real millimetres and drives the table's point of view.
 The auto-calibration toolkit — draw a few lines on cabinet photos, get an ONNX
 model — lives in **[`tools/anchor/`](tools/anchor/)** with its own guide.
 
+## 🎥 Which camera? Grab a second-hand Kinect v2
+
+Every backend works, but the sweet spot is a used **Kinect v2 (Xbox One)** —
+and it's absurdly cheap since Microsoft discontinued it:
+
+- **From ~€20** on leboncoin / eBay / your local classifieds — there are tons
+  of listings.
+- It tracks on its **infrared stream**: the sensor lights the scene itself,
+  so you get full 30 fps in a pitch-dark game room where a webcam struggles.
+- Real **depth sensor** → your head distance is *measured* in millimetres,
+  not estimated.
+- ⚠️ Budget for the **Kinect Adapter** (power + USB 3.0,
+  [~€29 new](https://amzn.eu/d/08mV466T)) unless the listing includes it —
+  check before buying. Total ~€50 all-in.
+- Plug it into a **dedicated USB 3.0 port** on the motherboard's back panel
+  (it won't enumerate behind a shared hub).
+
+The **Kinect v1** (Xbox 360) is even cheaper and field-tested too — lower
+resolution but perfectly usable. And a plain **webcam** costs nothing if you
+already have one: auto-calibration recovers real 3D from it (that's the whole
+point of this project) — the Kinect's IR just wins in a dark cabinet.
+
 ## 🚧 Status — honestly
 
 This is **early development**, released as **beta**. It builds for Linux,
@@ -280,6 +302,19 @@ devant le cab** sont les plus rares et les plus précieux.
 - **Zéro install côté utilisateur** — un seul binaire plugin, aucun SDK
   Microsoft, tout est lié statiquement.
 - **100 % Rust**, Linux · Windows · macOS.
+
+**🎥 Quelle caméra ? Une Kinect v2 d'occasion.** Tous les backends marchent,
+mais le meilleur rapport qualité/prix est une **Kinect v2 (Xbox One)**
+d'occasion — **dès ~20 €** sur leboncoin / eBay (les annonces pullulent
+depuis l'arrêt par Microsoft). Elle tracke sur son **flux infrarouge** (le
+capteur éclaire lui-même la scène : 30 fps plein pot dans un game room
+noir) et son **capteur de profondeur** mesure la distance de tête en vrais
+millimètres. ⚠️ Prévoir l'**adaptateur Kinect** (alim + USB 3.0,
+[~29 € neuf](https://amzn.eu/d/08mV466T)) si l'annonce ne l'inclut pas —
+vérifiez avant d'acheter. ~50 € tout compris, port **USB 3.0 dédié**
+obligatoire. La Kinect v1 (encore moins chère) et une simple webcam
+marchent aussi — l'auto-calibration reconstruit la 3D depuis la webcam,
+c'est tout l'objet du projet.
 
 **État :** début de développement, publié en **beta**. Ça compile pour Linux,
 Windows et macOS, et la chaîne complète — caméra → auto-calibration → POV

@@ -4,6 +4,16 @@
 > rules) and build-from-source notes. The [main README](../README.md) has
 > the overview; this is the reference.
 
+### Recommended camera
+
+Best experience: a second-hand **Kinect v2 (Xbox One)** — from ~€20 on
+leboncoin / eBay, plus the **Kinect Adapter** (power + USB 3.0,
+[~€29 new](https://amzn.eu/d/08mV466T)) if the listing doesn't include it.
+It tracks on its own infrared illumination (full 30 fps in a dark game
+room) and measures head distance with its depth sensor. Needs a dedicated
+USB 3.0 port (see the [bandwidth note](#v2-needs-usb-30-root-port-bandwidth)).
+Kinect v1 and plain webcams are fully supported too.
+
 ### Install the plugin
 
 Grab the binary for your OS from the
@@ -330,6 +340,16 @@ macOS, and Windows.
 
 
 ---
+
+### Caméra recommandée
+
+La meilleure expérience : une **Kinect v2 (Xbox One) d'occasion** — dès
+~20 € sur leboncoin / eBay, plus l'**adaptateur Kinect** (alim + USB 3.0,
+[~29 € neuf](https://amzn.eu/d/08mV466T)) si l'annonce ne l'inclut pas.
+Elle tracke sous son propre éclairage infrarouge (30 fps dans un game room
+noir) et mesure la distance de tête avec son capteur de profondeur. Port
+USB 3.0 dédié obligatoire (voir la note bande passante plus bas). La
+Kinect v1 et les simples webcams sont aussi pleinement supportées.
 
 ### Installation du plugin
 
