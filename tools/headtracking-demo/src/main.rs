@@ -2440,9 +2440,6 @@ struct Active {
     /// locked) — gates the camera-pose read-out so we only show a settled
     /// estimate, not the warmup's churn.
     anchor_locked: bool,
-    /// The geometry came from `anchor_fixed.json` (hand-placed lines), not the
-    /// model — the UI tag says so.
-    anchor_fixed: bool,
     /// Latest RGB888 frame (width, height, bytes) — kept so the "Screenshot" /
     /// "Share a capture" buttons can write it without re-grabbing. `Arc` so
     /// copying it out of the published frame is a refcount bump, not a memcpy.
@@ -2499,7 +2496,6 @@ impl Active {
             last_lockbar: None,
             last_anchor: None,
             anchor_locked: false,
-            anchor_fixed: false,
             last_rgb_frame: None,
             last_depth: None,
             last_depth_color: None,
@@ -2604,9 +2600,6 @@ struct Capture {
     pose_src: (u32, u32),
     head_ms: f32,
     anchor_ms: f32,
-    /// The anchor geometry came from `anchor_fixed.json` (hand-placed lines)
-    /// instead of the model — the worker is pre-locked and never runs.
-    anchor_fixed: bool,
 }
 
 impl Capture {
@@ -2629,62 +2622,6 @@ impl Capture {
             derivative_cutoff_hz: 1.0,
         };
         self.pose_filter.set_params_per_axis([xy, xy, z]);
-    }
-
-    /// Colour-stream dimensions of this backend — known at open time (the
-    /// Kinect colour formats are fixed; the webcam reports its negotiated
-    /// mode), so the hand-fixed calibration can be validated before the
-    /// first frame arrives.
-    fn stream_dims(&self) -> (u32, u32) {
-        match &self.inner {
-            Inner::KinectV2 { .. } => (1920, 1080),
-            Inner::KinectV1 { .. } => (640, 480),
-            Inner::Webcam { camera } => (camera.width(), camera.height()),
-        }
-    }
-
-    /// Hand-fixed calibration: if `anchor_fixed.json` (next to the binary)
-    /// carries an entry for this backend whose dimensions match the actual
-    /// colour stream, build the geometry from the hand-placed lines, pre-set
-    /// it, and lock the anchor worker so the (still weak) model never runs.
-    /// Any mismatch or parse problem falls back to the live model with a
-    /// precise warning — the demo must never lose its anchor over a bad file.
-    fn apply_fixed_anchor(&mut self) {
-        let slug = backend_slug(self.backend);
-        let Some(entry) = load_fixed_anchor(&slug) else {
-            return; // no file / no entry — live model path, logged by caller
-        };
-        let (w, h) = self.stream_dims();
-        if (entry.img_w, entry.img_h) != (w, h) {
-            warn!(
-                slug,
-                file_dims = format!("{}x{}", entry.img_w, entry.img_h),
-                stream_dims = format!("{w}x{h}"),
-                "anchor_fixed.json entry ignored: annotated dimensions don't \
-                 match the live stream — falling back to the anchor model"
-            );
-            return;
-        }
-        let [sideleft, sideright, lockbar_player, lockbar_screen] = entry.lines;
-        match anchor::geometry_from_lines(sideleft, sideright, lockbar_player, lockbar_screen, w, h)
-        {
-            Some(g) => {
-                self.last_anchor = Some(g);
-                self.last_lockbar = Some(anchor_to_quad(&g, w, h));
-                self.anchor_fixed = true;
-                self.anchor_worker.force_lock();
-                info!(
-                    slug,
-                    "anchor: hand-fixed calibration loaded from anchor_fixed.json \
-                     — model will not run"
-                );
-            }
-            None => warn!(
-                slug,
-                "anchor_fixed.json entry ignored: degenerate lines (a rail is \
-                 parallel to the lockbar) — falling back to the anchor model"
-            ),
-        }
     }
 
     /// Poll the device once. Runs BlazePose + the anchor model, deprojects the
@@ -3022,7 +2959,6 @@ impl Capture {
             anchor_ms: self.anchor_ms,
             reg_ms: self.reg_ms,
             anchor_locked: self.anchor_worker.is_locked(),
-            anchor_fixed: self.anchor_fixed,
         }
     }
 }
@@ -3136,7 +3072,6 @@ struct LatestFrame {
     /// when it isn't running.
     reg_ms: f32,
     anchor_locked: bool,
-    anchor_fixed: bool,
 }
 
 /// Device I/O the GL thread asks the capture thread to run (things outside the
@@ -3286,12 +3221,10 @@ fn capture_thread_loop(
             return;
         }
     };
-    // Hand-fixed calibration (anchor_fixed.json): applied per open, so the
-    // file can be added/edited between backend switches without a restart.
-    cap.apply_fixed_anchor();
-    if !cap.anchor_fixed {
-        info!(?backend, "anchor: live model path (no fixed calibration)");
-    }
+    // Always the live anchor model — hand-fixed calibration files are gone
+    // on purpose: when the model is wrong, we want to SEE it, not paper
+    // over it with hand-placed lines.
+    info!(?backend, "anchor: live model path");
     // Confirm the stream actually flows before going live (Kinect v1 can open
     // yet never deliver a frame until the stream is bounced) — same recovery as
     // the old `SwitchState::Waiting`, but on this thread so the UI never blocks.
@@ -3639,17 +3572,6 @@ impl AnchorWorker {
         self.locked.load(Ordering::Acquire)
     }
 
-    /// Hand-fixed calibration: lock immediately so the model never runs (the
-    /// caller pre-sets the geometry from `anchor_fixed.json`). Called right
-    /// after spawn — the worker loop checks the flag before loading the ONNX
-    /// session, so in the common case the model is never even built (CPU and
-    /// memory saved); if the load already started, the worker just parks
-    /// unused, which is equally correct.
-    fn force_lock(&self) {
-        self.locked.store(true, Ordering::Release);
-        self.job.1.notify_one();
-    }
-
     fn submit(&self, rgb888: Arc<Vec<u8>>, w: u32, h: u32) {
         *self.job.0.lock() = Some(HeadJob { rgb888, w, h });
         self.job.1.notify_one();
@@ -3676,15 +3598,6 @@ fn anchor_worker_loop(
     stop: &Arc<AtomicBool>,
     locked: &Arc<AtomicBool>,
 ) {
-    // Hand-fixed calibration (`anchor_fixed.json`): the lock is set before the
-    // first frame, so skip the ONNX session build entirely — the model would
-    // never be submitted anyway. Best-effort (see `AnchorWorker::force_lock`).
-    if locked.load(Ordering::Acquire) {
-        while !stop.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        return;
-    }
     let mut det = match anchor::AnchorDetector::new() {
         Ok(d) => d,
         Err(e) => {
@@ -4733,7 +4646,6 @@ impl App {
             }
             active.metrics.note_reg_ms(frame.reg_ms);
             active.anchor_locked = frame.anchor_locked;
-            active.anchor_fixed = frame.anchor_fixed;
             if frame.anchor_locked {
                 active.metrics.note_anchor_locked();
             } else if frame.anchor_ms > 0.0 {
@@ -6001,22 +5913,13 @@ impl App {
         let dx = head.x_mm - lb.x;
         let dy = head.y_mm - lb.y;
         let dz = head.depth_mm - lb.z;
-        // We only reach here with a live lockbar quad. The tag says where the
-        // calibration came from: hand-placed lines (`anchor_fixed.json`) in
-        // light blue, or the live model's locked detection in light green.
-        let (tag, color, hover) = if active.anchor_fixed {
-            (
-                "anchor pinned",
-                Color32::LIGHT_BLUE,
-                "Manual calibration (anchor_fixed.json) — the model is not running.",
-            )
-        } else {
-            (
-                "anchor live",
-                Color32::LIGHT_GREEN,
-                "Calibration detected by the anchor model.",
-            )
-        };
+        // We only reach here with a live lockbar quad — always the model's
+        // own detection (hand-fixed calibration files are gone on purpose).
+        let (tag, color, hover) = (
+            "anchor live",
+            Color32::LIGHT_GREEN,
+            "Calibration detected by the anchor model.",
+        );
         ui.label(
             RichText::new(format!(
                 "→ VPX   ΔX {dx:+.0}   ΔY {dy:+.0}   ΔZ {dz:+.0} mm   [{tag}]"
@@ -6255,7 +6158,8 @@ fn draw_overlay<C: OverlayCanvas>(
     const GREEN: [u8; 3] = [60, 230, 90];
     const CYAN: [u8; 3] = [0, 210, 255];
     const YELLOW: [u8; 3] = [255, 225, 25];
-    let _ = fh;
+    const MAGENTA: [u8; 3] = [255, 60, 220];
+    let _ = (fw, fh);
     if let Some(p) = pose {
         use blazepose::idx::{
             LEFT_ELBOW, LEFT_SHOULDER, LEFT_WRIST, NOSE, RIGHT_ELBOW, RIGHT_SHOULDER, RIGHT_WRIST,
@@ -6272,6 +6176,11 @@ fn draw_overlay<C: OverlayCanvas>(
         ] {
             c.stroke(g(a), g(b), BONE, 2.0);
         }
+        // The actual POV point — the glabella (between the eyes, pushed
+        // toward the brow), NOT the nose. The skeleton bones converge on
+        // the nose, which used to be mistaken for the tracked point; this
+        // marker shows what really drives the camera.
+        c.disc(head_center_xy(p), 5.0, MAGENTA);
     }
     if let Some(geo) = anchor {
         let cr = geo.corners;
@@ -6286,13 +6195,12 @@ fn draw_overlay<C: OverlayCanvas>(
                 c.dashed(sb.0, vp, CYAN);
             }
         }
+        // The lockbar centre IS the intersection of the quad's diagonals
+        // (the perspective-correct image of the rectangle's centre) — draw
+        // the diagonals themselves so the construction is visible.
+        c.stroke(cr[0], cr[2], YELLOW, 1.0);
+        c.stroke(cr[1], cr[3], YELLOW, 1.0);
         c.disc(geo.lockbar_center, 4.0, GREEN);
-        c.stroke(
-            (fw as f32 * 0.5, geo.lockbar_center.1),
-            geo.lockbar_center,
-            YELLOW,
-            2.0,
-        );
         let vp_txt = geo
             .depth_vp
             .map_or_else(|| "inf".to_string(), |(x, y)| format!("({x:.0},{y:.0})"));
@@ -6379,74 +6287,7 @@ fn new_capture(backend: Backend, intrinsics: Intrinsics, inner: Inner) -> Captur
         pose_src: (0, 0),
         head_ms: 0.0,
         anchor_ms: 0.0,
-        anchor_fixed: false,
     }
-}
-
-/// One backend's entry in `anchor_fixed.json`: the annotated frame dimensions
-/// plus the four hand-placed lines, in the order
-/// `[sideleft, sideright, lockbar_player, lockbar_screen]`.
-struct FixedAnchorEntry {
-    img_w: u32,
-    img_h: u32,
-    lines: [anchor::LineSeg; 4],
-}
-
-/// Read the optional hand-fixed calibration for `slug` from
-/// `anchor_fixed.json` next to the binary (same location policy as
-/// `contributions/`). Generated by `tools/anchor/lines_to_fixed.py` from the
-/// annotator's output.
-///
-/// Key matching: exact backend slug first (`kinect-v2`, `kinect-v1`); webcams
-/// then fall back to the plain `webcam` key, because the SDL index in
-/// `webcam-<N>` shifts with the USB enumeration order and must not invalidate
-/// the calibration.
-fn load_fixed_anchor(slug: &str) -> Option<FixedAnchorEntry> {
-    let path = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .join("anchor_fixed.json");
-    let text = std::fs::read_to_string(&path).ok()?; // absent file = feature off
-    let root: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, "anchor_fixed.json unreadable: {e}");
-            return None;
-        }
-    };
-    let entry = root.get(slug).or_else(|| {
-        slug.starts_with("webcam")
-            .then(|| root.get("webcam"))
-            .flatten()
-    })?;
-    let dim = |k: &str| entry.get(k).and_then(serde_json::Value::as_u64);
-    let (Some(img_w), Some(img_h)) = (dim("img_w"), dim("img_h")) else {
-        warn!(slug, "anchor_fixed.json entry missing img_w/img_h");
-        return None;
-    };
-    // One line = [[x1, y1], [x2, y2]].
-    let seg = |name: &str| -> Option<anchor::LineSeg> {
-        let l = entry.get("lines")?.get(name)?;
-        let p =
-            |i: usize, j: usize| -> Option<f32> { l.get(i)?.get(j)?.as_f64().map(|v| v as f32) };
-        Some([[p(0, 0)?, p(0, 1)?], [p(1, 0)?, p(1, 1)?]])
-    };
-    let names = ["sideleft", "sideright", "lockbar_player", "lockbar_screen"];
-    let mut lines = [[[0.0f32; 2]; 2]; 4];
-    for (slot, name) in lines.iter_mut().zip(names) {
-        match seg(name) {
-            Some(s) => *slot = s,
-            None => {
-                warn!(slug, name, "anchor_fixed.json entry missing/malformed line");
-                return None;
-            }
-        }
-    }
-    Some(FixedAnchorEntry {
-        img_w: img_w as u32,
-        img_h: img_h as u32,
-        lines,
-    })
 }
 
 fn open_kinect_v2() -> Result<Capture, String> {
