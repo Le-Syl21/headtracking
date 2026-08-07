@@ -44,7 +44,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # Same ort-download-cache pairing as release.yml: the target dir's
+      # ort-sys fingerprint replays a link-search into this dir, so both
+      # must live and die together in the cache.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-directories: ~/.cache/ort.pyke.io
 
       - name: Install build deps
         run: |
