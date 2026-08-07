@@ -20,9 +20,11 @@ picking a camera and a mounting spot.
 
 Two extra constraints that apply to every camera:
 
-- **The pipeline gates head distance to 0.5–2.5 m.** A head detected
-  closer than 50 cm is rejected as implausible, even if the sensor
-  returned something.
+- **On the Kinects, the pipeline gates depth samples to 0.5–2.5 m** —
+  this is background rejection (it keeps the wall behind you out of the
+  head-distance median), and its floor sits at/below the sensors' own
+  hardware floors anyway. The **webcam path has no software floor**: its
+  shoulder-width triangulation works as close as the framing allows.
 - **The pose model is a body detector, not a face detector.** When the
   camera is so close that it only sees a face without shoulders, tracking
   degrades and eventually drops. Whatever the sensor: the player's bust
@@ -72,9 +74,12 @@ savoir avant de choisir la caméra et son emplacement.
 
 Deux contraintes supplémentaires valables pour toutes les caméras :
 
-- **Le pipeline limite la distance de tête à 0,5–2,5 m.** Une tête
-  détectée à moins de 50 cm est rejetée comme implausible, même si le
-  capteur renvoyait quelque chose.
+- **Sur les Kinect, le pipeline filtre les échantillons de profondeur
+  à 0,5–2,5 m** — c'est du rejet de fond (ça tient le mur derrière vous
+  hors de la médiane de distance de tête), et son plancher est au niveau
+  ou sous les planchers matériels des capteurs de toute façon. Le
+  **chemin webcam n'a aucun plancher logiciel** : sa triangulation par
+  largeur d'épaules fonctionne d'aussi près que le cadrage le permet.
 - **Le modèle de pose détecte un corps, pas un visage.** Quand la caméra
   est si proche qu'elle ne voit qu'un visage sans épaules, le tracking se
   dégrade puis décroche. Quel que soit le capteur : le buste du joueur
