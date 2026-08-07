@@ -6,6 +6,23 @@ version: 2
 # reçoit plus les correctifs automatiquement — c'est le rôle de Dependabot, qui
 # sait mettre à jour un SHA épinglé et garder le commentaire de version à jour.
 updates:
+  # Crates : une PR groupée mensuelle pour les bumps semver-compatibles du
+  # lockfile + les retards de version majeure des deps directes. Les pins
+  # volontaires (ort en =rc épinglé tant que la 2.0 finale n'est pas là)
+  # sont exclus.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      crates:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+    ignore:
+      - dependency-name: ort
+      - dependency-name: ort-sys
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
