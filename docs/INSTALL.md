@@ -104,6 +104,19 @@ VPX scans `plugins/<id>/plugin.cfg` to discover plugins.
      stable pose is captured as the neutral baseline
      (`BaselineOffsetX/Y/Z` nudges it afterwards without recapturing).
 
+
+> [!WARNING]
+> **Measure those two values — don't guess them.** The plugin trusts your
+> **lockbar width** and **screen inclination** blindly:
+> - a wrong lockbar width scales *every* distance (head position, camera
+>   pose) by the same error — the parallax will feel too strong or too
+>   weak everywhere;
+> - a missing/wrong inclination mixes *up/down* with *closer/farther* —
+>   the view drifts diagonally when you move and it "feels wrong" with no
+>   obvious cause.
+>
+> If tracking feels weird, check these two numbers before anything else.
+
 5. On game start the plugin pushes an on-screen notification with the
    detected camera and the calibration state, and the VPX log gets
    `HeadTracking` lines (camera enumeration, backend, anchor detection).
@@ -462,6 +475,21 @@ dossier — VPX scanne `plugins/<id>/plugin.cfg` pour découvrir les plugins.
    * Se placer en position de jeu normale au chargement de la table — la
      première pose stable est capturée comme baseline neutre
      (`BaselineOffsetX/Y/Z` l'ajuste ensuite sans recapturer).
+
+
+> [!WARNING]
+> **Mesurez ces deux valeurs — ne les devinez pas.** Le plugin fait une
+> confiance aveugle à votre **largeur de lockbar** et à votre
+> **inclinaison d'écran** :
+> - une largeur de lockbar fausse met *toutes* les distances à la même
+>   erreur d'échelle (position de tête, pose caméra) — la parallaxe
+>   paraîtra partout trop forte ou trop faible ;
+> - une inclinaison absente ou fausse mélange le *haut/bas* avec le
+>   *proche/loin* — la vue dérive en diagonale quand vous bougez, et « ça
+>   fait bizarre » sans cause évidente.
+>
+> Si le tracking semble étrange, vérifiez ces deux nombres avant toute
+> autre chose.
 
 5. Au lancement de la partie, le plugin affiche une notification à l'écran
    avec la caméra détectée et l'état de calibration, et le log VPX reçoit
