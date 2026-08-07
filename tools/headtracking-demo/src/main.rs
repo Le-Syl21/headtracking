@@ -1243,6 +1243,19 @@ impl winit::application::ApplicationHandler for DemoShell {
                     .with_scale(1.4),
             ),
         );
+        // Remote UI inspection (egui_mcp & friends), opt-in via the standard
+        // EGUI_INSPECTION env var. Registered AFTER the rotation plugin —
+        // that ordering is a contract (see egui-rotate's inspection docs):
+        // injected logical-space events must bypass the physical→logical
+        // rotation that real window events go through.
+        match egui_rotate::attach_inspection_from_env(
+            &self.egui_ctx,
+            Some("headtracking-demo".into()),
+        ) {
+            Ok(true) => info!("egui inspection server attached (EGUI_INSPECTION)"),
+            Ok(false) => {}
+            Err(e) => warn!("egui inspection attach failed: {e}"),
+        }
 
         self.gl_window = Some(gl_window);
         self.gl = Some(gl);
@@ -1924,6 +1937,11 @@ const KINECT_ACCESS_OK_NOTE: &str = "";
 /// dropdown signal is therefore unreliable; `kinect_present_but_not_set_up`
 /// is the only authoritative source.
 fn compute_kinect_access_hint() -> bool {
+    // UI debug hook (same family as HT_FAKE_CAMS): force the banner without
+    // any hardware, to eyeball its rendering after layout reworks.
+    if std::env::var_os("HT_FORCE_ACCESS_HINT").is_some_and(|v| v != "0") {
+        return true;
+    }
     if !kinect_present_but_not_set_up() {
         return false;
     }
@@ -2035,13 +2053,28 @@ fn kinect_present_but_not_set_up() -> bool {
     use std::process::Command;
 
     // PID lists: v1 = Camera/Audio/Motor across models 1414 & 1473/KfW;
-    // v2 = sensor 02C4, firmware-update 02D8, NuiSensor Adaptor 02D9.
+    // v2 = sensor 02C4. The firmware-update PID (02D8) and the NuiSensor
+    // Adaptor power hub (02D9) are deliberately NOT in the required set —
+    // they must never be WinUSB-bound, requiring them would make the
+    // banner permanent on a healthy setup.
+    //
+    // EVERY required function must be libusb-capable, not just one: a
+    // half-Zadig'd v1 (camera bound, motor not) enumerates in the
+    // dropdown but fails at open — that exact case must keep the banner
+    // up (field report 2026-08-07).
+    // Win32_PnPEntity via Get-WmiObject instead of Get-PnpDevice: the
+    // latter only exists on PowerShell 5.1+/Win 8.1+, while Get-WmiObject
+    // works on every `powershell.exe` ever shipped (it's only gone in
+    // pwsh 6+, which we never invoke) — and the population still running
+    // Kinect-SDK-1.8-era hardware skews old. A probe that errors out
+    // silently shows no banner at all (field report 2026-08-07).
     const SCRIPT: &str = "\
-        $ms = 'VID_045E&PID_(02AE|02BF|02AD|02BE|02B0|02C2|02C4|02D8|02D9)'; \
-        $d = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | \
-               Where-Object { $_.InstanceId -match $ms }); \
-        $drv = @($d | Where-Object { $_.Service -in 'WinUSB','WinUsb','libusbK','libusb0' }); \
-        Write-Output (\"present={0} winusb={1}\" -f $d.Count, $drv.Count)";
+        $req = 'VID_045E&PID_(02AE|02BF|02AD|02BE|02B0|02C2|02C4)'; \
+        $ok = @('WinUSB','WinUsb','libusbK','libusb0'); \
+        $d = @(Get-WmiObject Win32_PnPEntity -ErrorAction SilentlyContinue | \
+               Where-Object { $_.DeviceID -match $req }); \
+        $bad = @($d | Where-Object { $ok -notcontains $_.Service }); \
+        Write-Output (\"present={0} missing={1}\" -f $d.Count, $bad.Count)";
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let out = Command::new("powershell")
@@ -2060,8 +2093,26 @@ fn kinect_present_but_not_set_up() -> bool {
             .unwrap_or(0)
     };
     let present = field("present=");
-    let winusb = field("winusb=");
-    present > 0 && winusb == 0
+    let missing = field("missing=");
+    // Always log what the probe saw — "no banner" support cases are
+    // undiagnosable otherwise. present=0 usually means the Kinect isn't
+    // on the USB bus at all (a v2 without its powered adapter is
+    // completely invisible, not even an unknown device).
+    info!(
+        present,
+        missing,
+        "windows Kinect driver probe (present=0 → nothing on the USB bus: \
+         check the v2 power adapter and use a rear USB 3.0 port; \
+         missing>0 → that many Kinect functions still lack WinUSB)"
+    );
+    if !out.status.success() {
+        warn!(
+            "Kinect driver probe exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    present > 0 && missing > 0
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -2175,12 +2226,18 @@ fn fix_kinect_access() -> Result<(), String> {
     // We use this trampoline instead of a direct Win32 ShellExecuteW
     // call to keep the dependency tree std-only — the price is one
     // ephemeral PowerShell process (~100 ms) before UAC fires.
+    // Quoting matters twice here: the paths sit inside PowerShell
+    // single-quoted strings (escape ' as ''), and `Start-Process` joins
+    // -ArgumentList items with spaces WITHOUT quoting — so the -File path
+    // must carry its own embedded double quotes or an extraction dir like
+    // `C:\Users\Jean Dupont\Downloads` breaks the elevated launch.
+    let ps_quote = |p: &std::path::Path| p.display().to_string().replace('\'', "''");
     let inner = format!(
         "$ErrorActionPreference='Stop'; Start-Process powershell -Verb RunAs \
          -WorkingDirectory '{workdir}' \
-         -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{script}'",
-        workdir = workdir.display(),
-        script = script.display(),
+         -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{script}\"'",
+        workdir = ps_quote(workdir),
+        script = ps_quote(script),
     );
     let status = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &inner])
@@ -2248,6 +2305,10 @@ struct App {
     /// `Err` carries a fallback hint (manual command line / "re-download
     /// the release ZIP"). Cleared on rescan.
     kinect_access_result: Option<Result<String, String>>,
+    /// Next time the access probe re-runs while the fix banner is up, so a
+    /// finished driver install (button OR manual setup.ps1) triggers an
+    /// automatic rescan — nobody reads "click rescan" notes mid-install.
+    kinect_access_recheck_at: Option<Instant>,
     /// Outcome of the last "Screenshot" click — kept until the next click
     /// (or backend change) so the user has time to read the saved path.
     /// `Ok` carries the full saved path, `Err` carries the failure reason.
@@ -4305,6 +4366,7 @@ impl App {
             logs,
             kinect_access_hint,
             kinect_access_result: None,
+            kinect_access_recheck_at: None,
             screenshot_status: None,
             // "270°" in the player's frame = egui-rotate CW90 once applied
             // (the rotated pincab screen inverts the apparent direction;
@@ -4896,6 +4958,24 @@ impl App {
         // for the bits that still need one (texture upload in `poll`).
         let egui_ctx = ui.ctx().clone();
         self.ensure_active();
+        // While the access banner is up, re-probe every few seconds and
+        // rescan automatically once the drivers are in place — whether they
+        // came from our button or from a manually-run setup.ps1.
+        if self.kinect_access_hint {
+            let due = self.kinect_access_recheck_at.is_none_or(|t| Instant::now() >= t);
+            if due {
+                self.kinect_access_recheck_at =
+                    Some(Instant::now() + Duration::from_secs(5));
+                if !compute_kinect_access_hint() {
+                    info!("Kinect access fixed — rescanning automatically");
+                    self.refresh_available();
+                    self.kinect_access_result =
+                        Some(Ok("drivers detected — device list rescanned automatically".into()));
+                }
+            }
+        } else {
+            self.kinect_access_recheck_at = None;
+        }
         self.poll(&egui_ctx);
         if self.parallax_enabled {
             self.update_parallax_eye(&egui_ctx);
@@ -6014,14 +6094,8 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
     );
 }
 
-/// Draw the BlazePose skeleton (bones + joints) over the camera view. The 33
-/// landmarks are in frame pixels; `src` is the texture size they map onto.
-/// The anchor calibration model was trained on this many hand-annotated cabinet
-/// images. **Bump it after every retrain** — the contribution banner reads it.
-const MODEL_TRAINING_IMAGES: usize = 3;
-
-/// Red-edged banner under the main menu: the calibration model is still trained
-/// on very few images, so we ask hard for contributions. Bold, centred.
+/// Red-edged banner under the main menu: the calibration model has only seen
+/// a handful of cabinets, so we ask hard for contributions. Bold, centred.
 fn contribution_banner(ui: &mut egui::Ui) {
     let red = Color32::from_rgb(0xD3, 0x2F, 0x2F);
     egui::Frame::group(ui.style())
@@ -6030,11 +6104,11 @@ fn contribution_banner(ui: &mut egui::Ui) {
             ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| {
                 ui.label(
-                    RichText::new(format!(
-                        "⚠  Le modèle de calibration n'a tourné que sur \
-                         {MODEL_TRAINING_IMAGES} images — on a vraiment besoin \
-                         d'un MAXIMUM de contributions.  🎁"
-                    ))
+                    RichText::new(
+                        "⚠  The auto-calibration model has only seen a \
+                         handful of cabinets — it needs YOUR captures to \
+                         learn.  🎁 Contribute!",
+                    )
                     .strong()
                     .color(red),
                 );
