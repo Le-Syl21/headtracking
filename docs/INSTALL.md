@@ -19,7 +19,8 @@ screws are collected in a ready-made
 [Amazon "Headtracking" list](https://www.amazon.fr/hz/wishlist/ls/ZFKFTI03HIJ3) and ship with Prime for the
 impatient (and leboncoin hand-to-hand pickup can get you the sensor the
 same day). Kinect v1 and plain webcams are fully
-supported too.
+supported too. Building a **minicab**? See the dedicated
+[🇬🇧/🇫🇷 minicab notes](MINICAB.md) — the short distance changes the picks.
 
 
 > [!IMPORTANT]
@@ -374,7 +375,8 @@ et visserie sont regroupés dans une
 [liste Amazon « Headtracking »](https://www.amazon.fr/hz/wishlist/ls/ZFKFTI03HIJ3) toute prête, en Prime (livrés le
 lendemain pour les pressés) — et la remise en main propre leboncoin peut
 fournir le capteur dans la journée. La Kinect v1 et les simples webcams sont
-aussi pleinement supportées.
+aussi pleinement supportées. Vous montez un **minicab** ? Voir les
+[notes minicab 🇫🇷/🇬🇧](MINICAB.md) — la faible distance change les choix.
 
 
 > [!IMPORTANT]

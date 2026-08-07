@@ -118,6 +118,11 @@ resolution but perfectly usable. And a plain **webcam** costs nothing if you
 already have one: auto-calibration recovers real 3D from it (that's the whole
 point of this project) — the Kinect's IR just wins in a dark cabinet.
 
+Building a **minicab**? The short player-to-camera distance changes the
+picks — see the dedicated notes:
+[🇬🇧 Minicab notes](docs/MINICAB.md#-english) ·
+[🇫🇷 Notes minicab](docs/MINICAB.md#-français).
+
 ## 🚧 Status — honestly
 
 This is **early development**, released as **beta**. It builds for Linux,
@@ -356,6 +361,10 @@ webcam, c'est tout l'objet du projet.
 > USB 3.0. Donc avant d'accuser la caméra ou l'adaptateur : vérifiez
 > qu'elle est sur un **port USB 3.0 racine dédié** de la carte mère —
 > pas de hub, pas de port de façade, pas de rallonge douteuse.
+
+**Minicab ?** La faible distance joueur-caméra change les choix — voir les
+notes dédiées : [🇫🇷 Notes minicab](docs/MINICAB.md#-français) ·
+[🇬🇧 Minicab notes](docs/MINICAB.md#-english).
 
 **État :** début de développement, publié en **beta**. Ça compile pour Linux,
 Windows et macOS, et la chaîne complète — caméra → auto-calibration → POV
