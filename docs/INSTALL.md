@@ -251,12 +251,15 @@ That's it for both Kinect v1 and v2. Plug the Kinect, restart VPX.
 Prefer the terminal? Open an elevated PowerShell and run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File setup\setup.ps1
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File setup\setup.ps1
 ```
 
-(The `-ExecutionPolicy Bypass` matters — a fresh Windows defaults to
-`Restricted`/`RemoteSigned` and would otherwise refuse to run an
-unsigned local script.)
+(The script ships **Authenticode-signed** in release ZIPs, so
+`RemoteSigned` verifies the signature instead of bypassing policy — the
+first run may ask about the publisher, answer `A` (Always run). Unsigned
+**dev builds** downloaded from the Actions tab carry the Mark of the Web
+and will be refused: right-click the `.ps1` → Properties → Unblock, or
+use a release build.)
 
 What the script does, in order:
 
@@ -628,12 +631,16 @@ C'est tout, pour les deux Kinect v1 et v2. Brancher la Kinect, relancer VPX.
 Tu préfères le terminal ? Ouvrir un PowerShell administrateur et lancer :
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File setup\setup.ps1
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File setup\setup.ps1
 ```
 
-(Le `-ExecutionPolicy Bypass` est important — Windows neuf est par
-défaut en `Restricted`/`RemoteSigned` et refuserait sinon un script
-local non signé.)
+(Le script est **signé Authenticode** dans les ZIP de release :
+`RemoteSigned` vérifie la signature au lieu de contourner la politique —
+au premier lancement Windows peut demander de confirmer l'éditeur,
+répondre `A` (Toujours exécuter). Les **dev builds** non signées
+téléchargées depuis l'onglet Actions portent la marque du web et seront
+refusées : clic droit sur le `.ps1` → Propriétés → Débloquer, ou
+utiliser une release.)
 
 Ce que fait le script, dans l'ordre :
 

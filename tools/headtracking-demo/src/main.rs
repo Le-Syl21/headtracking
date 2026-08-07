@@ -2230,13 +2230,14 @@ fn fix_kinect_access() -> Result<(), String> {
 
     // Two-step trampoline: spawn a hidden, *non*-elevated PowerShell
     // whose only job is to call `Start-Process -Verb RunAs` on
-    // `powershell.exe -ExecutionPolicy Bypass -File setup.ps1`. The
+    // `powershell.exe -ExecutionPolicy RemoteSigned -File setup.ps1`. The
     // RunAs verb is what pops the UAC consent dialog; the spawned
     // elevated PowerShell opens its own visible console (we don't pass
     // `-WindowStyle Hidden`) so the user can read the script's output
-    // and the type-`yes` prompt. `-ExecutionPolicy Bypass` is required
-    // because a fresh Windows defaults to Restricted/RemoteSigned and
-    // would otherwise refuse our unsigned local script.
+    // and the type-`yes` prompt. `-ExecutionPolicy RemoteSigned` (not
+    // Bypass): release ZIPs ship setup.ps1 Authenticode-signed, so the
+    // policy VERIFIES the signature on Mark-of-the-Web files while
+    // still running local/dev builds (no MOTW, no signature needed).
     //
     // We use this trampoline instead of a direct Win32 ShellExecuteW
     // call to keep the dependency tree std-only — the price is one
@@ -2250,7 +2251,7 @@ fn fix_kinect_access() -> Result<(), String> {
     let inner = format!(
         "$ErrorActionPreference='Stop'; Start-Process powershell -Verb RunAs \
          -WorkingDirectory '{workdir}' \
-         -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{script}\"'",
+         -ArgumentList '-NoProfile','-ExecutionPolicy','RemoteSigned','-File','\"{script}\"'",
         workdir = ps_quote(workdir),
         script = ps_quote(script),
     );
@@ -2268,7 +2269,7 @@ fn fix_kinect_access() -> Result<(), String> {
     Err(format!(
         "launcher PowerShell exited with {status} (often = UAC cancelled, or PowerShell \
          missing). Open an elevated PowerShell yourself and run:\n\
-         powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+         powershell -NoProfile -ExecutionPolicy RemoteSigned -File \"{}\"",
         script.display()
     ))
 }

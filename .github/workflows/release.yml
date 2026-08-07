@@ -611,6 +611,18 @@ jobs:
           curl -fsSL https://github.com/Le-Syl21/ssign/releases/latest/download/ssign-linux-x86_64.tar.gz | tar xz
           sudo install -m755 ssign /usr/local/bin/ssign
 
+      # ssign's own signer covers PE only; every other Authenticode format
+      # (here: the PowerShell installer script) goes through its PKCS#11
+      # module + osslsigncode, per ssign's README. Pinned to the v0.1.4 tag.
+      - name: Build the ssign PKCS#11 module (script signing)
+        run: |
+          git clone --depth 1 --branch v0.1.4 https://github.com/Le-Syl21/ssign ssign-src
+          cargo build --manifest-path ssign-src/Cargo.toml -p ssign-pkcs11 --release
+          # osslsigncode's -ac wants PEM; ssign ships the Certum
+          # intermediate as DER.
+          openssl x509 -inform der -in ssign-src/ssign-core/src/certs/ccsca2021.der \
+            -out ccsca2021.pem
+
       - name: Resolve artifact name
         run: echo "ART=headtracking-${GITHUB_REF_NAME#v}-windows-x86_64" >> "$GITHUB_ENV"
 
@@ -654,6 +666,21 @@ jobs:
           for f in win/headtracking.dll win/headtracking-demo.exe; do
             verify_signature "$f"
           done
+
+          # The installer script is signed too (0.0.31+), so the launchers
+          # can enforce the signature (-ExecutionPolicy RemoteSigned)
+          # instead of bypassing policy. Same cloud key, via the PKCS#11
+          # module — osslsigncode knows the PowerShell SIP format.
+          osslsigncode sign \
+            -pkcs11module ssign-src/target/release/libssign_pkcs11.so \
+            -pkcs11cert 'pkcs11:type=cert' -key 'pkcs11:type=private' \
+            -ac ccsca2021.pem -h sha256 -t http://time.certum.pl/ \
+            -in win/setup/setup.ps1 -out win/setup/setup.ps1.signed
+          mv win/setup/setup.ps1.signed win/setup/setup.ps1
+          # Structural check: the SIP signature block must be appended.
+          # (`osslsigncode verify` output for scripts is best-effort only.)
+          grep -q "SIG # Begin signature block" win/setup/setup.ps1
+          osslsigncode verify win/setup/setup.ps1 || true
 
       - name: Re-upload the signed Windows artifact
         uses: actions/upload-artifact@v7
