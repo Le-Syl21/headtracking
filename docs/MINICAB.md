@@ -97,17 +97,19 @@ savoir avant de choisir la caméra et son emplacement.
 
 ### Astuces de montage et de configuration
 
-- **Monter haut, viser bas** : placer la caméra en haut du backbox (ou
-  au-dessus) et l'incliner vers le bas augmente la distance *oblique*
-  jusqu'à la tête du joueur — chaque centimètre compte face aux planchers
-  capteur ci-dessus.
-- **Mesurer et déclarer la vraie largeur de lockbar** (VPX → F12 →
-  Cabinet Settings) : celle d'un minicab est bien plus étroite que les
-  610 mm par défaut d'un widebody, et l'auto-calibration est ancrée sur
-  cette valeur.
-- Déclarer l'**inclinaison de l'écran**, comme sur un cab pleine taille.
-- L'ancre d'auto-calibration (lockbar + rails) fonctionne à toutes les
-  échelles de caisse — une caméra proche rend même l'ancre plus grosse et
-  plus facile à détecter. Envoyez un relevé (bouton 🎁 de la démo) : les
-  minicabs sont exactement le genre de géométrie que le modèle n'a jamais
-  vue.
+- **Montez la caméra haut et inclinez-la vers le bas** : placée en haut
+  du backbox (ou au-dessus), elle est plus loin de la tête du joueur —
+  et chaque centimètre gagné compte face aux distances minimales du
+  tableau.
+- **Mesurez votre lockbar et déclarez sa vraie largeur** (VPX → F12 →
+  Cabinet Settings) : sur un minicab elle est bien plus étroite que les
+  610 mm d'un flipper classique, et toute l'auto-calibration repose sur
+  cette mesure.
+- Déclarez aussi l'**inclinaison de l'écran**, comme sur un cab
+  classique.
+- Bonne nouvelle pour finir : la détection du cab (lockbar + rails)
+  marche quelle que soit la taille de la caisse — et de près, ces
+  repères occupent plus de place dans l'image, ce qui aide même le
+  modèle. Pensez au bouton **🎁 Contribute** de la démo : le modèle n'a
+  encore jamais vu de minicab, votre relevé lui apprendra cette
+  géométrie.
