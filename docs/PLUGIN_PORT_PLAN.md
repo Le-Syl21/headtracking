@@ -168,3 +168,13 @@ installer/diagnostic step** users run once before enabling the plugin:
   copy-paste; without them VPX fails silently as non-root.
 - Seeing yourself tracked in the demo = the plugin will work in VPX; the
   demo is also where captures are contributed and calibration verified.
+
+Distribution channels, from freshest to most stable:
+
+1. **Dev builds** — every `main` push uploads unsigned per-platform
+   artifacts on the workflow run (Actions tab, GitHub login required).
+2. **`-preview` tags** — the early-adopter channel: a real GitHub
+   pre-release with signed binaries and one obvious download link, no
+   Actions digging. PinReady should eventually offer installing the
+   plugin from this channel at VPX install time (TODO, PinReady side).
+3. **`-beta` / `-rc` / final tags** — the stable ladder.

@@ -680,7 +680,10 @@ jobs:
             release-assets/*.tar.gz
             release-assets/*.zip
           generate_release_notes: true
-          # Tags with -alpha / -beta / -rc suffix are flagged as
-          # pre-releases automatically.
-          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          # Tags with -alpha / -beta / -preview / -rc suffix are flagged
+          # as pre-releases automatically. `preview` is the early-adopter
+          # channel: a real GitHub Release (signed binaries, one obvious
+          # download link) without digging into Actions artifacts —
+          # PinReady is meant to offer these at install time eventually.
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') || contains(github.ref, '-preview') }}
           fail_on_unmatched_files: false

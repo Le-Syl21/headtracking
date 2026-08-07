@@ -21,7 +21,7 @@ repository = "https://github.com/Le-Syl21/headtracking"
 
 [package]
 name = "headtracking"
-version = "0.0.26"
+version = "0.0.27"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
