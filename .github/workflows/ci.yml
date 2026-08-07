@@ -1,8 +1,8 @@
 name: CI
 
-# Aucun build sur push `main` : le travail arrive en direct sur main, donc un
-# build par commit ne ferait que du bruit. Les gates tournent sur PR, sur tag
-# (avant toute signature/publication) et à la demande.
+# Les gates (fmt/clippy/tests) tournent sur PR et à la demande. Les builds
+# par commit sur `main` vivent dans `release.yml` (job `build` seul, artefacts
+# non signés sur le run Actions) — c'est le canal « dev builds » des testeurs.
 on:
   pull_request:
   workflow_dispatch:

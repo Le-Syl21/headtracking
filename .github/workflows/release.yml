@@ -1,9 +1,16 @@
 name: Release
 
-# Triggered when a `vX.Y.Z` (or `vX.Y.Z-suffix`) tag is pushed. Each
-# matrix target builds the cdylib (`headtracking`) + the standalone demo
-# (`headtracking-demo`), bundles them with `plugin.cfg` and `LICENSE`,
-# uploads as a GitHub Release artifact.
+# Triggered when a `vX.Y.Z` (or `vX.Y.Z-suffix`) tag is pushed, and on
+# every push to `main` (dev builds). Each matrix target builds the cdylib
+# (`headtracking`) + the standalone demo (`headtracking-demo`), bundles
+# them with `plugin.cfg` and `LICENSE`, uploads as a workflow artifact.
+#
+# On a tag, the artifacts are additionally signed (Windows/macOS, gated
+# behind the `signing` environment) and published as a GitHub Release.
+# On a `main` push, only the build matrix runs: the artifacts stay on the
+# workflow run (Actions tab, GitHub login required to download), UNSIGNED
+# — Windows SmartScreen / macOS Gatekeeper will warn. They're meant for
+# testers who want the freshest plugin+demo without waiting for a tag.
 #
 # Targets that don't build cleanly yet (e.g. cross-compiled aarch64
 # Linux, Windows MSVC w/ vendored cmake projects) are marked
@@ -13,6 +20,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*.*.*'
       - 'v*.*.*-*'
@@ -261,7 +270,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          # Tag push → the release version; main push / dispatch → a
+          # `dev-<shortsha>` marker so testers can tell dev builds apart.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-${GITHUB_SHA:0:7}"
+          fi
           stage="staging-${{ matrix.suffix }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/${{ matrix.plugin_lib }}" "$stage/"

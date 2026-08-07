@@ -6,7 +6,12 @@
 
 ### Install the plugin
 
-Grab the binary for your OS from the Releases page and drop it into VPX's
+Grab the binary for your OS from the
+[Releases page](https://github.com/Le-Syl21/headtracking/releases) — or, for
+the freshest build, from the artifacts of any `main`-branch run on the
+[Actions tab](https://github.com/Le-Syl21/headtracking/actions/workflows/release.yml)
+(every commit builds the plugin + demo for all platforms; dev builds are
+**unsigned** and need a GitHub login to download). Drop it into VPX's
 plugin folder:
 
 ```
@@ -22,45 +27,59 @@ VPX scans `plugins/<id>/plugin.cfg` to discover plugins.
 
 ### Enable & configure inside VPX
 
-1. Launch VPX once after copying the files. The plugin manager picks up the
-   new `plugin.cfg` automatically.
-2. Open **Preferences → Plugins**, find **Head Tracking** in the list, tick
-   **Enable**, then restart VPX. The plugin only loads on next start, not
-   live.
-3. The plugin's settings appear in the same dialog (one row per setting).
-   Under the hood they're persisted in `VPinballX.ini` under
-   `[Plugin.HeadTracking]` — you can also edit that file by hand:
+1. Launch VPX (10.8.1+) once after copying the files — the plugin manager
+   discovers the new `plugin.cfg` automatically.
+2. Load any table and press **F12** (Toggle In-Game UI) → **Plugin
+   Settings** → **Head Tracking**, then tick **Enable**. Quit and reload
+   the table: the tracker starts at game start.
+3. Every setting lives on that same F12 page and applies **live** while
+   you play — except **Backend** and **Camera**, which are read at game
+   start (reload the table after changing them). Under the hood they're
+   persisted in `VPinballX.ini` under `[Plugin.HeadTracking]`:
 
    ```ini
    [Plugin.HeadTracking]
-   Backend             = 0     ; 0=Auto, 1=Kinect v2, 2=Kinect v1, 3=Webcam
-   DeviceIndex         = 0     ; 0-based, ignored for Kinect v2
-   Gain                = 1.0   ; multiplier applied to head delta → camera
-   MinCutoffHz         = 0.4   ; 1€ filter baseline cutoff (lower = smoother when still)
-   Beta                = 0.05  ; 1€ filter response to fast motion (higher = less lag)
-   BaselineOffsetX     = 0.0   ; correction (mm) on the captured neutral pose
-   BaselineOffsetY     = 0.0
-   BaselineOffsetZ     = 0.0
-   LockbarHandSpan     = 660.0 ; mm between hands on flipper buttons (~660 widebody)
-   LockbarFloorHeight  = 850.0 ; mm from floor to top of lockbar (850 widebody)
-   IPDmm               = 63.0  ; interpupillary distance — 63 adult mean
+   Enable          = 1
+   Backend         = 0     ; 0=Auto (Kinect v2 → v1 → Webcam), 1=Kinect v2, 2=Kinect v1, 3=Webcam
+   DeviceIndex     = 0     ; which webcam — the in-game dropdown shows real device names
+   Gain            = 1.0   ; multiplier on the head-motion delta (0.5 is a good cab start)
+   Smoothing       = 0     ; 0=Stable (field-tested default), 1=Normal, 2=Reactive
+   MedianWindow    = 3     ; frames of spike-killing median pre-filter (1 = off)
+   TrackingStream  = 0     ; 0=Auto (IR on Kinects — tracks in a dark room), 1=Color
+   InvertX         = 0     ; flip left/right for mirrored / unusual mountings
+   InvertY         = 0
+   InvertZ         = 0
+   WebcamFocalPx   = 0.0   ; webcam focal length in pixels, 0 = automatic
+   BaselineOffsetX = 0.0   ; trim (mm) on the captured neutral head position
+   BaselineOffsetY = 0.0
+   BaselineOffsetZ = 0.0
    ```
 
-   On Linux this lives at `~/.vpinball/VPinballX.ini`, on Windows at
-   `%APPDATA%\VPinballX\VPinballX.ini`, on macOS at
-   `~/Library/Application Support/VPinballX/VPinballX.ini`.
+   The ini lives in VPX's preferences folder: Linux
+   `~/.local/share/VPinballX/10.8/VPinballX.ini`, Windows
+   `%AppData%\VPinballX\10.8\VPinballX.ini`, macOS
+   `~/Library/Application Support/VPinballX/10.8/VPinballX.ini`.
+   Only edit it while VPX is **closed** — VPX rewrites the whole file on
+   exit.
 
-4. **In-table view setup**: open a table, hit **F6** (or whichever key your
-   build maps to *View Setup*), and pick the **Camera** view layout mode.
-   Head tracking only steers the camera in that mode (`VLM_CAMERA`); in
-   *Legacy* it has no effect. Re-center yourself in front of the
-   sensor/webcam *before* loading the table — that pose is captured as the
-   neutral baseline. `BaselineOffsetX/Y/Z` lets you nudge the baseline
-   afterwards without recapturing.
+4. **View setup** — the plugin's startup notification reminds you of all
+   of this:
+   * **F12 → Cabinet Settings**: measure and enter your **lockbar width**
+     and your **screen inclination** — auto-calibration and the eye
+     mapping are anchored on those two values.
+   * Table POV: pick the **Window** view layout with **rotation 0** and
+     enable the **cabinet autofit** mode. Window is the mode designed for
+     head tracking: the screen becomes a fixed window into the cabinet
+     and the fish-tank effect happens inside the table.
+   * Stand in your normal play position when the table loads — the first
+     stable pose is captured as the neutral baseline
+     (`BaselineOffsetX/Y/Z` nudges it afterwards without recapturing).
 
-5. Open the VPX log console; on plugin load you should see something like
-   `kinect2 backend: 1 device(s) detected` (or v1 / webcam equivalents).
-   No line → driver/permission issue, see runtime requirements below.
+5. On game start the plugin pushes an on-screen notification with the
+   detected camera and the calibration state, and the VPX log gets
+   `HeadTracking` lines (camera enumeration, backend, anchor detection).
+   No notification → driver/permission issue, see runtime requirements
+   below.
 
 ### Runtime requirements per OS
 
@@ -112,6 +131,13 @@ Same: unplug/replug.
 lsusb | grep -i microsoft           # Kinect must show up
 ls -l /dev/bus/usb/<bus>/<dev>      # MODE should be crw-rw-rw-
 ```
+
+Best functional check: run `headtracking-demo` — the camera list should
+show your Kinect and the video panel should stream. While you're there,
+click **🎁 Contribute**: one capture of your cab trains the
+auto-calibration model, and since the detector learns the *cabinet*
+(lockbar + rails), an empty cab is exactly as useful — no need to stand
+in frame.
 
 ##### Webcam
 
@@ -167,6 +193,12 @@ knows how to launch it elevated:
    the demo's toolbar.
 
 That's it for both Kinect v1 and v2. Plug the Kinect, restart VPX.
+
+> 💡 **While the demo is open and the camera streaming**, click
+> **🎁 Contribute** — one capture of your cab becomes training data for
+> the auto-calibration model. The detector learns the *cabinet* (lockbar
+> + side rails), so an empty cab is exactly as useful as a played one:
+> no need to stand in frame.
 
 > ⚠ **Coexists with BAM?** No. BAM relies on the Microsoft Kinect
 > for Windows v2 SDK runtime, and this script removes that driver
@@ -301,8 +333,15 @@ macOS, and Windows.
 
 ### Installation du plugin
 
-Récupérer le binaire correspondant à votre OS depuis la page Releases, puis le
-déposer dans le dossier des plugins de votre install VPX :
+Récupérer le binaire correspondant à votre OS depuis la
+[page Releases](https://github.com/Le-Syl21/headtracking/releases) — ou, pour
+la version la plus fraîche, depuis les artefacts de n'importe quel run de la
+branche `main` dans l'onglet
+[Actions](https://github.com/Le-Syl21/headtracking/actions/workflows/release.yml)
+(chaque commit compile plugin + démo pour toutes les plateformes ; les dev
+builds sont **non signées** et demandent un compte GitHub pour le
+téléchargement). Puis le déposer dans le dossier des plugins de votre
+install VPX :
 
 ```
 <VPX_install>/plugins/headtracking/
@@ -317,46 +356,60 @@ dossier — VPX scanne `plugins/<id>/plugin.cfg` pour découvrir les plugins.
 
 ### Activation et configuration dans VPX
 
-1. Lancer VPX une fois après avoir copié les fichiers. Le plugin manager
-   prend en compte le nouveau `plugin.cfg` automatiquement.
-2. Ouvrir **Preferences → Plugins**, trouver **Head Tracking** dans la
-   liste, cocher **Enable**, puis redémarrer VPX. Le plugin n'est chargé
-   qu'au prochain démarrage, pas à chaud.
-3. Les réglages du plugin apparaissent dans le même dialogue (une ligne par
-   réglage). Ils sont persistés dans `VPinballX.ini` sous
-   `[Plugin.HeadTracking]` — vous pouvez aussi éditer ce fichier à la main :
+1. Lancer VPX (10.8.1+) une fois après avoir copié les fichiers — le plugin
+   manager découvre le nouveau `plugin.cfg` automatiquement.
+2. Charger une table et presser **F12** (Toggle In-Game UI) → **Plugin
+   Settings** → **Head Tracking**, puis cocher **Enable**. Quitter et
+   recharger la table : le tracker démarre au lancement de la partie.
+3. Tous les réglages vivent sur cette même page F12 et s'appliquent **en
+   live** pendant le jeu — sauf **Backend** et **Camera**, lus au démarrage
+   de la partie (recharger la table après les avoir changés). Sous le
+   capot, tout est persisté dans `VPinballX.ini` sous
+   `[Plugin.HeadTracking]` :
 
    ```ini
    [Plugin.HeadTracking]
-   Backend             = 0     ; 0=Auto, 1=Kinect v2, 2=Kinect v1, 3=Webcam
-   DeviceIndex         = 0     ; 0-based, ignoré pour la Kinect v2
-   Gain                = 1.0   ; multiplicateur appliqué au delta tête → caméra
-   MinCutoffHz         = 0.4   ; cutoff de base du filtre 1€ (plus bas = plus lissé au repos)
-   Beta                = 0.05  ; réponse 1€ au mouvement rapide (plus haut = moins de lag)
-   BaselineOffsetX     = 0.0   ; correction (mm) de la pose neutre capturée
-   BaselineOffsetY     = 0.0
-   BaselineOffsetZ     = 0.0
-   LockbarHandSpan     = 660.0 ; mm entre les mains sur les boutons (~660 widebody)
-   LockbarFloorHeight  = 850.0 ; mm du sol au sommet du lockbar (850 widebody)
-   IPDmm               = 63.0  ; distance interpupillaire — 63 adulte moyen
+   Enable          = 1
+   Backend         = 0     ; 0=Auto (Kinect v2 → v1 → Webcam), 1=Kinect v2, 2=Kinect v1, 3=Webcam
+   DeviceIndex     = 0     ; quelle webcam — la dropdown in-game affiche les vrais noms
+   Gain            = 1.0   ; multiplicateur sur le delta tête (0.5 = bon départ sur cab)
+   Smoothing       = 0     ; 0=Stable (défaut éprouvé), 1=Normal, 2=Reactive
+   MedianWindow    = 3     ; frames de médiane anti-pics avant le filtre (1 = off)
+   TrackingStream  = 0     ; 0=Auto (IR sur Kinect — tracke dans le noir), 1=Color
+   InvertX         = 0     ; inverse gauche/droite (montage caméra atypique)
+   InvertY         = 0
+   InvertZ         = 0
+   WebcamFocalPx   = 0.0   ; focale webcam en pixels, 0 = automatique
+   BaselineOffsetX = 0.0   ; correction (mm) de la pose neutre capturée
+   BaselineOffsetY = 0.0
+   BaselineOffsetZ = 0.0
    ```
 
-   Sur Linux le fichier est à `~/.vpinball/VPinballX.ini`, sur Windows à
-   `%APPDATA%\VPinballX\VPinballX.ini`, sur macOS à
-   `~/Library/Application Support/VPinballX/VPinballX.ini`.
+   L'ini vit dans le dossier de préférences VPX : Linux
+   `~/.local/share/VPinballX/10.8/VPinballX.ini`, Windows
+   `%AppData%\VPinballX\10.8\VPinballX.ini`, macOS
+   `~/Library/Application Support/VPinballX/10.8/VPinballX.ini`.
+   Ne l'éditer que VPX **fermé** — VPX réécrit tout le fichier en
+   quittant.
 
-4. **View Setup en table** : ouvrir une table, presser **F6** (ou la
-   touche que votre build mappe sur *View Setup*) et choisir le mode
-   **Camera**. Le head tracking ne pilote la caméra que dans ce mode
-   (`VLM_CAMERA`) ; en *Legacy* il n'a aucun effet. Se recentrer face au
-   capteur/webcam **avant** de charger la table — cette pose est capturée
-   comme baseline neutre. `BaselineOffsetX/Y/Z` permet d'ajuster la
-   baseline ensuite sans tout recapturer.
+4. **View setup** — la notification de démarrage du plugin rappelle tout
+   ça :
+   * **F12 → Cabinet Settings** : mesurer et renseigner la **largeur de
+     lockbar** et l'**inclinaison de l'écran** — l'auto-calibration et le
+     mapping de l'œil sont ancrés sur ces deux valeurs.
+   * POV de table : choisir le layout **Window** avec **rotation 0** et
+     activer le mode **cabinet autofit**. Window est le mode conçu pour le
+     head tracking : l'écran devient une fenêtre fixe sur le cab et
+     l'effet fish-tank se produit dans la table.
+   * Se placer en position de jeu normale au chargement de la table — la
+     première pose stable est capturée comme baseline neutre
+     (`BaselineOffsetX/Y/Z` l'ajuste ensuite sans recapturer).
 
-5. Ouvrir la console plugin de VPX ; au PluginLoad on doit voir une ligne
-   du genre `kinect2 backend: 1 device(s) detected` (ou v1 / webcam
-   équivalent). Rien → souci driver/permissions, voir la section runtime
-   plus bas.
+5. Au lancement de la partie, le plugin affiche une notification à l'écran
+   avec la caméra détectée et l'état de calibration, et le log VPX reçoit
+   des lignes `HeadTracking` (énumération caméras, backend, détection de
+   l'ancre). Pas de notification → souci driver/permissions, voir les
+   sections runtime plus bas.
 
 ### Pré-requis runtime par plateforme
 
@@ -409,6 +462,13 @@ Idem : débrancher/rebrancher.
 lsusb | grep -i microsoft           # doit montrer la Kinect
 ls -l /dev/bus/usb/<bus>/<dev>      # MODE doit valoir crw-rw-rw-
 ```
+
+Meilleur test fonctionnel : lancer `headtracking-demo` — la liste des
+caméras doit montrer la Kinect et le panneau vidéo doit streamer. Tant
+qu'on y est, cliquer **🎁 Contribute** : un relevé de votre cab entraîne
+le modèle d'auto-calibration, et comme le détecteur apprend le *cab*
+(lockbar + rails), un cab vide est exactement aussi utile — pas besoin
+d'être dans le champ.
 
 ##### Webcam
 
@@ -467,6 +527,12 @@ lancer élevé :
    dans la barre d'outils de la démo.
 
 C'est tout, pour les deux Kinect v1 et v2. Brancher la Kinect, relancer VPX.
+
+> 💡 **Tant que la démo est ouverte et la caméra en flux**, cliquer
+> **🎁 Contribute** — un relevé de votre cab devient donnée
+> d'entraînement pour le modèle d'auto-calibration. Le détecteur apprend
+> le *cab* (lockbar + rails latéraux), donc un cab vide est exactement
+> aussi utile qu'une partie en cours : pas besoin d'être dans le champ.
 
 > ⚠ **Cohabite avec BAM ?** Non. BAM dépend du runtime Microsoft
 > Kinect for Windows v2 SDK, et le script remplace ce driver par

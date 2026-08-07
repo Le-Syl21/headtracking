@@ -77,10 +77,10 @@ model — lives in **[`tools/anchor/`](tools/anchor/)** with its own guide.
 ## 🚧 Status — honestly
 
 This is **early development**, released as **beta**. It builds for Linux,
-Windows and macOS, but has only been **field-validated on Linux** so far —
-Windows and macOS runs are exactly what we need testers for. Nothing is wired
-end-to-end against a running VPX install *yet* — but a lot of the hard parts
-already work standalone.
+Windows and macOS, and the full chain — camera → auto-calibration →
+live POV inside a running VPX — is now **field-validated on a real Linux
+pincab** (Kinect v2, Kinect v1 and webcam, Window view mode). Windows and
+macOS runs are exactly what we need testers for.
 
 > [!CAUTION]
 > ### ⚠️ Windows + Kinect users — read this BEFORE installing anything
@@ -103,7 +103,8 @@ already work standalone.
 | Auto-calibration maths (focal + pose) | ✅ validated to ±0–3 % vs tape measure |
 | `anchor` training pipeline (lines → ONNX) | ✅ validated end-to-end |
 | Trained, generalizing `anchor` model | 🚧 needs annotated photos |
-| Live POV inside VPX, end-to-end | 🚧 not tested yet |
+| Live POV inside VPX, end-to-end | ✅ field-validated on a real Linux pincab |
+| In-game settings (F12 → Plugin Settings), live tuning | ✅ |
 | Windows / macOS real-world runs | 🚧 needs testers |
 
 ## 📸 We need captures of YOUR pincab — 2 minutes, no coding
@@ -177,7 +178,7 @@ Full install / VPX config / per-OS Kinect setup: **[`docs/INSTALL.md`](docs/INST
 
 ### Install into VPX
 
-Drop the built library into VPX's plugin folder:
+Drop the built library into VPX's (10.8.1+) plugin folder:
 
 ```
 <VPX_install>/plugins/headtracking/
@@ -186,6 +187,17 @@ Drop the built library into VPX's plugin folder:
 ├── libheadtracking.so        # Linux
 └── libheadtracking.dylib     # macOS
 ```
+
+Then in a table press **F12 → Plugin Settings → Head Tracking → Enable**.
+Every setting (gain, smoothing, camera…) is tunable live from that page —
+full walkthrough in [`docs/INSTALL.md`](docs/INSTALL.md).
+
+Don't want to build? Besides the
+[releases](https://github.com/Le-Syl21/headtracking/releases), **every
+commit on `main` uploads fresh dev builds** (plugin + demo, all platforms)
+as artifacts on the
+[Actions tab](https://github.com/Le-Syl21/headtracking/actions/workflows/release.yml)
+— unsigned, GitHub login required.
 
 ## 🗺️ Architecture
 
@@ -270,12 +282,14 @@ devant le cab** sont les plus rares et les plus précieux.
 - **100 % Rust**, Linux · Windows · macOS.
 
 **État :** début de développement, publié en **beta**. Ça compile pour Linux,
-Windows et macOS, mais ce n'est **validé sur le terrain que sous Linux** — les
-retours Windows/macOS sont exactement ce qu'on cherche. Rien n'est encore
-branché de bout en bout dans VPX, mais l'essentiel des briques difficiles
-marche déjà en standalone (capture Kinect v1/v2 + webcam, tête BlazePose
-~7 ms, maths d'auto-calibration validées à ±0–3 % au mètre-ruban, démo
-parallaxe fish-tank). Voir le tableau d'état plus haut.
+Windows et macOS, et la chaîne complète — caméra → auto-calibration → POV
+live dans VPX — est **validée sur le terrain sur un vrai pincab Linux**
+(Kinect v2, Kinect v1 et webcam, mode Window, réglages live via F12). Les
+retours Windows/macOS sont exactement ce qu'on cherche. Voir le tableau
+d'état plus haut. En bonus : chaque commit sur `main` publie des dev builds
+fraîches (plugin + démo, toutes plateformes) dans l'onglet
+[Actions](https://github.com/Le-Syl21/headtracking/actions/workflows/release.yml)
+— non signées, compte GitHub requis.
 
 > [!CAUTION]
 > ### ⚠️ Utilisateurs Windows + Kinect — à lire AVANT toute installation
