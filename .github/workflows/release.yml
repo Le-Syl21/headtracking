@@ -705,6 +705,9 @@ jobs:
           mkdir -p release-assets release-staging
           for d in dist/*/; do
             name=$(basename "$d")
+            # Internal fan-out artifact from the fetch-models job — not a
+            # release deliverable (the models are embedded in the binaries).
+            [ "$name" = "onnx-models" ] && continue
             mv "$d" "release-staging/$name"
             # `actions/upload-artifact` round-trips through a zip blob,
             # which doesn't preserve POSIX executable bits. Files come
