@@ -13,8 +13,8 @@ It tracks on its own infrared illumination (full 30 fps in a dark game
 room) and measures head distance with its depth sensor. Needs a dedicated
 USB 3.0 port (see the [bandwidth note](#v2-needs-usb-30-root-port-bandwidth)).
 To mount it on the backglass or topper, a
-[standard 1/4" (Kodak) screw kit](https://amzn.eu/d/07wd6UjW)
-(13 / 25 / 51 mm) does the job. Kinect v1 and plain webcams are fully
+[1/4"-20 screw assortment kit](https://amzn.eu/d/05Pmh3l6) (~€11 for 40
+stainless pieces, 7 lengths + spacers + wrench) does the job. Kinect v1 and plain webcams are fully
 supported too.
 
 ### Install the plugin
@@ -353,8 +353,8 @@ Elle tracke sous son propre éclairage infrarouge (30 fps dans un game room
 noir) et mesure la distance de tête avec son capteur de profondeur. Port
 USB 3.0 dédié obligatoire (voir la note bande passante plus bas). Pour la
 fixation sur le backglass ou le topper, un
-[kit de vis au pas Kodak standard 1/4"](https://amzn.eu/d/07wd6UjW)
-(13 / 25 / 51 mm) fait l'affaire. La Kinect v1 et les simples webcams sont
+[kit d'assortiment de vis 1/4"-20](https://amzn.eu/d/05Pmh3l6) (~11 € les
+40 pièces inox, 7 longueurs + entretoises + clé) fait l'affaire. La Kinect v1 et les simples webcams sont
 aussi pleinement supportées.
 
 ### Installation du plugin
