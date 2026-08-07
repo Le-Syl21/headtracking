@@ -7,7 +7,7 @@
 ### Recommended camera
 
 Best experience: a second-hand **Kinect v2 (Xbox One)** — from ~€20 on
-leboncoin / eBay, plus the **Kinect Adapter** (power + USB 3.0,
+[leboncoin](https://www.leboncoin.fr/recherche?text=%22Kinect%22%20Xbox%20One&shippable=1&price=20-max&transaction_status=search__no_value&owner_type=private&sort=price&order=asc) / [eBay](https://www.ebay.fr/sch/i.html?_nkw=kinect+xbox+one&_sacat=54968&_from=R40&LH_TitleDesc=0&_sop=2&Marque=Microsoft&_dcat=54968), plus the **Kinect Adapter** (power + USB 3.0,
 [~€29 new](https://amzn.eu/d/08mV466T)) if the listing doesn't include it.
 It tracks on its own infrared illumination (full 30 fps in a dark game
 room) and measures head distance with its depth sensor. Needs a dedicated
@@ -348,7 +348,7 @@ macOS, and Windows.
 ### Caméra recommandée
 
 La meilleure expérience : une **Kinect v2 (Xbox One) d'occasion** — dès
-~20 € sur leboncoin / eBay, plus l'**adaptateur Kinect** (alim + USB 3.0,
+~20 € sur [leboncoin](https://www.leboncoin.fr/recherche?text=%22Kinect%22%20Xbox%20One&shippable=1&price=20-max&transaction_status=search__no_value&owner_type=private&sort=price&order=asc) / [eBay](https://www.ebay.fr/sch/i.html?_nkw=kinect+xbox+one&_sacat=54968&_from=R40&LH_TitleDesc=0&_sop=2&Marque=Microsoft&_dcat=54968), plus l'**adaptateur Kinect** (alim + USB 3.0,
 [~29 € neuf](https://amzn.eu/d/08mV466T)) si l'annonce ne l'inclut pas.
 Elle tracke sous son propre éclairage infrarouge (30 fps dans un game room
 noir) et mesure la distance de tête avec son capteur de profondeur. Port

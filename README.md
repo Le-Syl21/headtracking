@@ -81,8 +81,9 @@ model — lives in **[`tools/anchor/`](tools/anchor/)** with its own guide.
 Every backend works, but the sweet spot is a used **Kinect v2 (Xbox One)** —
 and it's absurdly cheap since Microsoft discontinued it:
 
-- **From ~€20** on leboncoin / eBay / your local classifieds — there are tons
-  of listings.
+- **From ~€20** on [leboncoin](https://www.leboncoin.fr/recherche?text=%22Kinect%22%20Xbox%20One&shippable=1&price=20-max&transaction_status=search__no_value&owner_type=private&sort=price&order=asc) / [eBay](https://www.ebay.fr/sch/i.html?_nkw=kinect+xbox+one&_sacat=54968&_from=R40&LH_TitleDesc=0&_sop=2&Marque=Microsoft&_dcat=54968) / your local
+  classifieds — there are tons of listings (both links are pre-filtered,
+  cheapest first).
 - It tracks on its **infrared stream**: the sensor lights the scene itself,
   so you get full 30 fps in a pitch-dark game room where a webcam struggles.
 - Real **depth sensor** → your head distance is *measured* in millimetres,
@@ -313,7 +314,8 @@ devant le cab** sont les plus rares et les plus précieux.
 
 **🎥 Quelle caméra ? Une Kinect v2 d'occasion.** Tous les backends marchent,
 mais le meilleur rapport qualité/prix est une **Kinect v2 (Xbox One)**
-d'occasion — **dès ~20 €** sur leboncoin / eBay (les annonces pullulent
+d'occasion — **dès ~20 €** sur [leboncoin](https://www.leboncoin.fr/recherche?text=%22Kinect%22%20Xbox%20One&shippable=1&price=20-max&transaction_status=search__no_value&owner_type=private&sort=price&order=asc) / [eBay](https://www.ebay.fr/sch/i.html?_nkw=kinect+xbox+one&_sacat=54968&_from=R40&LH_TitleDesc=0&_sop=2&Marque=Microsoft&_dcat=54968)
+(recherches pré-filtrées, moins chères d'abord — les annonces pullulent
 depuis l'arrêt par Microsoft). Elle tracke sur son **flux infrarouge** (le
 capteur éclaire lui-même la scène : 30 fps plein pot dans un game room
 noir) et son **capteur de profondeur** mesure la distance de tête en vrais
