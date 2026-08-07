@@ -632,14 +632,38 @@ jobs:
           name: ${{ env.ART }}
           path: win
 
-      - name: Sign the plugin DLL + demo EXE with ssign (via Certum)
+      - name: Sign every signable file in the artifact (via Certum)
         env:
           CERTUM_EMAIL: ${{ secrets.CERTUM_EMAIL }}
           CERTUM_OTP: ${{ secrets.CERTUM_OTP }}
         run: |
+          set -euo pipefail
+          # Discover instead of hardcoding, so a new exe/dll/script added to
+          # the ZIP can never ship unsigned by omission.
+          #
+          # DELIBERATE exclusion: setup/drivers/** — those .cat catalogs are
+          # libwdi-signed and setup.ps1 pre-trusts THAT certificate before
+          # pnputil. Re-signing them with the Certum Authenticode cert would
+          # break driver binding (code-signing certs aren't valid for driver
+          # packages; libwdi's self-sign + store-trust trick is the whole
+          # point), so their signature must be left untouched.
+          mapfile -t pe < <(find win -type f \
+            \( -iname '*.exe' -o -iname '*.dll' -o -iname '*.sys' \
+               -o -iname '*.ocx' -o -iname '*.cpl' \) \
+            -not -path 'win/setup/drivers/*' | sort)
+          mapfile -t scripts < <(find win -type f \
+            \( -iname '*.ps1' -o -iname '*.psm1' -o -iname '*.vbs' \
+               -o -iname '*.js' \) \
+            -not -path 'win/setup/drivers/*' | sort)
+          echo "PE files to sign: ${pe[*]}"
+          echo "Scripts to sign: ${scripts[*]:-none}"
+          # Refuse to release a ZIP where discovery found nothing — that
+          # means the layout changed under us, not that there is no work.
+          [ "${#pe[@]}" -ge 2 ] || { echo "::error::expected at least the plugin DLL and demo EXE"; exit 1; }
+
           ssign --verbose \
             -n "headtracking" -u "https://github.com/${{ github.repository }}" \
-            win/headtracking.dll win/headtracking-demo.exe
+            "${pe[@]}"
           sudo apt-get update -qq && sudo apt-get install -y osslsigncode
           # Vérifie les faits, pas la présence d'une phrase. « Calculated message
           # digest » apparaît AUSSI quand le digest ne correspond pas, et ne dit
@@ -663,24 +687,26 @@ jobs:
               return 1
             fi
           }
-          for f in win/headtracking.dll win/headtracking-demo.exe; do
+          for f in "${pe[@]}"; do
             verify_signature "$f"
           done
 
-          # The installer script is signed too (0.0.31+), so the launchers
-          # can enforce the signature (-ExecutionPolicy RemoteSigned)
-          # instead of bypassing policy. Same cloud key, via the PKCS#11
-          # module — osslsigncode knows the PowerShell SIP format.
-          osslsigncode sign \
-            -pkcs11module ssign-src/target/release/libssign_pkcs11.so \
-            -pkcs11cert 'pkcs11:type=cert' -key 'pkcs11:type=private' \
-            -ac ccsca2021.pem -h sha256 -t http://time.certum.pl/ \
-            -in win/setup/setup.ps1 -out win/setup/setup.ps1.signed
-          mv win/setup/setup.ps1.signed win/setup/setup.ps1
-          # Structural check: the SIP signature block must be appended.
-          # (`osslsigncode verify` output for scripts is best-effort only.)
-          grep -q "SIG # Begin signature block" win/setup/setup.ps1
-          osslsigncode verify win/setup/setup.ps1 || true
+          # Scripts (0.0.31+: launchers enforce the signature with
+          # -ExecutionPolicy RemoteSigned instead of bypassing policy).
+          # Same cloud key, via the PKCS#11 module — osslsigncode knows
+          # the PowerShell SIP format.
+          for f in "${scripts[@]}"; do
+            osslsigncode sign \
+              -pkcs11module ssign-src/target/release/libssign_pkcs11.so \
+              -pkcs11cert 'pkcs11:type=cert' -key 'pkcs11:type=private' \
+              -ac ccsca2021.pem -h sha256 -t http://time.certum.pl/ \
+              -in "$f" -out "$f.signed"
+            mv "$f.signed" "$f"
+            # Structural check: the SIP signature block must be appended.
+            # (`osslsigncode verify` output for scripts is best-effort only.)
+            grep -q "SIG # Begin signature block" "$f"
+            osslsigncode verify "$f" || true
+          done
 
       - name: Re-upload the signed Windows artifact
         uses: actions/upload-artifact@v7
