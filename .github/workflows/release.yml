@@ -747,10 +747,13 @@ jobs:
             release-assets/*.tar.gz
             release-assets/*.zip
           generate_release_notes: true
-          # Tags with -alpha / -beta / -preview / -rc suffix are flagged
-          # as pre-releases automatically. `preview` is the early-adopter
-          # channel: a real GitHub Release (signed binaries, one obvious
-          # download link) without digging into Actions artifacts —
-          # PinReady is meant to offer these at install time eventually.
-          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') || contains(github.ref, '-preview') }}
+          # Channel policy (decided 2026-08-07 after the "Latest badge on an
+          # ancient build" incident): `-preview` is the PUBLIC download
+          # channel — published as a normal release so GitHub's "Latest"
+          # badge and the repo sidebar funnel everyone to it. -alpha /
+          # -beta / -rc stay flagged pre-release (GitHub can't mark a
+          # pre-release as Latest). PinReady is meant to offer the preview
+          # channel at install time eventually.
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          make_latest: ${{ contains(github.ref, '-preview') && 'true' || 'legacy' }}
           fail_on_unmatched_files: false
