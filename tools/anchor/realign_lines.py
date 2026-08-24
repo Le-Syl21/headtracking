@@ -16,7 +16,7 @@ Always validate the output: run extend_dataset.py against the new reference
 annotate_check.py overlay.
 
 Usage:
-  ../../output/u-seg/.venv/bin/python realign_lines.py \
+  ../../output/anchor/.venv/bin/python realign_lines.py \
       --merged dataset_stage/merged.json --images input \
       --ref  ht_webcam-1_20260804-152629_411983_raw.png \
       --new  ht_webcam-1_20260805-133025_f1177b_raw.png \

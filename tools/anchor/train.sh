@@ -20,11 +20,17 @@ BATCH="${4:-16}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/runs"
 
-# Pick a python/yolo: prefer the project's u-seg venv if present, else system yolo.
+# Pick a python/yolo: prefer a project venv if there is one, else system yolo.
+# `output/u-seg/` is the historical name — the segmentation experiment that
+# seeded this tooling is gone, but the venv it created is still a working
+# ultralytics install, so keep finding it rather than making people rebuild one.
 YOLO="yolo"
-if [ -x "$HERE/../../output/u-seg/.venv/bin/yolo" ]; then
-  YOLO="$HERE/../../output/u-seg/.venv/bin/yolo"
-fi
+for candidate in "$HERE/../../output/anchor/.venv" "$HERE/../../output/u-seg/.venv"; do
+  if [ -x "$candidate/bin/yolo" ]; then
+    YOLO="$candidate/bin/yolo"
+    break
+  fi
+done
 
 echo "▶ training  data=$DATA  epochs=$EPOCHS  imgsz=$IMGSZ  batch=$BATCH"
 [ "$BATCH" -lt 16 ] && echo "⚠  batch < 16 : BatchNorm may not converge (see README)."

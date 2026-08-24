@@ -14,8 +14,9 @@ within --max-shift pixels (default 1.5) of where the reference puts it.
 A nudged camera, a person in frame, or an occluded anchor breaks at least
 one corner and the image is skipped with the measured displacement.
 
-Run with the u-seg venv python (numpy + cv2):
-  ../../output/u-seg/.venv/bin/python extend_dataset.py \
+Run with the project's ultralytics venv python (numpy + cv2) — see
+tools/anchor/train.sh for where it is looked up:
+  ../../output/anchor/.venv/bin/python extend_dataset.py \
       --merged dataset_stage/merged.json --images input \
       --out output/merged-extended.json [--threshold 0.5]
 """

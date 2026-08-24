@@ -3,8 +3,15 @@
 > Plan de design pour remplacer la détection de **visage** (qui décroche quand
 > le joueur baisse la tête sur le playfield) par une détection de **tête comme
 > forme**, robuste sous tous les angles — crâne / calvitie vus de dessus inclus.
-> Statut : **DESIGN validé**. Entraînement du modèle différé (post-vacances,
-> géré par Sylvain). Aucune ligne de code encore posée.
+> Statut : **document historique**. Le plan a été exécuté — le crate `head`
+> (YOLOv11 embarqué) a été livré en 0.0.25 — puis **dépassé** : BlazePose
+> trouve tête, épaules et poignets d'un coup, y compris sur nos captures IR,
+> et alimente aujourd'hui les trois backends. Les crates `face` et `head` ne
+> sont plus branchés nulle part. Gardé pour le raisonnement face → tête, qui
+> reste la raison pour laquelle on ne détecte pas un visage.
+>
+> Le crate `u-onnx` (l'expérience de segmentation « U-seg ») a été supprimé du
+> dépôt ; les renvois ci-dessous vers son code sont donc historiques.
 
 ---
 
@@ -33,8 +40,7 @@ Détecter la **tête comme forme**, pas via des traits de visage. Un vrai
 - **MoveNet / pose corps entier** (piste initiale de Claude Code) : ses ancres
   sont **faciales** (nez, yeux, oreilles). Crâne vers la caméra → ces points
   passent en confiance quasi nulle. Échoue pile sur le cas visé. En prime, son
-  décodeur utilise `GatherND`/`ArgMax`, ops « à risque » dans tract
-  (cf. `crates/u-onnx/examples/movenet_probe.rs`).
+  décodeur utilise `GatherND`/`ArgMax`, ops « à risque » dans tract.
 - **Détecteur « person » CrowdHuman off-the-shelf** (ex. `yakhyo/yolov8-crowdhuman`) :
   détecte le **corps entier**, pas la tête. La bbox = épaules/torse → largeur
   inutilisable pour la profondeur (§4). Donne une position approximative au
@@ -42,14 +48,15 @@ Détecter la **tête comme forme**, pas via des traits de visage. Un vrai
 
 ## 3. Le modèle : YOLOv11 « head » entraîné maison
 
-On entraîne un détecteur de tête **YOLOv11** avec le pipeline existant
-(`output/u-seg/.venv`, ultralytics — le même qui a produit `crates/u-onnx/models/u.onnx`).
+On entraîne un détecteur de tête **YOLOv11** avec le pipeline ultralytics
+existant (le même venv que celui de `tools/anchor/train.sh`).
 
 Trois raisons qui s'empilent :
 1. **Vraies têtes, tous angles** (base CrowdHuman *head* + nos propres frames)
    → robuste tête baissée.
-2. **Format YOLOv11 identique à `u.onnx`** → le décodage tract d'u-onnx
-   (8400 anchors, NMS) est **réutilisé tel quel**, juste sans les canaux de masque.
+2. **Format YOLOv11 identique** au modèle de segmentation déjà entraîné → son
+   décodage tract (8400 anchors, NMS) est **réutilisable tel quel**, juste sans
+   les canaux de masque.
 3. Entraîné sur **la tête du joueur, sa caméra, son angle** : la largeur
    apparente devient **consistante et calibrée**, ce qui rend le calcul de
    profondeur (§4) précis sans prior générique bancal.
@@ -94,8 +101,8 @@ HeadAnchor { cx, cy, width, height, confidence }   // coords image
 - Refactor : `tracker/face_depth.rs::head_from_face_depth(&FaceDetection, …)`
   → `head_from_region(cx, cy, w, h, …)` (le corps — médiane + déprojection IR —
   et ses tests ne bougent pas ; seule l'entrée change).
-- Nouveau crate `head` calqué sur `u-onnx` (tract, `include_bytes!` du modèle,
-  décodage YOLOv11) → produit des `HeadAnchor`.
+- Nouveau crate `head` calqué sur le décodeur de segmentation (tract,
+  `include_bytes!` du modèle, décodage YOLOv11) → produit des `HeadAnchor`.
 - `tracker/{kinect_v1,kinect_v2,webcam}` : `face::Detector` → `head::Detector`.
 - `face` (Ultraface) devient retirable une fois les trackers basculés.
 
