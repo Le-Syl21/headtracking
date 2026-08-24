@@ -354,6 +354,7 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
             backend = ?cfg.backend,
             device_index = cfg.device_index,
             gain = cfg.gain,
+            gain_trim = ?[cfg.gain_x, cfg.gain_y, cfg.gain_z],
             smoothing = ?cfg.smoothing,
             stream = ?cfg.tracking_stream,
             "spawning tracker session with current config"
@@ -581,10 +582,13 @@ fn apply_pose_to_view() {
             window_rot_rad: window_player_rotation(&view),
         };
         let delta = pose_delta_to_view_delta(&pose, &adjusted_baseline_pose, &params);
+        // Master gain times the per-axis trim. Keeping the master as one
+        // number means a config that only ever set `Gain` behaves exactly as
+        // it did; the trims default to 1.0 and cost a multiply.
         game.applied = [
-            delta.dx * cfg.gain,
-            delta.dy * cfg.gain,
-            delta.dz * cfg.gain,
+            delta.dx * cfg.gain * cfg.gain_x,
+            delta.dy * cfg.gain * cfg.gain_y,
+            delta.dz * cfg.gain * cfg.gain_z,
         ];
     }
 

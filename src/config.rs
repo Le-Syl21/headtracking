@@ -76,6 +76,10 @@ pub enum SmoothingPreset {
     Normal,
     /// Follows fast; may breathe a little at rest.
     Reactive,
+    /// Drive the two One-Euro knobs yourself (`SmoothingResponsiveness` and
+    /// `SmoothingCatchUp`). The per-axis profile the presets carry is kept —
+    /// see [`Config::one_euro_params`].
+    Custom,
 }
 
 impl SmoothingPreset {
@@ -83,6 +87,7 @@ impl SmoothingPreset {
         match v {
             0 => Self::Stable,
             2 => Self::Reactive,
+            3 => Self::Custom,
             _ => Self::Normal,
         }
     }
@@ -91,6 +96,7 @@ impl SmoothingPreset {
             Self::Stable => 0,
             Self::Normal => 1,
             Self::Reactive => 2,
+            Self::Custom => 3,
         }
     }
 }
@@ -124,7 +130,20 @@ pub struct Config {
     pub backend: BackendKind,
     pub device_index: i32,
     pub gain: f32,
+    /// Per-axis trims multiplying [`Self::gain`], `1.0` = no change. The
+    /// master stays a single number so existing configs keep behaving
+    /// exactly as before; these only let one direction be dialled back when
+    /// a cabinet needs it (a shallow playfield often wants less near/far).
+    pub gain_x: f32,
+    pub gain_y: f32,
+    pub gain_z: f32,
     pub smoothing: SmoothingPreset,
+    /// One-Euro `min_cutoff` for the left/right axis under
+    /// [`SmoothingPreset::Custom`]; ignored by the three presets.
+    pub smoothing_responsiveness: f32,
+    /// One-Euro `beta` for the left/right axis under
+    /// [`SmoothingPreset::Custom`]; ignored by the three presets.
+    pub smoothing_catch_up: f32,
     /// Median spike-gate window in frames (odd, 1 = off); see
     /// `filter::MedianGate` for the latency trade-off.
     pub median_window: i32,
@@ -139,6 +158,13 @@ pub struct Config {
     pub baseline_offset_y_mm: f32,
     pub baseline_offset_z_mm: f32,
 }
+
+/// Range of the `SmoothingResponsiveness` setting (One-Euro `min_cutoff`, Hz).
+const MIN_CUTOFF_RANGE: (f32, f32) = (0.05, 5.0);
+/// Range of the `SmoothingCatchUp` setting (One-Euro `beta`).
+const BETA_RANGE: (f32, f32) = (0.0, 1.5);
+/// Range of the per-axis gain trims.
+const GAIN_TRIM_RANGE: (f32, f32) = (0.0, 3.0);
 
 /// One-Euro parameters for one axis.
 #[derive(Debug, Clone, Copy)]
@@ -171,6 +197,26 @@ impl Config {
             SmoothingPreset::Stable => [p(0.25, 0.002), p(0.2, 0.002), p(0.1, 0.006)],
             SmoothingPreset::Normal => [p(1.0, 0.01), p(0.8, 0.008), p(0.4, 0.05)],
             SmoothingPreset::Reactive => [p(2.0, 0.05), p(1.6, 0.04), p(0.8, 0.1)],
+            // Custom drives the left/right axis from the two settings and
+            // keeps the shape the three presets share, rather than flattening
+            // all three axes onto one pair of numbers — which would silently
+            // throw away the near/far tuning that makes the projection sit
+            // still. The cutoff ratios (0.8 up/down, 0.4 near/far) are
+            // identical across all three presets. The near/far beta ratio is
+            // the one that varies (x3 Stable, x5 Normal, x2 Reactive), so
+            // Custom takes the middle and clamps to the setting's own range.
+            SmoothingPreset::Custom => {
+                let (c, b) = (
+                    self.smoothing_responsiveness
+                        .clamp(MIN_CUTOFF_RANGE.0, MIN_CUTOFF_RANGE.1),
+                    self.smoothing_catch_up.clamp(BETA_RANGE.0, BETA_RANGE.1),
+                );
+                [
+                    p(c, b),
+                    p(c * 0.8, b * 0.8),
+                    p(c * 0.4, (b * 3.0).min(BETA_RANGE.1)),
+                ]
+            }
         }
     }
 }
@@ -181,7 +227,12 @@ impl Default for Config {
             backend: BackendKind::Auto,
             device_index: 0,
             gain: 1.0,
+            gain_x: 1.0,
+            gain_y: 1.0,
+            gain_z: 1.0,
             smoothing: SmoothingPreset::Stable,
+            smoothing_responsiveness: 1.0,
+            smoothing_catch_up: 0.01,
             median_window: 3,
             tracking_stream: StreamPref::Auto,
             invert_x: false,
@@ -199,7 +250,12 @@ static CONFIG: RwLock<Config> = RwLock::new(Config {
     backend: BackendKind::Auto,
     device_index: 0,
     gain: 1.0,
+    gain_x: 1.0,
+    gain_y: 1.0,
+    gain_z: 1.0,
     smoothing: SmoothingPreset::Stable,
+    smoothing_responsiveness: 1.0,
+    smoothing_catch_up: 0.01,
     median_window: 3,
     tracking_stream: StreamPref::Auto,
     invert_x: false,
@@ -247,6 +303,41 @@ unsafe extern "C" fn get_gain() -> f32 {
 }
 unsafe extern "C" fn set_gain(v: f32) {
     rw!().gain = v;
+}
+
+unsafe extern "C" fn get_gain_x() -> f32 {
+    current().gain_x
+}
+unsafe extern "C" fn set_gain_x(v: f32) {
+    rw!().gain_x = v;
+}
+
+unsafe extern "C" fn get_gain_y() -> f32 {
+    current().gain_y
+}
+unsafe extern "C" fn set_gain_y(v: f32) {
+    rw!().gain_y = v;
+}
+
+unsafe extern "C" fn get_gain_z() -> f32 {
+    current().gain_z
+}
+unsafe extern "C" fn set_gain_z(v: f32) {
+    rw!().gain_z = v;
+}
+
+unsafe extern "C" fn get_smoothing_responsiveness() -> f32 {
+    current().smoothing_responsiveness
+}
+unsafe extern "C" fn set_smoothing_responsiveness(v: f32) {
+    rw!().smoothing_responsiveness = v;
+}
+
+unsafe extern "C" fn get_smoothing_catch_up() -> f32 {
+    current().smoothing_catch_up
+}
+unsafe extern "C" fn set_smoothing_catch_up(v: f32) {
+    rw!().smoothing_catch_up = v;
 }
 
 unsafe extern "C" fn get_smoothing() -> c_int {
@@ -337,10 +428,11 @@ static BACKEND_VALUES: EnumValues<5> = EnumValues([
     std::ptr::null(),
 ]);
 
-static SMOOTHING_VALUES: EnumValues<4> = EnumValues([
+static SMOOTHING_VALUES: EnumValues<5> = EnumValues([
     c"Stable".as_ptr(),
     c"Normal".as_ptr(),
     c"Reactive".as_ptr(),
+    c"Custom".as_ptr(),
     std::ptr::null(),
 ]);
 
@@ -507,16 +599,71 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
             get_gain,
             set_gain,
         ),
+        make_float_setting(
+            c"GainX",
+            c"Gain trim, left/right",
+            c"Per-axis trim multiplying the master Gain. 1.00 leaves it alone; lower it when one direction moves too much for your cabinet.",
+            GAIN_TRIM_RANGE.0,
+            GAIN_TRIM_RANGE.1,
+            0.05,
+            1.0,
+            get_gain_x,
+            set_gain_x,
+        ),
+        make_float_setting(
+            c"GainY",
+            c"Gain trim, up/down",
+            c"Per-axis trim multiplying the master Gain. 1.00 leaves it alone; lower it when one direction moves too much for your cabinet.",
+            GAIN_TRIM_RANGE.0,
+            GAIN_TRIM_RANGE.1,
+            0.05,
+            1.0,
+            get_gain_y,
+            set_gain_y,
+        ),
+        make_float_setting(
+            c"GainZ",
+            c"Gain trim, near/far",
+            c"Per-axis trim multiplying the master Gain. 1.00 leaves it alone; near/far is the one most often worth calming, since it re-skews the whole projection.",
+            GAIN_TRIM_RANGE.0,
+            GAIN_TRIM_RANGE.1,
+            0.05,
+            1.0,
+            get_gain_z,
+            set_gain_z,
+        ),
         make_int_setting(
             c"Smoothing",
             c"Smoothing",
-            c"Stable is the field-tested default (kills every tremor for a touch of lag), Normal follows quicker, Reactive follows fast moves closest. Each preset is tuned per axis already: near/far is smoothed hardest, since it is the noisiest reading and the one that re-skews the whole projection.",
+            c"Stable is the field-tested default (kills every tremor for a touch of lag), Normal follows quicker, Reactive follows fast moves closest. Each preset is tuned per axis already: near/far is smoothed hardest, since it is the noisiest reading and the one that re-skews the whole projection. Custom hands you the two knobs below and keeps that same per-axis shape.",
             0,
-            2,
+            3,
             SmoothingPreset::Stable.to_i32(),
             SMOOTHING_VALUES.0.as_ptr().cast_mut(),
             get_smoothing,
             set_smoothing,
+        ),
+        make_float_setting(
+            c"SmoothingResponsiveness",
+            c"Custom smoothing: responsiveness",
+            c"Only used when Smoothing is set to Custom. While you hold still: low = rock steady with a touch of lag, high = follows sooner and may tremble. The up/down and near/far axes follow this at the same ratios the presets use.",
+            MIN_CUTOFF_RANGE.0,
+            MIN_CUTOFF_RANGE.1,
+            0.05,
+            1.0,
+            get_smoothing_responsiveness,
+            set_smoothing_responsiveness,
+        ),
+        make_float_setting(
+            c"SmoothingCatchUp",
+            c"Custom smoothing: motion catch-up",
+            c"Only used when Smoothing is set to Custom. When you move fast: higher = catches up quicker so the view sticks to your head. 0 turns the catch-up off and leaves plain smoothing.",
+            BETA_RANGE.0,
+            BETA_RANGE.1,
+            0.01,
+            0.01,
+            get_smoothing_catch_up,
+            set_smoothing_catch_up,
         ),
         make_int_setting(
             c"MedianWindow",
@@ -613,5 +760,88 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         // SAFETY: caller guarantees `api`/`endpoint_id`; `def` is leaked and
         // outlives the host's use of it.
         unsafe { register(endpoint_id, def) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every preset keeps the same per-axis shape: up/down is calmer than
+    /// left/right, near/far calmer still. If a preset ever flattens, the
+    /// projection starts breathing on the axis that skews it.
+    #[test]
+    fn presets_keep_near_far_the_calmest_axis() {
+        for preset in [
+            SmoothingPreset::Stable,
+            SmoothingPreset::Normal,
+            SmoothingPreset::Reactive,
+        ] {
+            let cfg = Config {
+                smoothing: preset,
+                ..Config::default()
+            };
+            let [x, y, z] = cfg.one_euro_params();
+            assert!(y.min_cutoff_hz < x.min_cutoff_hz, "{preset:?}");
+            assert!(z.min_cutoff_hz < y.min_cutoff_hz, "{preset:?}");
+        }
+    }
+
+    /// Custom drives the axes from the two settings and keeps that same
+    /// shape, instead of flattening all three onto one pair of numbers.
+    #[test]
+    fn custom_smoothing_follows_the_two_knobs() {
+        let cfg = Config {
+            smoothing: SmoothingPreset::Custom,
+            smoothing_responsiveness: 2.0,
+            smoothing_catch_up: 0.1,
+            ..Config::default()
+        };
+        let [x, y, z] = cfg.one_euro_params();
+        assert!((x.min_cutoff_hz - 2.0).abs() < 1e-6);
+        assert!((x.beta - 0.1).abs() < 1e-6);
+        assert!(y.min_cutoff_hz < x.min_cutoff_hz);
+        assert!(z.min_cutoff_hz < y.min_cutoff_hz);
+    }
+
+    /// Out-of-range values reaching the config (a hand-edited ini, a host
+    /// that does not clamp) must not produce a filter that behaves wildly.
+    #[test]
+    fn custom_smoothing_clamps_what_it_is_given() {
+        let cfg = Config {
+            smoothing: SmoothingPreset::Custom,
+            smoothing_responsiveness: 999.0,
+            smoothing_catch_up: 999.0,
+            ..Config::default()
+        };
+        let [x, _, z] = cfg.one_euro_params();
+        assert!((x.min_cutoff_hz - MIN_CUTOFF_RANGE.1).abs() < 1e-6);
+        assert!(x.beta <= BETA_RANGE.1);
+        // Near/far triples the catch-up, so it is the one that would run away.
+        assert!(z.beta <= BETA_RANGE.1);
+    }
+
+    /// The preset round-trips through the i32 the host stores, Custom
+    /// included — a value the old builds never wrote.
+    #[test]
+    fn smoothing_preset_round_trips() {
+        for preset in [
+            SmoothingPreset::Stable,
+            SmoothingPreset::Normal,
+            SmoothingPreset::Reactive,
+            SmoothingPreset::Custom,
+        ] {
+            assert_eq!(SmoothingPreset::from_i32(preset.to_i32()), preset);
+        }
+    }
+
+    /// A config that only ever set the master gain must behave exactly as it
+    /// did before the trims existed.
+    #[test]
+    fn gain_trims_default_to_no_change() {
+        let cfg = Config::default();
+        assert!((cfg.gain_x - 1.0).abs() < 1e-6);
+        assert!((cfg.gain_y - 1.0).abs() < 1e-6);
+        assert!((cfg.gain_z - 1.0).abs() < 1e-6);
     }
 }
