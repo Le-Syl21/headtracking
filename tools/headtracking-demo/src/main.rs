@@ -68,10 +68,10 @@ const CONTRIB_TERMS: &[(&str, &str)] = &[
     ),
     (
         "Private storage",
-        "each capture is saved locally in the demo's contributions/ folder (your own \
-         copy) and uploaded to the maintainer's private, write-only server. On the \
-         server no one — not even you — can list, read or download anything; only the \
-         maintainer sees the uploads.",
+        "each capture is uploaded to the maintainer's private, write-only server. On \
+         the server no one — not even you — can list, read or download anything; only \
+         the maintainer sees the uploads. You are also offered a folder to keep your \
+         own copy in; declining is fine, and nothing else is written to your disk.",
     ),
     (
         "Never public",
@@ -1368,7 +1368,7 @@ impl winit::application::ApplicationHandler for DemoShell {
 
 const CLI_USAGE: &str = "\
 Usage: headtracking-demo [--capture <backend> [--out <path>] [--wait <secs>]]
-                         [--contribute <backend> [--wait <secs>]]
+                         [--contribute <backend> [--wait <secs>] [--local-copy <dir>]]
 
   --capture <backend>   Run headless: open backend, settle for `--wait`
                         seconds, save one PNG, exit.
@@ -1376,10 +1376,12 @@ Usage: headtracking-demo [--capture <backend> [--out <path>] [--wait <secs>]]
   --contribute <backend>
                         Run headless: capture EVERY stream of the backend
                         (raw/det/depth/ir + previews, same file set as the
-                        GUI Contribute button), save under `contributions/`
-                        next to the binary, upload to the training drop,
-                        exit. Made for unattended cron runs collecting
-                        lighting variety.
+                        GUI Contribute button) and upload it to the training
+                        drop, then exit. Made for unattended cron runs
+                        collecting lighting variety.
+  --local-copy <dir>    Also keep a copy of the capture in <dir>. Without it
+                        nothing is written to disk — the GUI asks for this
+                        folder, a cron run has to name it.
   --out <path>          Output PNG path. Default: next to the binary,
                         named `<backend>_<UTC-timestamp>.png`.
   --wait <secs>         Seconds to let the device warm up + head/lockbar
@@ -1406,6 +1408,10 @@ struct CaptureArgs {
     pf_deg: f32,
     /// `--contribute`: full multi-stream capture + upload instead of one PNG.
     contribute: bool,
+    /// `--local-copy <dir>`: keep a copy of the capture there too. `None` =
+    /// upload only, the same default the GUI offers when the picker is
+    /// cancelled.
+    local_copy: Option<std::path::PathBuf>,
 }
 
 fn parse_cli() -> Result<Option<CaptureArgs>, String> {
@@ -1424,6 +1430,7 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
     let mut lockbar_mm: f32 = headtracking::calibration::LOCKBAR_WIDTH_MM;
     let mut pf_deg: f32 = DEFAULT_TABLE_INCL_DEG;
     let mut contribute = false;
+    let mut local_copy: Option<std::path::PathBuf> = None;
     let mut iter = raw.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1439,6 +1446,10 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
             "--out" => {
                 let v = iter.next().ok_or("--out needs a path")?;
                 out_path = Some(std::path::PathBuf::from(v));
+            }
+            "--local-copy" => {
+                let v = iter.next().ok_or("--local-copy needs a directory")?;
+                local_copy = Some(std::path::PathBuf::from(v));
             }
             "--wait" => {
                 let v = iter.next().ok_or("--wait needs a seconds value")?;
@@ -1470,6 +1481,7 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
         lockbar_mm,
         pf_deg,
         contribute,
+        local_copy,
     }))
 }
 
@@ -1618,9 +1630,10 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
 }
 
 /// Headless `--contribute <backend>`: capture EVERY stream the camera has
-/// (same file set as the GUI Contribute button), save locally under
-/// `contributions/` and upload to the write-only drop, then exit. Built for
-/// unattended cron runs that collect training data across lighting changes.
+/// (same file set as the GUI Contribute button) and upload it to the
+/// write-only drop, then exit — plus a local copy when `--local-copy` names a
+/// folder. Built for unattended cron runs collecting training data across
+/// lighting changes.
 fn run_headless_contribute(cap: CaptureArgs) -> Result<(), String> {
     info!(
         backend = ?cap.backend,
@@ -1702,12 +1715,18 @@ fn run_headless_contribute(cap: CaptureArgs) -> Result<(), String> {
         return Err("no image could be encoded".to_string());
     }
 
-    let dir = contributions_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    // No folder is invented here either: a cron run names one with
+    // `--local-copy` or gets upload-only. An unusable folder is fatal — an
+    // unattended run that silently keeps nothing is worse than one that stops.
+    if let Some(dir) = &cap.local_copy {
+        probe_writable(dir).map_err(|e| format!("--local-copy {}: {e}", dir.display()))?;
+    }
     let uploader = contribute::Uploader::spawn();
     let count = files.len();
     for (name, bytes) in files {
-        if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
+        if let Some(dir) = &cap.local_copy
+            && let Err(e) = std::fs::write(dir.join(&name), &bytes)
+        {
             warn!(name, "contribution: local save failed: {e}");
         }
         println!("contribute: queuing {name} ({} KiB)", bytes.len() / 1024);
@@ -2371,6 +2390,15 @@ struct App {
     /// Stem of the last capture shared, shown so the user can note it (needed
     /// to request a removal, since the drop is anonymous).
     contrib_last: Option<String>,
+    /// Where the user wants their own copy of a shared capture, if anywhere.
+    contrib_local: LocalCopy,
+    /// Folder the last shared capture's files actually reached. The window
+    /// used to announce a folder it had never written to — which is how a
+    /// tester ended up hunting a directory that did not exist.
+    contrib_saved_in: Option<std::path::PathBuf>,
+    /// Why the last local save failed, if it did. Shown next to the folder, so
+    /// "saved locally" is never claimed without proof.
+    contrib_save_error: Option<String>,
     /// Embedded help thumbnails (example capture + the two setup photos),
     /// decoded to textures on first open of the panel.
     contrib_thumbs: Option<[TextureHandle; 3]>,
@@ -4403,6 +4431,9 @@ impl App {
             consent_checked: false,
             uploader: contribute::Uploader::spawn(),
             contrib_last: None,
+            contrib_local: LocalCopy::default(),
+            contrib_saved_in: None,
+            contrib_save_error: None,
             contrib_thumbs: None,
             switch_state: SwitchState::Idle,
             parallax_enabled: true,
@@ -4635,8 +4666,14 @@ impl App {
             return;
         };
         let stem = contribution_stem(backend);
-        let dir = contributions_dir();
-        let _ = std::fs::create_dir_all(&dir);
+        // Ask once, here, where the user's own copy should go — see
+        // [`LocalCopy`] for why there is no default folder.
+        if matches!(self.contrib_local, LocalCopy::Unasked) {
+            self.contrib_local = match ask_local_copy_folder() {
+                Some(dir) => LocalCopy::Folder(dir),
+                None => LocalCopy::Declined,
+            };
+        }
         // Tracking read-out shared by both colour planes — embedded as PNG
         // tEXt so the capture is self-describing (head Z per backend, etc.).
         let mut meta = capture_meta(
@@ -4663,13 +4700,33 @@ impl App {
             ir_v1.as_ref(),
             &meta,
         );
+        // The upload happens whatever the local copy does — the drop is the
+        // point — but record what the save really did so the window can say it
+        // instead of assuming.
+        self.contrib_saved_in = None;
+        self.contrib_save_error = None;
+        let local = match &self.contrib_local {
+            LocalCopy::Folder(dir) => Some(dir.clone()),
+            LocalCopy::Unasked | LocalCopy::Declined => None,
+        };
+        let mut saved = 0usize;
         for (name, bytes) in files {
-            if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
-                warn!(name, "contribution: local save failed: {e}");
+            if let Some(dir) = &local {
+                match std::fs::write(dir.join(&name), &bytes) {
+                    Ok(()) => saved += 1,
+                    Err(e) => {
+                        warn!(name, "contribution: local save failed: {e}");
+                        self.contrib_save_error
+                            .get_or_insert_with(|| format!("{}: {e}", dir.display()));
+                    }
+                }
             }
             self.uploader.submit(name, bytes);
         }
-        info!(stem, "capture shared");
+        if saved > 0 {
+            self.contrib_saved_in = local;
+        }
+        info!(stem, saved, "capture shared");
         self.contrib_last = Some(stem);
     }
 
@@ -4978,15 +5035,17 @@ impl App {
         // rescan automatically once the drivers are in place — whether they
         // came from our button or from a manually-run setup.ps1.
         if self.kinect_access_hint {
-            let due = self.kinect_access_recheck_at.is_none_or(|t| Instant::now() >= t);
+            let due = self
+                .kinect_access_recheck_at
+                .is_none_or(|t| Instant::now() >= t);
             if due {
-                self.kinect_access_recheck_at =
-                    Some(Instant::now() + Duration::from_secs(5));
+                self.kinect_access_recheck_at = Some(Instant::now() + Duration::from_secs(5));
                 if !compute_kinect_access_hint() {
                     info!("Kinect access fixed — rescanning automatically");
                     self.refresh_available();
-                    self.kinect_access_result =
-                        Some(Ok("drivers detected — device list rescanned automatically".into()));
+                    self.kinect_access_result = Some(Ok(
+                        "drivers detected — device list rescanned automatically".into(),
+                    ));
                 }
             }
         } else {
@@ -5078,7 +5137,11 @@ impl App {
                                     );
                                 });
                             } else {
-                                ui.selectable_value(&mut self.selected, entry.backend, &entry.label);
+                                ui.selectable_value(
+                                    &mut self.selected,
+                                    entry.backend,
+                                    &entry.label,
+                                );
                             }
                         }
                         if combo_debug {
@@ -5674,8 +5737,14 @@ impl App {
                     );
                 }
                 if let Some(err) = &st.last_error {
+                    // Only mention a local copy when there actually is one.
+                    let tail = if self.contrib_saved_in.is_some() {
+                        " — your own copy was saved"
+                    } else {
+                        " — and no local copy was kept"
+                    };
                     ui.label(
-                        RichText::new(format!("upload issue: {err} — saved locally"))
+                        RichText::new(format!("upload issue: {err}{tail}"))
                             .color(Color32::from_rgb(0xff, 0x99, 0x66)),
                     );
                 }
@@ -5685,11 +5754,46 @@ impl App {
                     ui.monospace(format!("{stem}_raw.png · {stem}_det.png"));
                 }
                 ui.add_space(4.0);
-                // Where captures land on this machine (also queued for upload).
+                // Your own copy: never a promise, always the checked answer —
+                // the folder a share really reached, the folder chosen for the
+                // next one, or a plain "none".
+                if let Some(err) = &self.contrib_save_error {
+                    ui.label(
+                        RichText::new(format!("⚠ your copy could not be written — {err}"))
+                            .color(Color32::from_rgb(0xff, 0x99, 0x66)),
+                    );
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.label("Also saved locally in:");
-                    ui.monospace(contributions_dir().display().to_string());
+                    match (&self.contrib_saved_in, &self.contrib_local) {
+                        (Some(dir), _) => {
+                            ui.label("Your copy was saved in:");
+                            ui.monospace(dir.display().to_string());
+                        }
+                        (None, LocalCopy::Folder(dir)) => {
+                            ui.label("Your copy will be saved in:");
+                            ui.monospace(dir.display().to_string());
+                        }
+                        (None, LocalCopy::Declined) => {
+                            ui.label("Your copy: none kept — upload only.");
+                        }
+                        (None, LocalCopy::Unasked) => {
+                            ui.label("Your copy: you'll be asked for a folder when you share.");
+                        }
+                    }
+                    if ui
+                        .button("📁 Choose a folder…")
+                        .on_hover_text(
+                            "Where to keep your own copy of each capture. Cancelling the \
+                             picker means the capture is only uploaded.",
+                        )
+                        .clicked()
+                    {
+                        self.contrib_local = match ask_local_copy_folder() {
+                            Some(dir) => LocalCopy::Folder(dir),
+                            None => LocalCopy::Declined,
+                        };
+                    }
                 });
                 ui.separator();
                 ui.label(RichText::new("Before you capture").strong());
@@ -6687,13 +6791,63 @@ fn backend_slug(b: Backend) -> String {
     }
 }
 
-/// Directory for shared captures, next to the running binary.
-fn contributions_dir() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("contributions")
+/// Where the user's own copy of a shared capture goes.
+///
+/// There is deliberately no default. The demo is a single binary people run
+/// straight out of a download — very often from a temporary extraction (WinRAR
+/// and friends open archives in `%TEMP%`), and a folder picked next to the
+/// binary is then wiped without warning. So we ask, once, at the moment it
+/// matters; declining is a perfectly good answer, and the upload happens
+/// either way.
+#[derive(Debug, Clone, Default)]
+enum LocalCopy {
+    /// Nobody has been asked yet — the next share opens the picker.
+    #[default]
+    Unasked,
+    /// The user cancelled the picker: upload only, and no nagging on the next
+    /// share (the window still offers a button to change their mind).
+    Declined,
+    /// Keep a copy in this folder.
+    Folder(std::path::PathBuf),
+}
+
+/// Open the native folder picker for the local copy. `None` when the user
+/// cancels, when the folder they chose cannot actually be written to, or when
+/// no picker is reachable at all (a bare compositor with no desktop portal) —
+/// every one of those falls back to upload-only, which is a working outcome.
+fn ask_local_copy_folder() -> Option<std::path::PathBuf> {
+    let dir = rfd::FileDialog::new()
+        .set_title("Keep your own copy of the capture — choose a folder (Cancel: upload only)")
+        .pick_folder()?;
+    match probe_writable(&dir) {
+        Ok(()) => {
+            info!(path = %dir.display(), "local copy folder chosen");
+            Some(dir)
+        }
+        Err(e) => {
+            warn!(path = %dir.display(), "local copy folder unusable: {e}");
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Cannot write there")
+                .set_description(format!(
+                    "{}\n\n{e}\n\nNo local copy will be kept — the upload still works.",
+                    dir.display()
+                ))
+                .show();
+            None
+        }
+    }
+}
+
+/// Prove a file can actually be written inside `dir`. Being able to *see* a
+/// folder says nothing: the interesting failures (a read-only mount, a
+/// policy-locked `Program Files`) only show up on the write.
+fn probe_writable(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create: {e}"))?;
+    let probe = dir.join(".ht-write-probe");
+    std::fs::write(&probe, b"").map_err(|e| format!("cannot write: {e}"))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Shared stem for a capture's two files: `ht_<backend>_<UTC>_<rand6>`, where
@@ -7666,5 +7820,66 @@ impl Write for LogWriter {
 impl Drop for LogWriter {
     fn drop(&mut self) {
         let _ = self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory we can create and write in is accepted.
+    #[test]
+    fn probe_accepts_a_writable_folder() {
+        let dir = std::env::temp_dir().join("ht-probe-ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(probe_writable(&dir).is_ok());
+        assert!(dir.is_dir(), "the probe creates the folder it validates");
+        // The probe file must not survive — a contribution folder that starts
+        // with a stray dotfile in it is confusing.
+        assert!(!dir.join(".ht-write-probe").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that cannot be created is refused rather than assumed — this is
+    /// the case that used to be swallowed by `let _ = create_dir_all(..)`.
+    #[test]
+    fn probe_refuses_a_path_under_a_file() {
+        let file = std::env::temp_dir().join("ht-probe-not-a-dir");
+        std::fs::write(&file, b"x").expect("write fixture");
+        let err = probe_writable(&file.join("sub")).expect_err("a file is not a parent");
+        assert!(err.starts_with("cannot create"), "{err}");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Being able to see a folder says nothing about being able to write in
+    /// it: the read-only case is exactly what a `Program Files` install or a
+    /// read-only mount looks like, and it only shows up on the write.
+    #[cfg(unix)]
+    #[test]
+    fn probe_refuses_a_read_only_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("ht-probe-readonly");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fixture");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod fixture");
+        let refused = probe_writable(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore fixture");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Running as root defeats the permission bits entirely; skip rather
+        // than assert something the environment cannot honour.
+        if unsafe { libc_geteuid() } != 0 {
+            let err = refused.expect_err("a read-only folder is not usable");
+            assert!(err.starts_with("cannot write"), "{err}");
+        }
+    }
+
+    #[cfg(unix)]
+    unsafe fn libc_geteuid() -> u32 {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() }
     }
 }

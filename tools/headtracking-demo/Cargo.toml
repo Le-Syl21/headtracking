@@ -51,6 +51,10 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # JPEG decode for the embedded setup / example thumbnails in the "Share a
 # capture" help (jpeg only — already in the lockfile transitively).
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Native folder picker for "keep my own copy of the capture". `xdg-portal`
+# (not gtk3) keeps the zero-install promise on Linux: the dialog goes through
+# the desktop portal over D-Bus, so no GTK to link or ship.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 [build-dependencies]
 # Embeds assets/icon.ico as the .exe icon on Windows; inert elsewhere.
