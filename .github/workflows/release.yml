@@ -664,7 +664,14 @@ jobs:
           ssign --verbose \
             -n "headtracking" -u "https://github.com/${{ github.repository }}" \
             "${pe[@]}"
-          sudo apt-get update -qq && sudo apt-get install -y osslsigncode
+          # osslsigncode's -pkcs11module goes through OpenSSL's `pkcs11`
+          # ENGINE, which is a separate package: without it the sign call dies
+          # on `ENGINE_by_id: no such engine: id=pkcs11` after the PE files are
+          # already signed. Engines are deprecated upstream in favour of
+          # providers, so if this package ever disappears the fix is
+          # osslsigncode's provider path, not a newer engine.
+          sudo apt-get update -qq
+          sudo apt-get install -y osslsigncode libengine-pkcs11-openssl
           # Vérifie les faits, pas la présence d'une phrase. « Calculated message
           # digest » apparaît AUSSI quand le digest ne correspond pas, et ne dit
           # rien de l'horodatage : ce contrôle laissait donc passer une signature
@@ -695,6 +702,12 @@ jobs:
           # -ExecutionPolicy RemoteSigned instead of bypassing policy).
           # Same cloud key, via the PKCS#11 module — osslsigncode knows
           # the PowerShell SIP format.
+          # Check the engine up front rather than discovering it is missing
+          # halfway through, so the error names the cause.
+          if [ "${#scripts[@]}" -gt 0 ] && ! openssl engine pkcs11 >/dev/null 2>&1; then
+            echo "::error::OpenSSL pkcs11 engine unavailable - scripts cannot be signed"
+            exit 1
+          fi
           for f in "${scripts[@]}"; do
             osslsigncode sign \
               -pkcs11module ssign-src/target/release/libssign_pkcs11.so \
