@@ -3201,6 +3201,10 @@ enum CaptureCmd {
     /// or immediately when no throttle is active. Used by the contribution
     /// capture so `_raw.png` is never ~400 ms stale.
     RefreshRgb(mpsc::Sender<()>),
+    /// Run the cabinet anchor detection again from scratch (↻ Recalibrate):
+    /// thaws the frozen best-of-warmup and drops the geometry derived from it,
+    /// for when the camera has been moved or re-aimed.
+    Recalibrate,
     /// Display-stream choice. Only the Kinect v1 acts on it at the device level
     /// (colour and IR are mutually exclusive there); every other backend keeps
     /// all its streams running and this stays a pure display concern.
@@ -3422,6 +3426,15 @@ fn capture_thread_loop(
                             }
                         }
                     }
+                }
+                CaptureCmd::Recalibrate => {
+                    cap.anchor_worker.recalibrate();
+                    // Drop what the old lock produced as well: the overlay
+                    // would otherwise keep drawing a lockbar the user has just
+                    // told us is wrong, until a new detection lands.
+                    cap.last_anchor = None;
+                    cap.last_lockbar = None;
+                    cap.anchor_ms = 0.0;
                 }
                 CaptureCmd::GrabIrV1(reply) => {
                     let frame = if let Inner::KinectV1 { device, .. } = &mut cap.inner {
@@ -3647,6 +3660,9 @@ struct AnchorWorker {
     stop: Arc<AtomicBool>,
     /// Set once the best-of-warmup detection is frozen (the cabinet is fixed).
     locked: Arc<AtomicBool>,
+    /// Raised by [`Self::recalibrate`] to thaw that freeze and run a fresh
+    /// warmup. The cabinet is fixed, the camera on top of it is not.
+    reset: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -3656,21 +3672,24 @@ impl AnchorWorker {
         let out = Arc::new(Mutex::new(AnchorOut::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let locked = Arc::new(AtomicBool::new(false));
-        let (job_t, out_t, stop_t, locked_t) = (
+        let reset = Arc::new(AtomicBool::new(false));
+        let (job_t, out_t, stop_t, locked_t, reset_t) = (
             Arc::clone(&job),
             Arc::clone(&out),
             Arc::clone(&stop),
             Arc::clone(&locked),
+            Arc::clone(&reset),
         );
         let handle = std::thread::Builder::new()
             .name("anchor".into())
-            .spawn(move || anchor_worker_loop(&job_t, &out_t, &stop_t, &locked_t))
+            .spawn(move || anchor_worker_loop(&job_t, &out_t, &stop_t, &locked_t, &reset_t))
             .expect("spawn anchor thread");
         Self {
             job,
             out,
             stop,
             locked,
+            reset,
             handle: Some(handle),
         }
     }
@@ -3678,6 +3697,17 @@ impl AnchorWorker {
     /// True once the warmup froze the best detection (the caller stops submitting).
     fn is_locked(&self) -> bool {
         self.locked.load(Ordering::Acquire)
+    }
+
+    /// Run the detection again from scratch: thaw the freeze, forget the best
+    /// score and the published geometry, restart the warmup window. For when
+    /// the camera has been moved or re-aimed after the lock — until this
+    /// existed, the only way out was to switch backend and back.
+    fn recalibrate(&self) {
+        self.reset.store(true, Ordering::Release);
+        // Wake the job wait too: a reset raised while the worker is still in
+        // warmup is picked up at the top of the next iteration.
+        self.job.1.notify_one();
     }
 
     fn submit(&self, rgb888: Arc<Vec<u8>>, w: u32, h: u32) {
@@ -3705,6 +3735,7 @@ fn anchor_worker_loop(
     out: &Arc<Mutex<AnchorOut>>,
     stop: &Arc<AtomicBool>,
     locked: &Arc<AtomicBool>,
+    reset: &Arc<AtomicBool>,
 ) {
     let mut det = match anchor::AnchorDetector::new() {
         Ok(d) => d,
@@ -3721,7 +3752,20 @@ fn anchor_worker_loop(
     let mut last_run = Instant::now();
     let mut warmup_start: Option<Instant> = None;
     let mut best_score = 0.0f32;
+    // Forget everything the last warmup concluded. Keeping the old best score
+    // would make a recalibration pointless: the frozen detection is exactly
+    // what the user is telling us is wrong now.
+    let restart = |warmup_start: &mut Option<Instant>, best_score: &mut f32| {
+        *warmup_start = None;
+        *best_score = 0.0;
+        *out.lock() = AnchorOut::default();
+        locked.store(false, Ordering::Release);
+        info!("anchor: recalibrating");
+    };
     loop {
+        if reset.swap(false, Ordering::AcqRel) {
+            restart(&mut warmup_start, &mut best_score);
+        }
         while last_run.elapsed() < INTERVAL {
             if stop.load(Ordering::Acquire) {
                 return;
@@ -3768,10 +3812,22 @@ fn anchor_worker_loop(
         // for good (the caller stops submitting once `is_locked`).
         if start.elapsed() >= WARMUP {
             locked.store(true, Ordering::Release);
+            // Park instead of exiting: ↻ Recalibrate has to be able to wake
+            // this thread. The caller stops submitting while locked, so the
+            // job wait below would never return on its own.
             while !stop.load(Ordering::Acquire) {
+                if reset.swap(false, Ordering::AcqRel) {
+                    restart(&mut warmup_start, &mut best_score);
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            return;
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            // `last_run` is stale by now, so the next detection runs at once
+            // rather than after another throttle interval.
+            continue;
         }
     }
 }
@@ -5603,11 +5659,13 @@ impl App {
                 ui.label("Parallax");
                 ui.add(egui::Slider::new(&mut self.parallax_gain, 0.5..=6.0).text("gain"))
                     .on_hover_text("Amplification of head movement into the POV.");
-                ui.toggle_value(&mut self.parallax_invert[0], "±X")
+                // Name the axis, not just its letter: while dragging you need
+                // to know which way the cab is going to move.
+                ui.toggle_value(&mut self.parallax_invert[0], "±X left/right")
                     .on_hover_text("Flip the left/right axis.");
-                ui.toggle_value(&mut self.parallax_invert[1], "±Y")
+                ui.toggle_value(&mut self.parallax_invert[1], "±Y up/down")
                     .on_hover_text("Flip the up/down axis.");
-                ui.toggle_value(&mut self.parallax_invert[2], "±Z")
+                ui.toggle_value(&mut self.parallax_invert[2], "±Z near/far")
                     .on_hover_text("Flip the depth axis (closer/farther).");
             });
         });
@@ -6093,23 +6151,56 @@ impl App {
                 );
             }
         });
-        // Line 2 — the anchor-derived lockbar, on its own row below.
-        if let Some(bar) = active.last_lockbar {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "lockbar (anchor) px: row {}, w {}px, t {}px, slope {:+.1}°",
-                        bar.mean_row(),
-                        bar.mean_width_px(),
-                        bar.thickness_px,
-                        bar.slope_deg,
-                    ))
-                    .color(LOCKBAR_COLOR)
-                    .monospace()
-                    .size(15.0),
-                );
-            });
-        }
+        // Line 2 — the anchor-derived lockbar, on its own row below, next to
+        // the control that runs the detection again. The warmup freezes the
+        // best detection because the cabinet is fixed — but the camera on top
+        // of it is not, and a lock taken before it was aimed stayed wrong for
+        // the rest of the session.
+        ui.horizontal(|ui| {
+            match active.last_lockbar {
+                Some(bar) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "lockbar (anchor) px: row {}, w {}px, t {}px, slope {:+.1}°",
+                            bar.mean_row(),
+                            bar.mean_width_px(),
+                            bar.thickness_px,
+                            bar.slope_deg,
+                        ))
+                        .color(LOCKBAR_COLOR)
+                        .monospace()
+                        .size(15.0),
+                    );
+                }
+                None if active.anchor_locked => {
+                    ui.label(
+                        RichText::new("lockbar (anchor): not found — aim the camera, then ↻")
+                            .color(Color32::GRAY)
+                            .monospace()
+                            .size(15.0),
+                    );
+                }
+                None => {
+                    ui.label(
+                        RichText::new("lockbar (anchor): looking…")
+                            .color(Color32::GRAY)
+                            .monospace()
+                            .size(15.0),
+                    );
+                }
+            }
+            if ui
+                .button("↻ Recalibrate")
+                .on_hover_text(
+                    "Detect the cabinet again from scratch. Use it after moving or \
+                     re-aiming the camera — the calibration freezes on purpose once \
+                     it has settled, so it will not follow the change on its own.",
+                )
+                .clicked()
+            {
+                let _ = active.worker.cmd_tx.send(CaptureCmd::Recalibrate);
+            }
+        });
     }
 
     /// Row 3 — camera OUTPUT: the head expressed in the lockbar frame, i.e.
