@@ -202,8 +202,25 @@ fn main() {
             // workflow), so it needs the loader's own Win32 dependencies:
             // the registry for the ICD list, and cfgmgr32 for the newer
             // device-enumeration path.
+            //
+            // rustc also needs the directory: telling CMake where the library
+            // is says nothing to the Rust link step, and the whole build dies
+            // on `could not find native static library OpenCL`. Without an
+            // explicit path (a local build with no CI-provided loader) fall
+            // back to the system's dynamic one.
             "windows" => {
-                println!("cargo:rustc-link-lib=static=OpenCL");
+                let static_lib = env::var("HT_OPENCL_LIBRARY")
+                    .ok()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_file());
+                if let Some(lib) = static_lib {
+                    if let Some(dir) = lib.parent() {
+                        println!("cargo:rustc-link-search=native={}", dir.display());
+                    }
+                    println!("cargo:rustc-link-lib=static=OpenCL");
+                } else {
+                    println!("cargo:rustc-link-lib=dylib=OpenCL");
+                }
                 println!("cargo:rustc-link-lib=dylib=cfgmgr32");
                 println!("cargo:rustc-link-lib=dylib=ole32");
                 println!("cargo:rustc-link-lib=dylib=advapi32");
