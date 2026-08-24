@@ -58,39 +58,6 @@ const WEBCAM_FX_PER_WIDTH: f32 = 0.9;
 
 const LOG_BUFFER_LINES: usize = 1_000;
 
-mod contribute;
-
-/// Privacy-notice bullets for the Share-a-capture window (title, body).
-const CONTRIB_TERMS: &[(&str, &str)] = &[
-    (
-        "Sole use",
-        "to train and improve the pincab head-tracking model. Nothing else.",
-    ),
-    (
-        "Private storage",
-        "each capture is saved locally in the demo's contributions/ folder (your own \
-         copy) and uploaded to the maintainer's private, write-only server. On the \
-         server no one — not even you — can list, read or download anything; only the \
-         maintainer sees the uploads.",
-    ),
-    (
-        "Never public",
-        "never published, sold, shared with third parties, or used beyond training.",
-    ),
-    (
-        "Your responsibility",
-        "share only images you have the right to distribute. If people appear (children \
-         included), you confirm you have their consent (or are the parent/guardian). You \
-         must be of legal age.",
-    ),
-    (
-        "Withdrawal",
-        "uploads are anonymous and can't be searched by author — to have one removed, give \
-         its exact file name (shown after upload) on Discord #headtracking \
-         (https://discord.gg/cFcNrt9AY).",
-    ),
-];
-
 // Overlay colours, kept here so the toolbar status text and the canvas
 // drawing stay in sync. Head → soft red; the anchor geometry → a
 // translucent cyan fill, with the lockbar quad derived from its closed
@@ -101,7 +68,7 @@ const LOCKBAR_COLOR: Color32 = Color32::from_rgb(0x00, 0xe5, 0xff);
 fn main() {
     // The `windows_subsystem = "windows"` attribute above detaches release
     // builds from any console (no black window on double-click) — but the
-    // CLI modes (--capture, --contribute, --list-cameras…) still need to
+    // CLI modes (--capture, --list-cameras…) still need to
     // print when launched FROM a terminal. Re-attach to the parent's
     // console if there is one; failing (the double-click case) is normal.
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
@@ -131,49 +98,9 @@ fn main() {
         "headtracking-demo starting"
     );
 
-    // Hidden `--upload-test`: exercise the contribution upload path (ureq /
-    // rustls / auth / write-only drop) end to end without the GUI, then exit.
-    if std::env::args().any(|a| a == "--upload-test") {
-        let uploader = contribute::Uploader::spawn();
-        let name = format!("{}_uploadtest.txt", contribution_stem(Backend::None));
-        println!("upload-test: PUT {name}");
-        uploader.submit(name.clone(), b"headtracking-demo upload test\n".to_vec());
-        for _ in 0..100 {
-            std::thread::sleep(Duration::from_millis(100));
-            let st = uploader.status();
-            if st.pending == 0 {
-                if st.uploaded > 0 {
-                    println!("upload-test: OK ({name})");
-                    std::process::exit(0);
-                }
-                eprintln!("upload-test: FAILED — {:?}", st.last_error);
-                std::process::exit(1);
-            }
-        }
-        eprintln!("upload-test: timeout");
-        std::process::exit(1);
-    }
-
-    // `--list-cameras`: print what SDL enumerates (real SDL_CameraIDs, which
-    // are opaque and NOT 0/1/2 indices), then exit. Diagnostic for "why isn't
-    // my webcam picked up".
-    if std::env::args().any(|a| a == "--list-cameras") {
-        match webcam::list() {
-            Ok(cams) if cams.is_empty() => println!("SDL enumerated 0 cameras."),
-            Ok(cams) => {
-                println!("SDL enumerated {} camera(s):", cams.len());
-                for c in &cams {
-                    println!("  id={} name={:?}", c.id, c.name);
-                }
-            }
-            Err(e) => println!("camera enumeration failed: {e}"),
-        }
-        std::process::exit(0);
-    }
-
     // `--pose-test --raw <png> [--depth <png>] [--ir <png>] [--out <png>]`:
     // headless validation of the BlazePose head/pose path on real captured
-    // modalities (e.g. a contribution raw+depth pair). Runs BlazePose on the
+    // modalities (e.g. a captured raw+depth pair). Runs BlazePose on the
     // raw, samples depth at the nose, renders the skeleton, prints + exits.
     if std::env::args().any(|a| a == "--pose-test") {
         let mut args = std::env::args();
@@ -209,21 +136,14 @@ fn main() {
             eprintln!("error: {msg}\n\n{CLI_USAGE}");
             std::process::exit(2);
         }
-        Ok(Some(cap)) => {
-            let result = if cap.contribute {
-                run_headless_contribute(cap)
-            } else {
-                run_headless_capture(cap)
-            };
-            match result {
-                Ok(()) => std::process::exit(0),
-                Err(e) => {
-                    error!(error = %e, "headless capture failed");
-                    eprintln!("capture failed: {e}");
-                    std::process::exit(1);
-                }
+        Ok(Some(cap)) => match run_headless_capture(cap) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                error!(error = %e, "headless capture failed");
+                eprintln!("capture failed: {e}");
+                std::process::exit(1);
             }
-        }
+        },
         Ok(None) => {}
     }
 
@@ -1368,18 +1288,10 @@ impl winit::application::ApplicationHandler for DemoShell {
 
 const CLI_USAGE: &str = "\
 Usage: headtracking-demo [--capture <backend> [--out <path>] [--wait <secs>]]
-                         [--contribute <backend> [--wait <secs>]]
 
   --capture <backend>   Run headless: open backend, settle for `--wait`
                         seconds, save one PNG, exit.
                         backend = kinect-v2 | kinect-v1 | webcam | webcam-<N>
-  --contribute <backend>
-                        Run headless: capture EVERY stream of the backend
-                        (raw/det/depth/ir + previews, same file set as the
-                        GUI Contribute button), save under `contributions/`
-                        next to the binary, upload to the training drop,
-                        exit. Made for unattended cron runs collecting
-                        lighting variety.
   --out <path>          Output PNG path. Default: next to the binary,
                         named `<backend>_<UTC-timestamp>.png`.
   --wait <secs>         Seconds to let the device warm up + head/lockbar
@@ -1404,8 +1316,6 @@ struct CaptureArgs {
     wait_secs: f32,
     lockbar_mm: f32,
     pf_deg: f32,
-    /// `--contribute`: full multi-stream capture + upload instead of one PNG.
-    contribute: bool,
 }
 
 fn parse_cli() -> Result<Option<CaptureArgs>, String> {
@@ -1423,18 +1333,12 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
     let mut wait_secs: f32 = 3.0;
     let mut lockbar_mm: f32 = headtracking::calibration::LOCKBAR_WIDTH_MM;
     let mut pf_deg: f32 = DEFAULT_TABLE_INCL_DEG;
-    let mut contribute = false;
     let mut iter = raw.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--capture" => {
                 let v = iter.next().ok_or("--capture needs a backend name")?;
                 backend = Some(parse_backend_arg(v)?);
-            }
-            "--contribute" => {
-                let v = iter.next().ok_or("--contribute needs a backend name")?;
-                backend = Some(parse_backend_arg(v)?);
-                contribute = true;
             }
             "--out" => {
                 let v = iter.next().ok_or("--out needs a path")?;
@@ -1461,15 +1365,13 @@ fn parse_cli() -> Result<Option<CaptureArgs>, String> {
             other => return Err(format!("unknown flag '{other}'")),
         }
     }
-    let backend =
-        backend.ok_or("--capture or --contribute <backend> is required for non-GUI mode")?;
+    let backend = backend.ok_or("--capture <backend> is required for non-GUI mode")?;
     Ok(Some(CaptureArgs {
         backend,
         out_path,
         wait_secs,
         lockbar_mm,
         pf_deg,
-        contribute,
     }))
 }
 
@@ -1496,7 +1398,7 @@ fn parse_backend_arg(s: &str) -> Result<Backend, String> {
 
 /// Open a backend, wait for its first RGB frame (bouncing the stream like the
 /// GUI does when a Kinect v1 opens silent), then let the pipeline settle for
-/// `wait_secs` so the detectors lock on. Shared by `--capture`/`--contribute`.
+/// `wait_secs` so the detectors lock on.
 fn open_and_settle(backend: Backend, wait_secs: f32) -> Result<Capture, String> {
     let mut active = open_backend(backend)?;
     // Same stream-liveness recovery as the GUI, but blocking: wait for the
@@ -1615,126 +1517,6 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
         "headless capture saved"
     );
     Ok(())
-}
-
-/// Headless `--contribute <backend>`: capture EVERY stream the camera has
-/// (same file set as the GUI Contribute button), save locally under
-/// `contributions/` and upload to the write-only drop, then exit. Built for
-/// unattended cron runs that collect training data across lighting changes.
-fn run_headless_contribute(cap: CaptureArgs) -> Result<(), String> {
-    info!(
-        backend = ?cap.backend,
-        wait_secs = cap.wait_secs,
-        "headless contribution starting"
-    );
-    let mut active = open_and_settle(cap.backend, cap.wait_secs)?;
-
-    // v1: colour and IR share one USB endpoint — grab both explicitly
-    // through the momentary mode switch, exactly like the GUI does.
-    let (rgb_v1, ir_v1) = if let Inner::KinectV1 { device, .. } = &mut active.inner {
-        let rgb = match device.capture_rgb(3) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                warn!("contribution: v1 RGB capture failed: {e}");
-                None
-            }
-        };
-        let ir = match device.capture_ir(3) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                warn!("contribution: v1 IR capture failed: {e}");
-                None
-            }
-        };
-        (rgb, ir)
-    } else {
-        (None, None)
-    };
-
-    let (w, h, raw): (u32, u32, Vec<u8>) = match rgb_v1.as_ref() {
-        Some(f) => (f.width, f.height, f.data.clone()),
-        None => {
-            let (w, h, raw) = active
-                .last_rgb_frame
-                .as_ref()
-                .ok_or_else(|| format!("no RGB frame received in {:.1}s", cap.wait_secs))?;
-            (*w, *h, raw.as_ref().clone())
-        }
-    };
-
-    let stem = contribution_stem(active.backend);
-    let mut meta = capture_meta(
-        active.backend,
-        (w, h),
-        &stem,
-        CabGeom {
-            table_incl_deg: cap.pf_deg,
-            lockbar_mm: cap.lockbar_mm,
-        },
-        active.last_head,
-        active.last_pose.as_ref(),
-        active.last_lockbar.as_ref(),
-    );
-    meta.extend(autocalib_meta(
-        active.last_lockbar.as_ref(),
-        (w, h),
-        active.last_depth.as_deref(),
-    ));
-    let det = bake_overlays(
-        w,
-        h,
-        &raw,
-        active.last_pose.as_ref(),
-        active.last_anchor.as_ref(),
-    );
-    let files = build_contribution_files(
-        &stem,
-        active.backend,
-        (w, h),
-        &raw,
-        &det,
-        active.last_depth.as_deref(),
-        active.last_ir.as_deref(),
-        ir_v1.as_ref(),
-        &meta,
-    );
-    if files.is_empty() {
-        return Err("no image could be encoded".to_string());
-    }
-
-    let dir = contributions_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let uploader = contribute::Uploader::spawn();
-    let count = files.len();
-    for (name, bytes) in files {
-        if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
-            warn!(name, "contribution: local save failed: {e}");
-        }
-        println!("contribute: queuing {name} ({} KiB)", bytes.len() / 1024);
-        uploader.submit(name, bytes);
-    }
-    // Block until the upload queue drains — cron has no UI to watch it.
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        let st = uploader.status();
-        if st.pending == 0 {
-            if st.uploaded == count {
-                println!("contribute: OK — {count} file(s) uploaded ({stem})");
-                return Ok(());
-            }
-            return Err(format!(
-                "only {}/{count} file(s) uploaded — last error: {:?}",
-                st.uploaded, st.last_error
-            ));
-        }
-        if Instant::now() > deadline {
-            return Err(format!(
-                "upload timed out with {}/{count} file(s) done",
-                st.uploaded
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
 }
 
 /// Same pipeline as the live capture loop, run inline (headless mode is
@@ -2361,19 +2143,9 @@ struct App {
     /// [`StreamKind::Rgb`] on every backend change, since not every device
     /// offers the same streams.
     selected_stream: StreamKind,
-    /// "Share a capture" window toggle + state.
-    contribute_open: bool,
-    /// The informed-consent checkbox (see the privacy notice). Gates the
-    /// share button; in-memory for the session.
-    consent_checked: bool,
-    /// Background uploader for shared captures (write-only Nextcloud drop).
-    uploader: contribute::Uploader,
-    /// Stem of the last capture shared, shown so the user can note it (needed
-    /// to request a removal, since the drop is anonymous).
-    contrib_last: Option<String>,
-    /// Embedded help thumbnails (example capture + the two setup photos),
-    /// decoded to textures on first open of the panel.
-    contrib_thumbs: Option<[TextureHandle; 3]>,
+    /// Embedded camera-placement thumbnails (the two setup photos + an
+    /// example frame), decoded to textures on first use.
+    placement_thumbs: Option<[TextureHandle; 3]>,
     /// Backend-switch state machine. Switching device closes the old one, then
     /// waits ~500 ms ("closing"), then ~500 ms ("opening") before the actual
     /// open — ~1 s of USB settle so a Kinect released by one backend is ready
@@ -2665,10 +2437,6 @@ struct Capture {
     /// When the colour frame was last polled+converted on the v2 while
     /// tracking on IR — throttles that path to ~2.5 Hz (see the v2 arm).
     last_rgb_refresh: Option<Instant>,
-    /// Pending [`CaptureCmd::RefreshRgb`] ack: while `Some`, the v2 arm
-    /// bypasses the colour throttle once and fires the ack right after the
-    /// fresh conversion lands.
-    rgb_refresh_ack: Option<mpsc::Sender<()>>,
     /// Colour-space depth view (v2 only): bigdepth cropped to the 1920×1080
     /// colour window, in `u16` mm with `0` = no reading. `Some` only while the
     /// depth stream is selected — it shares the colour framing, so the pose and
@@ -2726,18 +2494,12 @@ impl Capture {
                 // plugin should go further and simply open with
                 // `start_streams(false, true)` — never decode colour at all.
                 let want_rgb = !track_on_ir
-                    || self.rgb_refresh_ack.is_some()
                     || self
                         .last_rgb_refresh
                         .is_none_or(|t| t.elapsed() >= Duration::from_millis(400));
                 if want_rgb && let Some(rgb) = device.poll_rgb() {
                     self.last_rgb_at = Some(Instant::now());
                     self.last_rgb_refresh = Some(Instant::now());
-                    // A contribution capture asked for an un-throttled frame:
-                    // it just landed, let the GL thread proceed.
-                    if let Some(ack) = self.rgb_refresh_ack.take() {
-                        let _ = ack.send(());
-                    }
                     let rgb888 = Arc::new(bgrx_to_rgb888(&rgb.data));
                     if !track_on_ir {
                         got_rgb = true;
@@ -3161,18 +2923,6 @@ enum CaptureCmd {
     SetTilt(f32),
     SetLed(freenect::LedState),
     ResetBaseline,
-    /// Grab one v1 IR frame (borrows the video endpoint if RGB is live, then
-    /// restores it); reply with the frame or `None` on failure / non-v1.
-    GrabIrV1(mpsc::Sender<Option<freenect::IrFrame>>),
-    /// Grab one v1 colour frame — the mirror of [`Self::GrabIrV1`], for the
-    /// contribution capture while the IR stream is selected. A contribution
-    /// must always export every stream a camera has, whatever is on screen.
-    GrabRgbV1(mpsc::Sender<Option<freenect::RgbFrame>>),
-    /// Ask for one un-throttled colour conversion (v2 tracking-on-IR throttles
-    /// colour to ~2.5 Hz); the ack fires once a fresh frame has been converted,
-    /// or immediately when no throttle is active. Used by the contribution
-    /// capture so `_raw.png` is never ~400 ms stale.
-    RefreshRgb(mpsc::Sender<()>),
     /// Display-stream choice. Only the Kinect v1 acts on it at the device level
     /// (colour and IR are mutually exclusive there); every other backend keeps
     /// all its streams running and this stays a pure display concern.
@@ -3393,46 +3143,6 @@ fn capture_thread_loop(
                                 Err(e) => warn!(?e, ?want, "kinect v1: video switch failed"),
                             }
                         }
-                    }
-                }
-                CaptureCmd::GrabIrV1(reply) => {
-                    let frame = if let Inner::KinectV1 { device, .. } = &mut cap.inner {
-                        match device.capture_ir(3) {
-                            Ok(f) => Some(f),
-                            Err(e) => {
-                                warn!("contribution: v1 IR capture failed: {e}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let _ = reply.send(frame);
-                }
-                CaptureCmd::GrabRgbV1(reply) => {
-                    let frame = if let Inner::KinectV1 { device, .. } = &mut cap.inner {
-                        match device.capture_rgb(3) {
-                            Ok(f) => Some(f),
-                            Err(e) => {
-                                warn!("contribution: v1 RGB capture failed: {e}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let _ = reply.send(frame);
-                }
-                CaptureCmd::RefreshRgb(reply) => {
-                    // Only the v2-tracking-on-IR path throttles colour; in every
-                    // other state the latest colour frame is already fresh, so
-                    // ack straight away instead of parking the sender.
-                    let throttled = matches!(cap.inner, Inner::KinectV2 { .. })
-                        && cap.selected_stream == StreamKind::Ir;
-                    if throttled {
-                        cap.rgb_refresh_ack = Some(reply);
-                    } else {
-                        let _ = reply.send(());
                     }
                 }
             }
@@ -4399,11 +4109,7 @@ impl App {
             head_filter_beta: 0.03,
             bypass_filters: false,
             selected_stream: StreamKind::Rgb,
-            contribute_open: false,
-            consent_checked: false,
-            uploader: contribute::Uploader::spawn(),
-            contrib_last: None,
-            contrib_thumbs: None,
+            placement_thumbs: None,
             switch_state: SwitchState::Idle,
             parallax_enabled: true,
             parallax_tex: None,
@@ -4545,132 +4251,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// Encode the current frame's raw + detection images, save both to
-    /// `contributions/` and queue them for the write-only upload. No-op if no
-    /// frame is available. Called from the "Share a capture" button.
-    fn share_capture(&mut self) {
-        // A contribution must export EVERY stream the camera has, whatever is
-        // selected on screen. The v1's colour and IR share one USB endpoint,
-        // so we always request BOTH from the capture thread: whichever is
-        // already live costs one frame, the other borrows the endpoint through
-        // a momentary mode switch and hands it back to the user's selected
-        // stream (~500 ms). The GL thread never needs to know which mode the
-        // device is in. A brief block here is fine (manual button); 2 s covers
-        // the warmup + switch round-trip of each grab.
-        let (rgb_v1, ir_v1) = match self.active.as_ref() {
-            Some(active) if active.backend == Backend::KinectV1 => {
-                let rgb = {
-                    let (tx, rx) = mpsc::channel();
-                    if active.worker.cmd_tx.send(CaptureCmd::GrabRgbV1(tx)).is_ok() {
-                        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
-                    } else {
-                        None
-                    }
-                };
-                let ir = {
-                    let (tx, rx) = mpsc::channel();
-                    if active.worker.cmd_tx.send(CaptureCmd::GrabIrV1(tx)).is_ok() {
-                        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
-                    } else {
-                        None
-                    }
-                };
-                (rgb, ir)
-            }
-            _ => (None, None),
-        };
-        // The v2 throttles colour conversion to ~2.5 Hz while tracking on IR —
-        // ask for one un-throttled conversion so `_raw.png` isn't ~400 ms
-        // stale. Acks immediately when no throttle is active.
-        if let Some(active) = self.active.as_ref()
-            && active.backend == Backend::KinectV2
-        {
-            let (tx, rx) = mpsc::channel();
-            if active
-                .worker
-                .cmd_tx
-                .send(CaptureCmd::RefreshRgb(tx))
-                .is_ok()
-            {
-                let _ = rx.recv_timeout(Duration::from_secs(1));
-            }
-        }
-        let payload = self.active.as_ref().and_then(|active| {
-            // v1: prefer the freshly grabbed colour frame — while the IR
-            // stream is selected, `last_rgb_frame` holds the gray-expanded IR
-            // the pipeline tracked on, not true colour. Overlays stay
-            // geometrically valid on the grab: the v1's colour and IR share
-            // one sensor framing (same 640×480), so a pose computed on IR
-            // lands on the right pixels of the colour frame.
-            let (w, h, raw): (u32, u32, Arc<Vec<u8>>) = match rgb_v1.as_ref() {
-                Some(f) => (f.width, f.height, Arc::new(f.data.clone())),
-                None => {
-                    let (w, h, raw) = active.last_rgb_frame.as_ref()?;
-                    (*w, *h, Arc::clone(raw))
-                }
-            };
-            let det = bake_overlays(
-                w,
-                h,
-                &raw,
-                active.last_pose.as_ref(),
-                active.last_anchor.as_ref(),
-            );
-            Some((
-                active.backend,
-                w,
-                h,
-                raw,
-                det,
-                active.last_depth.clone(),
-                active.last_ir.clone(),
-                active.last_head,
-                active.last_pose.clone(),
-                active.last_lockbar,
-            ))
-        });
-        let Some((backend, w, h, raw, det, depth, ir_v2, head, pose, lockbar)) = payload else {
-            return;
-        };
-        let stem = contribution_stem(backend);
-        let dir = contributions_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        // Tracking read-out shared by both colour planes — embedded as PNG
-        // tEXt so the capture is self-describing (head Z per backend, etc.).
-        let mut meta = capture_meta(
-            backend,
-            (w, h),
-            &stem,
-            CabGeom {
-                table_incl_deg: self.table_incl_deg,
-                lockbar_mm: self.lockbar_width_mm,
-            },
-            head,
-            pose.as_ref(),
-            lockbar.as_ref(),
-        );
-        meta.extend(autocalib_meta(lockbar.as_ref(), (w, h), depth.as_deref()));
-        let files = build_contribution_files(
-            &stem,
-            backend,
-            (w, h),
-            &raw,
-            &det,
-            depth.as_deref(),
-            ir_v2.as_deref(),
-            ir_v1.as_ref(),
-            &meta,
-        );
-        for (name, bytes) in files {
-            if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
-                warn!(name, "contribution: local save failed: {e}");
-            }
-            self.uploader.submit(name, bytes);
-        }
-        info!(stem, "capture shared");
-        self.contrib_last = Some(stem);
     }
 
     fn poll(&mut self, egui_ctx: &egui::Context) {
@@ -4978,15 +4558,17 @@ impl App {
         // rescan automatically once the drivers are in place — whether they
         // came from our button or from a manually-run setup.ps1.
         if self.kinect_access_hint {
-            let due = self.kinect_access_recheck_at.is_none_or(|t| Instant::now() >= t);
+            let due = self
+                .kinect_access_recheck_at
+                .is_none_or(|t| Instant::now() >= t);
             if due {
-                self.kinect_access_recheck_at =
-                    Some(Instant::now() + Duration::from_secs(5));
+                self.kinect_access_recheck_at = Some(Instant::now() + Duration::from_secs(5));
                 if !compute_kinect_access_hint() {
                     info!("Kinect access fixed — rescanning automatically");
                     self.refresh_available();
-                    self.kinect_access_result =
-                        Some(Ok("drivers detected — device list rescanned automatically".into()));
+                    self.kinect_access_result = Some(Ok(
+                        "drivers detected — device list rescanned automatically".into(),
+                    ));
                 }
             }
         } else {
@@ -5078,7 +4660,11 @@ impl App {
                                     );
                                 });
                             } else {
-                                ui.selectable_value(&mut self.selected, entry.backend, &entry.label);
+                                ui.selectable_value(
+                                    &mut self.selected,
+                                    entry.backend,
+                                    &entry.label,
+                                );
                             }
                         }
                         if combo_debug {
@@ -5190,23 +4776,6 @@ impl App {
                 // `install_extra_glyph_fonts`).
                 ui.toggle_value(&mut self.parallax_enabled, "🪟 Parallax")
                     .on_hover_text("Show the off-axis 3D validation scene below the camera feed");
-                // 🎁 Contribute — same highlight toggle as the others (so it
-                // never shifts the bar), with a red outline *painted on top* of
-                // its rect as a call to action. Painting the border rather than
-                // using Button::stroke keeps it out of the layout entirely, so
-                // no widget below it moves on hover/press.
-                let contrib = ui
-                    .toggle_value(
-                        &mut self.contribute_open,
-                        RichText::new("🎁 Contribute").strong(),
-                    )
-                    .on_hover_text("Share a capture to help train the head-tracking model");
-                ui.painter().rect_stroke(
-                    contrib.rect,
-                    egui::CornerRadius::same(3),
-                    Stroke::new(2.0, Color32::from_rgb(0xe0, 0x3a, 0x3a)),
-                    egui::StrokeKind::Outside,
-                );
                 if ui
                     .button("⏻ Quit")
                     .on_hover_text("Close the demo (fullscreen has no window buttons)")
@@ -5232,9 +4801,6 @@ impl App {
                     };
                 }
             });
-
-            ui.add_space(3.0);
-            contribution_banner(ui);
 
             ui.add_space(2.0);
             // Row 2 — camera INPUT (raw, before maths). `input_line` lays out
@@ -5460,8 +5026,6 @@ impl App {
             self.stream_bar(ui);
             self.draw_camera_view(ui);
         });
-        let ctx = ui.ctx().clone();
-        self.contribute_window(&ctx);
     }
 
     /// Lockbar-width field — the metric ruler for the monocular (webcam)
@@ -5552,12 +5116,11 @@ impl App {
 
     /// Camera-placement guidance shown at the top of the central panel, above
     /// the live view: a one-line reminder + three example thumbnails (a good
-    /// frame, and two mounting shots). Useful to everyone, not just
-    /// contributors, so it lives in the main UI rather than the share window.
+    /// frame, and two mounting shots).
     fn camera_placement_help(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         // Order: the two mounting shots first, then what the camera should see.
-        let thumbs = self.contrib_thumbs.get_or_insert_with(|| {
+        let thumbs = self.placement_thumbs.get_or_insert_with(|| {
             [
                 load_thumb(
                     &ctx,
@@ -5600,111 +5163,6 @@ impl App {
                 });
             }
         });
-    }
-
-    /// The "Share a capture" window: the informed-consent notice + checkbox,
-    /// the share button (gated on consent + a live frame), upload status, and
-    /// a short capture reminder. All demo-only — the plugin has none of this.
-    fn contribute_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.contribute_open;
-        egui::Window::new("🎁 Share a capture")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(500.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(RichText::new("Please read before accepting").strong());
-                ui.add_space(4.0);
-                egui::ScrollArea::vertical()
-                    .max_height(420.0)
-                    .show(ui, |ui| {
-                        ui.label(
-                            "By sharing, you upload images from your tracking camera (each \
-                             capture = the raw image + the detection). These images may show \
-                             places, people, and their faces.",
-                        );
-                        ui.add_space(4.0);
-                        for (title, body) in CONTRIB_TERMS {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 3.0;
-                                ui.label(RichText::new(format!("{title}:")).strong());
-                                ui.label(*body);
-                            });
-                        }
-                    });
-                ui.add_space(6.0);
-                // Make the click-to-authorise action unmistakable: a call-out
-                // above the toggle so it's obvious the upload is gated on it.
-                ui.label(
-                    RichText::new("👉 Click the box below to authorise sending your image:")
-                        .strong()
-                        .color(Color32::from_rgb(0xff, 0xcc, 0x33)),
-                );
-                // Explicit opt-in as a highlight toggle (blue when on) — an
-                // affirmative, deliberate action before any upload is allowed.
-                ui.toggle_value(
-                    &mut self.consent_checked,
-                    "☐ I have read the above and I freely give my informed consent to share \
-                     these images under these terms.",
-                );
-                ui.add_space(6.0);
-                let has_frame = self
-                    .active
-                    .as_ref()
-                    .is_some_and(|a| a.last_rgb_frame.is_some());
-                let ready = self.consent_checked && has_frame;
-                if ui
-                    .add_enabled(ready, egui::Button::new("📸 Share this capture"))
-                    .clicked()
-                {
-                    self.share_capture();
-                }
-                if !has_frame {
-                    ui.label(RichText::new("(select a device and wait for the feed first)").weak());
-                }
-                // Upload status.
-                let st = self.uploader.status();
-                if st.pending > 0 {
-                    ui.label(format!("uploading… {} file(s) pending", st.pending));
-                }
-                if st.uploaded > 0 {
-                    ui.label(
-                        RichText::new(format!("✓ {} file(s) uploaded", st.uploaded))
-                            .color(Color32::from_rgb(0x66, 0xff, 0x99)),
-                    );
-                }
-                if let Some(err) = &st.last_error {
-                    ui.label(
-                        RichText::new(format!("upload issue: {err} — saved locally"))
-                            .color(Color32::from_rgb(0xff, 0x99, 0x66)),
-                    );
-                }
-                if let Some(stem) = &self.contrib_last {
-                    ui.add_space(4.0);
-                    ui.label("Shared — note this if you may want it removed:");
-                    ui.monospace(format!("{stem}_raw.png · {stem}_det.png"));
-                }
-                ui.add_space(4.0);
-                // Where captures land on this machine (also queued for upload).
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.label("Also saved locally in:");
-                    ui.monospace(contributions_dir().display().to_string());
-                });
-                ui.separator();
-                ui.label(RichText::new("Before you capture").strong());
-                ui.label(
-                    "Make sure your camera is well placed — see the placement guide above \
-                     the camera view.",
-                );
-                ui.add_space(4.0);
-                ui.label(RichText::new("Help us with variety:").strong());
-                ui.label(
-                    "different lighting, colours and brightness; with and without a player; \
-                     the lockbar clear and with hands on it.",
-                );
-            });
-        self.contribute_open = open;
     }
 
     /// Stream bar, directly above the camera image: one chip per stream the
@@ -6126,28 +5584,6 @@ fn centered(ui: &mut egui::Ui, rect: Rect, text: &str) {
     );
 }
 
-/// Red-edged banner under the main menu: the calibration model has only seen
-/// a handful of cabinets, so we ask hard for contributions. Bold, centred.
-fn contribution_banner(ui: &mut egui::Ui) {
-    let red = Color32::from_rgb(0xD3, 0x2F, 0x2F);
-    egui::Frame::group(ui.style())
-        .stroke(Stroke::new(1.2, red))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new(
-                        "⚠  The auto-calibration model has only seen a \
-                         handful of cabinets — it needs YOUR captures to \
-                         learn.  🎁 Contribute!",
-                    )
-                    .strong()
-                    .color(red),
-                );
-            });
-        });
-}
-
 /// Overlay draw target. All inputs are in ORIGINAL IMAGE PIXEL coords; each impl
 /// maps to its own surface. A single [`draw_overlay`] feeds the live egui view,
 /// the capture RGB buffer and the headless `--pose-test`, so the overlay can
@@ -6391,7 +5827,6 @@ fn new_capture(backend: Backend, intrinsics: Intrinsics, inner: Inner) -> Captur
         reg_warned: false,
         selected_stream: StreamKind::Rgb,
         last_rgb_refresh: None,
-        rgb_refresh_ack: None,
         depth_color: None,
         pose_src: (0, 0),
         head_ms: 0.0,
@@ -6631,10 +6066,8 @@ const TURBO_LUT: [[u8; 3]; 16] = [
 /// Distances are clamped to the tracking range; invalid pixels come out
 /// near-black so dropouts stay obvious rather than reading as "very close".
 ///
-/// Shared by the live depth view and the `*_depthview.png` contribution
-/// preview, so a reviewer sees exactly what the operator saw. The lossless
-/// `*_depth.png` keeps the raw 16-bit millimetres — this is only ever the
-/// human-readable rendering.
+/// This is only ever the human-readable rendering — the depth the pipeline
+/// consumes stays the raw 16-bit millimetres.
 fn depth_to_turbo_rgb888(mm: &[u16]) -> Vec<u8> {
     let (lo, hi) = (DEPTH_MIN_MM, DEPTH_MAX_MM);
     let mut out = Vec::with_capacity(mm.len() * 3);
@@ -6687,109 +6120,13 @@ fn backend_slug(b: Backend) -> String {
     }
 }
 
-/// Directory for shared captures, next to the running binary.
-fn contributions_dir() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("contributions")
-}
-
-/// Shared stem for a capture's two files: `ht_<backend>_<UTC>_<rand6>`, where
-/// `rand6` is 6 hex chars from the sub-second clock (unique enough — the drop
-/// rejects duplicate names — and unambiguous to read back for a removal).
-fn contribution_stem(backend: Backend) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let rand6 = now.subsec_nanos() & 0x00ff_ffff;
-    format!(
-        "ht_{}_{}_{rand6:06x}",
-        backend_slug(backend),
-        format_utc_stamp(now.as_secs())
-    )
-}
-
-/// Encode every stream of a capture into the contribution file set: `_raw` +
-/// `_det` colour planes, lossless `_depth` (16-bit raw mm) + Turbo
-/// `_depthview`, `_ir` (native bit depth) + auto-levelled `_irview`. Shared
-/// by the GUI Contribute button and the headless `--contribute` mode so both
-/// always export EVERY stream the camera has.
-#[allow(clippy::too_many_arguments)]
-fn build_contribution_files(
-    stem: &str,
-    backend: Backend,
-    (w, h): (u32, u32),
-    raw: &[u8],
-    det: &[u8],
-    depth: Option<&(u32, u32, Vec<u16>)>,
-    ir_v2: Option<&(u32, u32, Vec<u16>)>,
-    ir_v1: Option<&freenect::IrFrame>,
-    meta: &[(String, String)],
-) -> Vec<(String, Vec<u8>)> {
-    // RGB planes are 8-bit colour; depth is 16-bit gray in raw mm; v2 IR is
-    // 16-bit gray intensity; v1 IR is 8-bit gray.
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for (kind, src) in [("raw", raw), ("det", det)] {
-        match png_bytes_meta(w, h, src, meta) {
-            Ok(bytes) => files.push((format!("{stem}_{kind}.png"), bytes)),
-            Err(e) => warn!("contribution: {kind} png encode failed: {e}"),
-        }
-    }
-    // Each depth/IR modality ships a lossless file (the real values) plus a
-    // `*view` preview so it's reviewable by eye. Depth's preview is the same
-    // Turbo false-colour the live view uses — distance reads as hue, which
-    // the eye judges far better than brightness. The lossless `_depth.png`
-    // below stays 16-bit raw mm: that's what training consumes.
-    if let Some((dw, dh, mm)) = depth {
-        match png_gray16_bytes(*dw, *dh, mm) {
-            Ok(bytes) => files.push((format!("{stem}_depth.png"), bytes)),
-            Err(e) => warn!("contribution: depth png encode failed: {e}"),
-        }
-        match png_bytes_meta(*dw, *dh, &depth_to_turbo_rgb888(mm), meta) {
-            Ok(bytes) => files.push((format!("{stem}_depthview.png"), bytes)),
-            Err(e) => warn!("contribution: depthview png encode failed: {e}"),
-        }
-    }
-    // IR: v1 always exports the freshly grabbed native 8-bit frame (the
-    // live `last_ir` is the same sensor but 8→16-widened while the IR
-    // stream is selected — using the grab keeps the file format identical
-    // across modes). v2 exports its live 16-bit stream.
-    if backend == Backend::KinectV1 {
-        if let Some(frame) = ir_v1 {
-            match png_gray8_bytes(frame.width, frame.height, &frame.data) {
-                Ok(bytes) => files.push((format!("{stem}_ir.png"), bytes)),
-                Err(e) => warn!("contribution: ir png encode failed: {e}"),
-            }
-            // v1 IR is native 8-bit; widen to reuse the u16 auto-leveller.
-            let widened: Vec<u16> = frame.data.iter().map(|&b| u16::from(b)).collect();
-            match autolevel_gray8(frame.width, frame.height, &widened, false) {
-                Ok(bytes) => files.push((format!("{stem}_irview.png"), bytes)),
-                Err(e) => warn!("contribution: irview png encode failed: {e}"),
-            }
-        }
-    } else if let Some((iw, ih, intensity)) = ir_v2 {
-        match png_gray16_bytes(*iw, *ih, intensity) {
-            Ok(bytes) => files.push((format!("{stem}_ir.png"), bytes)),
-            Err(e) => warn!("contribution: ir png encode failed: {e}"),
-        }
-        match autolevel_gray8(*iw, *ih, intensity, false) {
-            Ok(bytes) => files.push((format!("{stem}_irview.png"), bytes)),
-            Err(e) => warn!("contribution: irview png encode failed: {e}"),
-        }
-    }
-    files
-}
-
-/// Encode an RGB888 buffer to PNG bytes in memory (for the contribution
-/// upload — the screenshot path writes straight to a file instead).
+/// Encode an RGB888 buffer to PNG bytes in memory (the screenshot path
+/// writes straight to a file instead).
 fn png_bytes(width: u32, height: u32, rgb888: &[u8]) -> Result<Vec<u8>, String> {
     png_bytes_meta(width, height, rgb888, &[])
 }
 
-/// Like [`png_bytes`] but embeds `meta` as PNG `tEXt` chunks, so a contribution
+/// Like [`png_bytes`] but embeds `meta` as PNG `tEXt` chunks, so a saved
 /// image carries its own tracking read-out (backend, head X/Y/Z mm, pose…) and
 /// captures stay comparable across v1/v2/webcam without a side file.
 fn png_bytes_meta(
@@ -6849,7 +6186,7 @@ fn color_focal_px(backend: Backend, frame_width: u32) -> f32 {
     }
 }
 
-/// Build the tracking read-out embedded into a contribution capture as PNG
+/// Build the tracking read-out embedded into a saved capture as PNG
 /// `tEXt` chunks. Lets us line up v1/v2/webcam shots of the same scene and
 /// compare what each backend recovered — head **Z** above all (depth-sampled
 /// on the Kinects, shoulder-width-triangulated on the webcam). Keys are
@@ -7040,89 +6377,9 @@ fn autocalib_meta(
     m
 }
 
-/// Encode an 8-bit single-channel buffer (e.g. Kinect v1 IR) to a grayscale
-/// PNG. One intensity byte per pixel.
-fn png_gray8_bytes(width: u32, height: u32, gray: &[u8]) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut buf, width, height);
-        encoder.set_color(png::ColorType::Grayscale);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut wr = encoder
-            .write_header()
-            .map_err(|e| format!("png header: {e}"))?;
-        wr.write_image_data(gray)
-            .map_err(|e| format!("png write: {e}"))?;
-    }
-    Ok(buf)
-}
-
-/// Encode a depth buffer to a 16-bit grayscale PNG in raw millimetres — the
-/// capture stays lossless and machine-readable (a plain viewer renders it
-/// near-black since a few metres is a small slice of the 0–65535 range;
-/// normalise offline to look at it). PNG stores samples wider than 8 bits
-/// big-endian, so each `u16` is written high byte first.
-fn png_gray16_bytes(width: u32, height: u32, mm: &[u16]) -> Result<Vec<u8>, String> {
-    let mut be = Vec::with_capacity(mm.len() * 2);
-    for &s in mm {
-        be.extend_from_slice(&s.to_be_bytes());
-    }
-    let mut buf = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut buf, width, height);
-        encoder.set_color(png::ColorType::Grayscale);
-        encoder.set_depth(png::BitDepth::Sixteen);
-        let mut wr = encoder
-            .write_header()
-            .map_err(|e| format!("png header: {e}"))?;
-        wr.write_image_data(&be)
-            .map_err(|e| format!("png write: {e}"))?;
-    }
-    Ok(buf)
-}
-
-/// Auto-level a `u16` sample buffer to an 8-bit grayscale PREVIEW so a capture
-/// is reviewable at a glance — the lossless `_depth.png` / `_ir.png` still carry
-/// the real values. Samples are stretched between their own min and max. When
-/// `zero_is_hole` (depth: `0` = no data) zeros are excluded from the range and
-/// stay black; otherwise (IR intensity) the full min..max is used.
-fn autolevel_gray8(
-    width: u32,
-    height: u32,
-    samples: &[u16],
-    zero_is_hole: bool,
-) -> Result<Vec<u8>, String> {
-    let (mut lo, mut hi) = (u16::MAX, 0u16);
-    for &v in samples {
-        if zero_is_hole && v == 0 {
-            continue;
-        }
-        lo = lo.min(v);
-        hi = hi.max(v);
-    }
-    if hi < lo {
-        // No usable samples (empty or all-hole) — emit a black frame.
-        lo = 0;
-        hi = 0;
-    }
-    let span = f32::from(hi.saturating_sub(lo)).max(1.0);
-    let gray: Vec<u8> = samples
-        .iter()
-        .map(|&v| {
-            if zero_is_hole && v == 0 {
-                0
-            } else {
-                ((f32::from(v.saturating_sub(lo)) / span) * 255.0).clamp(0.0, 255.0) as u8
-            }
-        })
-        .collect();
-    png_gray8_bytes(width, height, &gray)
-}
-
-/// The auto-levelling of [`autolevel_gray8`] without the PNG encode: stretches
-/// `samples` to the full 0–255 range and returns the raw bytes. Used for the
-/// live IR view, so what the camera panel shows matches the `*view` PNG a
-/// shared capture would carry.
+/// Stretch `samples` to the full 0–255 range and return the raw grayscale
+/// bytes. Used for the live IR view: raw sensor intensity spans a fraction of
+/// the 16-bit range, so without this the panel shows near-black.
 fn autolevel_gray8_raw(samples: &[u16], zero_is_hole: bool) -> Vec<u8> {
     let (mut lo, mut hi) = (u16::MAX, 0u16);
     for &v in samples {
@@ -7193,8 +6450,7 @@ fn install_extra_glyph_fonts(ctx: &egui::Context) {
 }
 
 /// Bump text sizes and hit-target padding for legibility on a pincab screen,
-/// and stop widgets from resizing on hover (the ~1 px expansion looked odd,
-/// especially on the red-outlined Contribute button).
+/// and stop widgets from resizing on hover (the ~1 px expansion looked odd).
 fn apply_cab_style(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
     ctx.all_styles_mut(|style| {
@@ -7269,7 +6525,7 @@ fn format_utc_stamp(secs: u64) -> String {
 
 /// Bake the unified overlay ([`draw_overlay`]: skeleton bones + anchor lockbar/
 /// sidebars) into a copy of the RGB888 buffer, so a capture reads back what the
-/// algorithms saw. Shared by the contribution `_det` export and the screenshot.
+/// algorithms saw. Used by the screenshot button and `--pose-test`.
 fn bake_overlays(
     width: u32,
     height: u32,

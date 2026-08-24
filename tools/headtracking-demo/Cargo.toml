@@ -44,12 +44,8 @@ os_info = { version = "3", default-features = false }
 # Already in the lockfile as a transitive dep — listing it here just
 # makes the direct usage explicit, no extra build cost.
 png = "0.18"
-# Blocking HTTPS client (rustls TLS, no system OpenSSL) for the optional
-# "Share a capture" contribution upload to a write-only Nextcloud drop. Only
-# does a single PUT per file, off the UI thread.
-ureq = { version = "2", default-features = false, features = ["tls"] }
-# JPEG decode for the embedded setup / example thumbnails in the "Share a
-# capture" help (jpeg only — already in the lockfile transitively).
+# JPEG decode for the embedded camera-placement thumbnails and the
+# `--pose-test` inputs (jpeg only — already in the lockfile transitively).
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [build-dependencies]

@@ -167,22 +167,23 @@ angle — it needs to see real cabinets. Yours.
    [latest release](https://github.com/Le-Syl21/headtracking/releases) — a
    single binary, nothing to install.
 2. Point your webcam or Kinect at the playfield, select it in the demo.
-3. Click **🎁 Contribute** and confirm.
+3. Click **📷 Screenshot**. The PNG lands next to the binary, named after your
+   camera and the time, with the detection drawn on it.
+4. Send it on [Discord](https://discord.gg/cFcNrt9AY), channel `#headtracking`.
 
-That's it. The demo uploads a capture set (colour image + what the detector
-saw + depth/IR when a Kinect is there) to a write-only drop, and it becomes
-training data.
+That's it — one image, and it becomes training data. Nothing is uploaded
+behind your back: the demo writes the file and stops there, so you see
+exactly what you are sending before you send it.
 
 ![The reference frame derived from a capture: 4 traced lines and their 6 intersection points on the lockbar and rails](docs/images/anchor-check.jpeg)
 
 <sub>What we extract from your capture: the lockbar's two edges, the two side
 rails, and their 6 intersection points — the cabinet's reference frame.</sub>
 
-**What gets shared, honestly:** the images show your cabinet and whatever is
-around it — check the preview before accepting. Uploads need no account and carry no identity; each capture has a printed ID you can quote on Discord
-to have it removed. Empty cab or mid-game, day or night, every variation
-helps — captures with **a player standing at the cab** are the rarest and
-most valuable.
+**What gets shared, honestly:** the image shows your cabinet and whatever is
+around it — open the PNG and look before you post it. Empty cab or mid-game,
+day or night, every variation helps; captures with **a player standing at the
+cab** are the rarest and most valuable.
 
 ## 🙌 Contributors wanted
 
@@ -306,17 +307,18 @@ vrais cabs. Le vôtre.
    [dernière release](https://github.com/Le-Syl21/headtracking/releases) — un
    binaire unique, rien à installer.
 2. Pointez votre webcam ou Kinect vers le plateau, sélectionnez-la dans la démo.
-3. Cliquez **🎁 Contribute** et confirmez.
+3. Cliquez **📷 Screenshot**. Le PNG arrive à côté du binaire, nommé d'après
+   votre caméra et l'heure, avec la détection dessinée dessus.
+4. Envoyez-le sur [Discord](https://discord.gg/cFcNrt9AY), salon `#headtracking`.
 
-C'est tout. La démo envoie un relevé (image couleur + ce que le détecteur a vu
-+ depth/IR si Kinect) vers un dépôt en écriture seule, et ça devient des
-données d'entraînement.
+C'est tout — une image, et ça devient des données d'entraînement. Rien ne part
+dans votre dos : la démo écrit le fichier et s'arrête là, vous voyez donc
+exactement ce que vous envoyez avant de l'envoyer.
 
-**Ce qui est partagé, honnêtement :** les images montrent votre cab et ce qu'il
-y a autour — vérifiez l'aperçu avant d'accepter. L'envoi ne demande aucun compte et n'embarque aucune identité ; chaque relevé a un identifiant affiché que vous
-pouvez citer sur Discord pour demander sa suppression. Cab vide ou en pleine
-partie, jour ou nuit, toute variation aide — les relevés avec **un joueur
-devant le cab** sont les plus rares et les plus précieux.
+**Ce qui est partagé, honnêtement :** l'image montre votre cab et ce qu'il y a
+autour — ouvrez le PNG et regardez-le avant de le poster. Cab vide ou en pleine
+partie, jour ou nuit, toute variation aide ; les relevés avec **un joueur devant
+le cab** sont les plus rares et les plus précieux.
 
 **Ce qui le rend unique :**
 

@@ -1444,7 +1444,6 @@ dependencies = [
  "png",
  "tracing",
  "tracing-subscriber",
- "ureq 2.12.1",
  "webcam",
  "winresource",
 ]

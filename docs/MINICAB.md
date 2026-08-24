@@ -52,8 +52,9 @@ Also worth knowing, whatever the camera:
 - Declare your **screen inclination** the same way as on a full-size cab.
 - The auto-calibration anchor (lockbar + side rails) works at any cabinet
   scale — the camera being close even makes the anchor bigger and easier
-  to detect. Contribute a capture (🎁 button in the demo): minicabs are
-  exactly the kind of geometry the model has never seen.
+  to detect. Send us a capture (📷 Screenshot in the demo, then post the
+  PNG on Discord `#headtracking`): minicabs are exactly the kind of
+  geometry the model has never seen.
 
 ---
 
@@ -110,6 +111,6 @@ savoir avant de choisir la caméra et son emplacement.
 - Bonne nouvelle pour finir : la détection du cab (lockbar + rails)
   marche quelle que soit la taille de la caisse — et de près, ces
   repères occupent plus de place dans l'image, ce qui aide même le
-  modèle. Pensez au bouton **🎁 Contribute** de la démo : le modèle n'a
-  encore jamais vu de minicab, votre relevé lui apprendra cette
-  géométrie.
+  modèle. Pensez au bouton **📷 Screenshot** de la démo, puis postez le
+  PNG sur le Discord `#headtracking` : le modèle n'a encore jamais vu de
+  minicab, votre relevé lui apprendra cette géométrie.
