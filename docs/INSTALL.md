@@ -176,10 +176,10 @@ ls -l /dev/bus/usb/<bus>/<dev>      # MODE should be crw-rw-rw-
 
 Best functional check: run `headtracking-demo` — the camera list should
 show your Kinect and the video panel should stream. While you're there,
-click **📷 Screenshot** and post the PNG on Discord `#headtracking`: one
-capture of your cab trains the auto-calibration model, and since the
-detector learns the *cabinet* (lockbar + rails), an empty cab is exactly
-as useful — no need to stand in frame.
+click **🎁 Contribute**: one capture of your cab trains the
+auto-calibration model, and since the detector learns the *cabinet*
+(lockbar + rails), an empty cab is exactly as useful — no need to stand
+in frame.
 
 ##### Webcam
 
@@ -237,11 +237,10 @@ knows how to launch it elevated:
 That's it for both Kinect v1 and v2. Plug the Kinect, restart VPX.
 
 > 💡 **While the demo is open and the camera streaming**, click
-> **📷 Screenshot** and post the PNG on Discord `#headtracking` — one
-> capture of your cab becomes training data for the auto-calibration
-> model. The detector learns the *cabinet* (lockbar + side rails), so an
-> empty cab is exactly as useful as a played one: no need to stand in
-> frame.
+> **🎁 Contribute** — one capture of your cab becomes training data for
+> the auto-calibration model. The detector learns the *cabinet* (lockbar
+> + side rails), so an empty cab is exactly as useful as a played one:
+> no need to stand in frame.
 
 > ⚠ **Coexists with BAM?** No. BAM relies on the Microsoft Kinect
 > for Windows v2 SDK runtime, and this script removes that driver
@@ -555,11 +554,10 @@ ls -l /dev/bus/usb/<bus>/<dev>      # MODE doit valoir crw-rw-rw-
 
 Meilleur test fonctionnel : lancer `headtracking-demo` — la liste des
 caméras doit montrer la Kinect et le panneau vidéo doit streamer. Tant
-qu'on y est, cliquer **📷 Screenshot** et poster le PNG sur le Discord
-`#headtracking` : un relevé de votre cab entraîne le modèle
-d'auto-calibration, et comme le détecteur apprend le *cab* (lockbar +
-rails), un cab vide est exactement aussi utile — pas besoin d'être dans
-le champ.
+qu'on y est, cliquer **🎁 Contribute** : un relevé de votre cab entraîne
+le modèle d'auto-calibration, et comme le détecteur apprend le *cab*
+(lockbar + rails), un cab vide est exactement aussi utile — pas besoin
+d'être dans le champ.
 
 ##### Webcam
 
@@ -620,11 +618,10 @@ lancer élevé :
 C'est tout, pour les deux Kinect v1 et v2. Brancher la Kinect, relancer VPX.
 
 > 💡 **Tant que la démo est ouverte et la caméra en flux**, cliquer
-> **📷 Screenshot** et poster le PNG sur le Discord `#headtracking` — un
-> relevé de votre cab devient donnée d'entraînement pour le modèle
-> d'auto-calibration. Le détecteur apprend le *cab* (lockbar + rails
-> latéraux), donc un cab vide est exactement aussi utile qu'une partie en
-> cours : pas besoin d'être dans le champ.
+> **🎁 Contribute** — un relevé de votre cab devient donnée
+> d'entraînement pour le modèle d'auto-calibration. Le détecteur apprend
+> le *cab* (lockbar + rails latéraux), donc un cab vide est exactement
+> aussi utile qu'une partie en cours : pas besoin d'être dans le champ.
 
 > ⚠ **Cohabite avec BAM ?** Non. BAM dépend du runtime Microsoft
 > Kinect for Windows v2 SDK, et le script remplace ce driver par

@@ -167,7 +167,7 @@ installer/diagnostic step** users run once before enabling the plugin:
 - **Linux**: the demo (and INSTALL.md) carries the udev rules to
   copy-paste; without them VPX fails silently as non-root.
 - Seeing yourself tracked in the demo = the plugin will work in VPX; the
-  demo is also where training captures are taken and calibration verified.
+  demo is also where captures are contributed and calibration verified.
 
 Distribution channels, from freshest to most stable:
 
