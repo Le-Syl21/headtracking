@@ -61,6 +61,7 @@ jobs:
           # binary does — and `cargo clippy --workspace` builds every member.
           sudo apt-get install -y --no-install-recommends \
             cmake clang libclang-dev pkg-config ninja-build \
+            opencl-headers ocl-icd-opencl-dev \
             libusb-1.0-0-dev libudev-dev \
             libasound2-dev libpulse-dev libjack-jackd2-dev \
             libsndio-dev libpipewire-0.3-dev \

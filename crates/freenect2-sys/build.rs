@@ -49,12 +49,21 @@ fn main() {
     // list so libfreenect2's TURBOJPEG_WORKS try-compile actually links.
     let tj_libs = format!("{tj_root}/lib/libturbojpeg.a;{tj_root}/lib/libjpeg.a");
 
-    // Build libfreenect2 statically. On Linux we request the OpenCL depth
-    // pipeline (GPU offload of the phase-unwrap/filtering); everywhere else
-    // it stays CPU-only. No OpenGL, no CUDA, no OpenNI2, no examples — keeps
-    // the dep tree to libusb + libc++ + the static libjpeg-turbo we hand it
-    // (plus a dynamic libOpenCL on Linux).
-    let opencl_enabled = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
+    // Build libfreenect2 statically, with the OpenCL depth pipeline requested
+    // on EVERY platform.
+    //
+    // The Kinect v2's phase unwrap + bilateral/edge-aware filtering is the
+    // expensive part, and on the CPU pipeline it does not merely run slowly:
+    // libfreenect2 starts dropping USB depth packets it cannot consume in
+    // time (`DepthPacketStreamParser: N packets were lost`), and depth lands
+    // at ~5 fps instead of 30. Field report from a Windows tester: the head
+    // position then updates five times a second, and the parallax follows
+    // "as if you would be drunk". This was CPU-only everywhere but Linux.
+    //
+    // No OpenGL (needs GLFW3), no CUDA (needs the toolkit at build time), no
+    // OpenNI2, no examples — the dep tree stays libusb + libc++ + the static
+    // libjpeg-turbo we hand it, plus the platform's OpenCL loader.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let mut config = cmake::Config::new(&vendor_dir);
     // On Windows, force Ninja over the default Visual Studio generator.
     // VS is multi-config and installs static libs at
@@ -77,14 +86,15 @@ fn main() {
         .define("BUILD_EXAMPLES", "OFF")
         .define("BUILD_OPENNI2_DRIVER", "OFF")
         .define("ENABLE_OPENGL", "OFF")
-        // OpenCL depth pipeline on Linux only (the pincab target has an
-        // NVIDIA GPU + ICD). libfreenect2 treats ENABLE_OPENCL as a
-        // *request*: if `find_package(OpenCL)` fails in the build image it
-        // silently compiles CPU-only, `LIBFREENECT2_WITH_OPENCL_SUPPORT`
-        // stays undefined, and the shim falls back to the CPU pipeline — so
-        // this never breaks a build that lacks the OpenCL SDK. macOS/Windows
-        // stay CPU (deprecated / needs a vendor SDK). See shim.cpp.
-        .define("ENABLE_OPENCL", if opencl_enabled { "ON" } else { "OFF" })
+        // libfreenect2 treats ENABLE_OPENCL as a *request*: if
+        // `find_package(OpenCL)` fails in the build image it silently
+        // compiles CPU-only, `LIBFREENECT2_WITH_OPENCL_SUPPORT` stays
+        // undefined, and the shim falls back to the CPU pipeline. So asking
+        // for it can never break a build that lacks the SDK — it only decides
+        // whether the GPU path exists in the binary at all. Asking everywhere
+        // is therefore free; NOT asking is what left Windows and macOS on the
+        // CPU. See shim.cpp for the runtime fallback.
+        .define("ENABLE_OPENCL", "ON")
         .define("ENABLE_CUDA", "OFF")
         .define("ENABLE_VAAPI", "OFF")
         .define("ENABLE_TEGRAJPEG", "OFF")
@@ -97,6 +107,18 @@ fn main() {
         // final cdylib link is wired by Cargo through turbojpeg-sys's
         // transitive link metadata. Pre-cache the success flag.
         .define("TURBOJPEG_WORKS", "TRUE");
+    // On Windows the OpenCL loader comes from a *different* vcpkg triplet
+    // (`-static-md`, so it links into us instead of shipping a DLL), which the
+    // vcpkg toolchain's own `find_package` will not look in. When CI hands us
+    // the paths, pass them straight through rather than relying on a CMake
+    // policy to resolve `OpenCL_ROOT` inside a project whose
+    // `cmake_minimum_required` predates it.
+    if let Ok(dir) = env::var("HT_OPENCL_INCLUDE_DIR") {
+        config.define("OpenCL_INCLUDE_DIR", &dir);
+    }
+    if let Ok(lib) = env::var("HT_OPENCL_LIBRARY") {
+        config.define("OpenCL_LIBRARY", &lib);
+    }
 
     // libfreenect2's bundled FindLibUSB.cmake unconditionally calls
     // `pkg_check_modules(libusb-1.0)` whenever PKG_CONFIG is found,
@@ -150,27 +172,51 @@ fn main() {
     } else {
         println!("cargo:rustc-link-lib=static=freenect2");
     }
-    // Only pull in the dynamic OpenCL ICD loader if libfreenect2 actually
-    // compiled the OpenCL pipeline. `ENABLE_OPENCL=ON` is best-effort — when
-    // the build image has no OpenCL SDK, `find_package(OpenCL)` fails and the
-    // lib references no `cl*` symbols, so emitting `-lOpenCL` would be a link
-    // error against a lib that isn't there. The installed `config.h` records
-    // the outcome via `LIBFREENECT2_WITH_OPENCL_SUPPORT`; trust that. Must
+    // Only pull in the OpenCL loader if libfreenect2 actually compiled the
+    // pipeline. The request above is best-effort — with no SDK in the build
+    // image `find_package(OpenCL)` fails, the archive references no `cl*`
+    // symbols, and asking to link OpenCL would be an error against a library
+    // that isn't there. The installed `config.h` records the outcome via
+    // `LIBFREENECT2_WITH_OPENCL_SUPPORT`; trust that, not our own guess. Must
     // follow `-lfreenect2` on the link line (static archive scanned once).
-    if opencl_enabled {
-        let cfg_h = dst.join("include/libfreenect2/config.h");
-        let has_opencl = std::fs::read_to_string(&cfg_h)
-            .map(|s| s.contains("#define LIBFREENECT2_WITH_OPENCL_SUPPORT"))
-            .unwrap_or(false);
-        if has_opencl {
-            println!("cargo:rustc-link-lib=dylib=OpenCL");
-        } else {
-            println!(
-                "cargo:warning=freenect2-sys: ENABLE_OPENCL requested but \
-                 libfreenect2 built without it (no OpenCL SDK in the build \
-                 image) — Kinect v2 stays on the CPU depth pipeline."
-            );
+    let cfg_h = dst.join("include/libfreenect2/config.h");
+    let has_opencl = std::fs::read_to_string(&cfg_h)
+        .map(|s| s.contains("#define LIBFREENECT2_WITH_OPENCL_SUPPORT"))
+        .unwrap_or(false);
+    // Publish the outcome so it can be asserted rather than assumed: a `cfg`
+    // for our own tests, and link metadata (`DEP_FREENECT2_OPENCL`) for the
+    // crates above us. Shipping the CPU pipeline by accident is exactly what
+    // happened before, and it is invisible until someone's depth stream
+    // collapses to 5 fps in the field.
+    println!("cargo::rustc-check-cfg=cfg(freenect2_opencl)");
+    if has_opencl {
+        println!("cargo::rustc-cfg=freenect2_opencl");
+        println!("cargo::metadata=opencl=1");
+        match target_os.as_str() {
+            // A system framework since 10.7. Deprecated by Apple, still
+            // present and still the only GPU path we can use without a
+            // vendor SDK.
+            "macos" => println!("cargo:rustc-link-lib=framework=OpenCL"),
+            // Windows links the Khronos loader statically (see the release
+            // workflow), so it needs the loader's own Win32 dependencies:
+            // the registry for the ICD list, and cfgmgr32 for the newer
+            // device-enumeration path.
+            "windows" => {
+                println!("cargo:rustc-link-lib=static=OpenCL");
+                println!("cargo:rustc-link-lib=dylib=cfgmgr32");
+                println!("cargo:rustc-link-lib=dylib=ole32");
+                println!("cargo:rustc-link-lib=dylib=advapi32");
+            }
+            // Linux: the distribution ships only the shared loader, and it is
+            // present wherever a GPU driver is.
+            _ => println!("cargo:rustc-link-lib=dylib=OpenCL"),
         }
+    } else {
+        println!(
+            "cargo:warning=freenect2-sys: no OpenCL SDK in the build image — \
+             the Kinect v2 depth pipeline falls back to the CPU, which drops \
+             USB packets and delivers ~5 fps instead of 30."
+        );
     }
     // Static archives are scanned once in the order they appear on the link
     // line. libfreenect2.a references tj* / jpeg* symbols, so the JPEG

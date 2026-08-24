@@ -174,6 +174,7 @@ std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx) {
         libfreenect2::PacketPipeline *gpu = new libfreenect2::OpenCLPacketPipeline();
         holder->dev = ctx.inner.openDefaultDevice(gpu);
         if (holder->dev) {
+            holder->gpu_pipeline = true;
             holder->dev->setIrAndDepthFrameListener(&holder->ir_depth_listener);
             holder->dev->setColorFrameListener(&holder->rgb_listener);
             return holder;
@@ -190,6 +191,10 @@ std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx) {
     holder->dev->setIrAndDepthFrameListener(&holder->ir_depth_listener);
     holder->dev->setColorFrameListener(&holder->rgb_listener);
     return holder;
+}
+
+const char *depth_pipeline(const Freenect2Dev &dev) {
+    return dev.gpu_pipeline ? "OpenCL" : "CPU";
 }
 
 bool start_depth(Freenect2Dev &dev) {

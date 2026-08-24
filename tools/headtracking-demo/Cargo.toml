@@ -55,6 +55,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # (not gtk3) keeps the zero-install promise on Linux: the dialog goes through
 # the desktop portal over D-Bus, so no GTK to link or ship.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# Per-process CPU and memory, on every platform. Replaces a hand-rolled
+# /proc/self/stat reader that silently reported 0% everywhere but Linux —
+# which hid the Kinect v2's CPU depth pipeline saturating on Windows.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [build-dependencies]
 # Embeds assets/icon.ico as the .exe icon on Windows; inert elsewhere.

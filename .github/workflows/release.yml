@@ -249,6 +249,7 @@ jobs:
           # itself doesn't link SDL3 (resolved via dlsym at PluginLoad).
           sudo apt-get install -y --no-install-recommends \
             cmake clang libclang-dev pkg-config ninja-build \
+            opencl-headers ocl-icd-opencl-dev \
             libudev-dev \
             libasound2-dev libpulse-dev libjack-jackd2-dev \
             libsndio-dev libpipewire-0.3-dev \
@@ -291,7 +292,22 @@ jobs:
           # `pkg_check_modules(libusb-1.0)` succeeds) come from vcpkg —
           # avoids a separate Choco install and gives us a self-consistent
           # pkgconfig stack.
+          # `opencl` gives the Khronos headers plus the ICD loader, which is
+          # what `find_package(OpenCL)` needs for libfreenect2 to compile its
+          # GPU depth pipeline. Without it the Kinect v2 falls back to the CPU
+          # pipeline, drops USB depth packets and delivers ~5 fps instead of 30.
+          #
+          # Deliberately a different triplet from the rest: `-static-md` gives
+          # a static loader against the DYNAMIC CRT, which is what mixes with a
+          # normal MSVC Rust build (plain `-static` would switch the CRT too
+          # and fight everything else here). Linking the loader in means no
+          # `OpenCL.dll` to ship and no machine where a missing one stops the
+          # plugin from loading at all. The loader is only a dispatcher — the
+          # vendor driver still comes from the machine's GPU driver, and where
+          # none is registered OpenCL reports zero platforms and the shim falls
+          # back to the CPU pipeline exactly as before.
           vcpkg install libusb:x64-windows pkgconf:x64-windows
+          vcpkg install opencl:x64-windows-static-md
           # vcpkg's bash on Windows ships native paths with backslashes;
           # cmake / pkg-config want forward slashes. Normalise once.
           vcpkg_root="${VCPKG_INSTALLATION_ROOT//\\//}"
@@ -310,6 +326,12 @@ jobs:
           echo "CMAKE_TOOLCHAIN_FILE=${vcpkg_root}/scripts/buildsystems/vcpkg.cmake" >> $GITHUB_ENV
           echo "VCPKG_TARGET_TRIPLET=x64-windows" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=${installed}/lib/pkgconfig" >> $GITHUB_ENV
+          # OpenCL lives under its own triplet, so the vcpkg toolchain's
+          # `find_package` (pinned to x64-windows) will not see it. Hand
+          # freenect2-sys the exact paths instead of hoping a policy resolves.
+          ocl="${vcpkg_root}/installed/x64-windows-static-md"
+          echo "HT_OPENCL_INCLUDE_DIR=${ocl}/include" >> $GITHUB_ENV
+          echo "HT_OPENCL_LIBRARY=${ocl}/lib/OpenCL.lib" >> $GITHUB_ENV
 
       # ---------- Build ----------
 

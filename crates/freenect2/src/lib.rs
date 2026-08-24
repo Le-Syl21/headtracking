@@ -159,6 +159,31 @@ pub struct Device {
 }
 
 impl Device {
+    /// Which depth pipeline this device actually opened with: `"OpenCL"` or
+    /// `"CPU"`.
+    ///
+    /// Worth logging on every open. Compiling the GPU path in does not mean
+    /// it runs — no registered ICD, or no usable device, and libfreenect2
+    /// falls back — and the difference is the whole story behind a Kinect v2
+    /// delivering 5 fps of depth instead of 30. Reading it from a user's log
+    /// beats inferring it from frame rates.
+    #[must_use]
+    pub fn depth_pipeline(&self) -> &'static str {
+        let guard = self.inner.lock();
+        let Some(dev) = guard.as_ref() else {
+            return "unknown";
+        };
+        // SAFETY: the shim returns a pointer to a string literal with static
+        // storage duration, never null.
+        let raw = sys::depth_pipeline(dev);
+        if raw.is_null() {
+            return "unknown";
+        }
+        unsafe { std::ffi::CStr::from_ptr(raw) }
+            .to_str()
+            .unwrap_or("unknown")
+    }
+
     /// Begin streaming depth. Idempotent: returns `Ok` if already started.
     pub fn start(&self) -> Result<(), Error> {
         self.start_streams(false, true)

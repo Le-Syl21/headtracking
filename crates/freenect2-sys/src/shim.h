@@ -88,6 +88,12 @@ struct Freenect2Dev {
     libfreenect2::Freenect2Device *dev = nullptr;
     IrDepthSink ir_depth_listener;
     RgbSink rgb_listener;
+    // Which depth pipeline actually opened. Not a build-time fact: the GPU
+    // path can compile in and still fail to open (no ICD registered, no
+    // usable device), and the difference is the whole story when someone
+    // reports 5 fps. Reported by `depth_pipeline()` so a field log says it
+    // outright instead of leaving us to guess.
+    bool gpu_pipeline = false;
 
     ~Freenect2Dev();
 
@@ -130,6 +136,9 @@ void install_logger(uint32_t level);
 std::unique_ptr<Freenect2Ctx> new_context();
 int32_t enumerate(Freenect2Ctx &ctx);
 std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx);
+
+/// Name of the depth pipeline in use: "OpenCL" or "CPU".
+const char *depth_pipeline(const Freenect2Dev &dev);
 
 bool start_depth(Freenect2Dev &dev);
 bool start_streams(Freenect2Dev &dev, bool rgb, bool depth);

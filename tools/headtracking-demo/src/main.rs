@@ -4253,19 +4253,6 @@ struct Baseline {
 }
 
 /// Read this process's accumulated CPU time (user + system) in clock ticks
-/// from `/proc/self/stat`. `None` on any parse failure (non-Linux, etc.).
-fn read_cpu_jiffies() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/self/stat").ok()?;
-    // The `comm` field is parenthesised and may itself contain spaces; every
-    // field after the last ')' is plain space-separated. utime/stime are the
-    // 12th/13th of those (0-based 11/12).
-    let after = &s[s.rfind(')')? + 1..];
-    let t: Vec<&str> = after.split_whitespace().collect();
-    let utime: u64 = t.get(11)?.parse().ok()?;
-    let stime: u64 = t.get(12)?.parse().ok()?;
-    Some(utime + stime)
-}
-
 /// Live performance counters, shown in the toolbar and logged every ~2 s:
 /// per-model inference time (EWMA), process CPU%, and the input vs output
 /// frame rates. Both count the **same unit** so they're comparable: `in` =
@@ -4299,15 +4286,22 @@ struct Metrics {
     /// colour camera, not USB bandwidth or our pipeline.
     depth_fps: f32,
     ir_fps: f32,
+    /// Process CPU across all cores (100% = one core saturated) and resident
+    /// memory. Read through `sysinfo` so the numbers exist on Windows and
+    /// macOS too: the previous reader parsed `/proc/self/stat` and quietly
+    /// reported 0% everywhere else, which is exactly how the Kinect v2's CPU
+    /// depth pipeline saturating on Windows went unseen for so long.
     cpu_pct: f32,
+    ram_mib: u64,
     in_frames: u32,
     out_frames: u32,
     render_frames: u32,
     depth_frames: u32,
     ir_frames: u32,
     window_start: Instant,
-    last_jiffies: u64,
     last_log: Instant,
+    sys: sysinfo::System,
+    pid: sysinfo::Pid,
 }
 
 impl Metrics {
@@ -4323,14 +4317,16 @@ impl Metrics {
             depth_fps: 0.0,
             ir_fps: 0.0,
             cpu_pct: 0.0,
+            ram_mib: 0,
             in_frames: 0,
             out_frames: 0,
             render_frames: 0,
             depth_frames: 0,
             ir_frames: 0,
             window_start: now,
-            last_jiffies: read_cpu_jiffies().unwrap_or(0),
             last_log: now,
+            sys: sysinfo::System::new(),
+            pid: sysinfo::get_current_pid().unwrap_or_else(|_| sysinfo::Pid::from(0)),
         }
     }
 
@@ -4404,11 +4400,20 @@ impl Metrics {
             self.render_fps = self.render_frames as f32 / elapsed;
             self.depth_fps = self.depth_frames as f32 / elapsed;
             self.ir_fps = self.ir_frames as f32 / elapsed;
-            let jiffies = read_cpu_jiffies().unwrap_or(self.last_jiffies);
-            // USER_HZ is 100 on Linux x86_64; ticks → seconds = / 100.
-            let cpu_secs = jiffies.saturating_sub(self.last_jiffies) as f32 / 100.0;
-            self.cpu_pct = cpu_secs / elapsed * 100.0;
-            self.last_jiffies = jiffies;
+            // sysinfo derives CPU% from the gap between two refreshes, so it
+            // needs the previous sample to still be there — hence the long-lived
+            // `System`. The 1 s window is comfortably above its 200 ms minimum.
+            self.sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[self.pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing()
+                    .with_cpu()
+                    .with_memory(),
+            );
+            if let Some(proc_) = self.sys.process(self.pid) {
+                self.cpu_pct = proc_.cpu_usage();
+                self.ram_mib = proc_.memory() / (1024 * 1024);
+            }
             self.in_frames = 0;
             self.out_frames = 0;
             self.render_frames = 0;
@@ -4418,11 +4423,12 @@ impl Metrics {
         }
         if now.duration_since(self.last_log).as_secs_f32() >= 2.0 {
             info!(
-                "perf: head {:.1}ms | anchor {:.1}ms | reg {:.1}ms | cpu {:.0}% | in {:.1} fps | out {:.1} fps | render {:.1} fps | depth {:.1} fps | ir {:.1} fps",
+                "perf: head {:.1}ms | anchor {:.1}ms | reg {:.1}ms | cpu {:.0}% | ram {} MiB | in {:.1} fps | out {:.1} fps | render {:.1} fps | depth {:.1} fps | ir {:.1} fps",
                 self.head_ms,
                 self.anchor_ms,
                 self.reg_ms,
                 self.cpu_pct,
+                self.ram_mib,
                 self.in_fps,
                 self.out_fps,
                 self.render_fps,
@@ -4438,8 +4444,14 @@ impl Metrics {
         // Depth / IR only exist on the Kinects — appended when they're flowing
         // so the webcam read-out stays uncluttered.
         let mut s = format!(
-            "head {:.0}ms · anchor {:.0}ms · cpu {:.0}% · in {:.0} / out {:.0} / render {:.0} fps",
-            self.head_ms, self.anchor_ms, self.cpu_pct, self.in_fps, self.out_fps, self.render_fps
+            "head {:.0}ms · anchor {:.0}ms · cpu {:.0}% · ram {} MiB · in {:.0} / out {:.0} / render {:.0} fps",
+            self.head_ms,
+            self.anchor_ms,
+            self.cpu_pct,
+            self.ram_mib,
+            self.in_fps,
+            self.out_fps,
+            self.render_fps
         );
         if self.reg_ms > 0.0 {
             s.push_str(&format!(" · reg {:.0}ms", self.reg_ms));
@@ -6614,6 +6626,19 @@ fn open_kinect_v2() -> Result<Capture, String> {
     let device = ctx
         .open_default()
         .map_err(|e| format!("freenect2 open_default: {e}"))?;
+    // First thing in the log, before anything else can go wrong: which depth
+    // pipeline actually opened. On the CPU one the v2 drops USB depth packets
+    // and delivers ~5 fps instead of 30, and every downstream number inherits
+    // it — so a report that starts with "CPU" needs no further diagnosis.
+    let pipeline = device.depth_pipeline();
+    if pipeline == "CPU" {
+        warn!(
+            "Kinect v2 depth pipeline: CPU — expect dropped USB packets and \
+             ~5 fps of depth. No OpenCL device available (missing driver ICD?)."
+        );
+    } else {
+        info!(pipeline, "Kinect v2 depth pipeline");
+    }
     device
         .start_streams(true, true)
         .map_err(|e| format!("freenect2 start_streams: {e}"))?;
@@ -7972,5 +7997,26 @@ mod tests {
             fn geteuid() -> u32;
         }
         unsafe { geteuid() }
+    }
+
+    /// The process metrics must exist on whatever platform this is running on.
+    /// The reader they replaced parsed `/proc/self/stat` and returned 0 on
+    /// Windows and macOS, which turned the perf line into a lie precisely
+    /// where we needed it — a saturated CPU depth pipeline reads as idle.
+    #[test]
+    fn process_metrics_are_reported_on_this_platform() {
+        let mut m = Metrics::new();
+        // sysinfo needs two samples spaced past its minimum interval before
+        // CPU means anything; memory is available from the first.
+        m.tick();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        m.window_start = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        m.tick();
+        assert!(m.ram_mib > 0, "resident memory should not read as zero");
+        assert!(
+            m.cpu_pct.is_finite() && m.cpu_pct >= 0.0,
+            "cpu {}",
+            m.cpu_pct
+        );
     }
 }

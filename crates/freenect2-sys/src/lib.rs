@@ -170,6 +170,11 @@ mod ffi {
         fn open_default(ctx: Pin<&mut Freenect2Ctx>) -> UniquePtr<Freenect2Dev>;
 
         /// Start the depth stream (RGB stays off — the head-tracker path).
+        /// `"OpenCL"` or `"CPU"` — which depth pipeline the device opened
+        /// with. The CPU one drops USB packets on a Kinect v2, so this is the
+        /// first thing to read in a slow-stream report.
+        fn depth_pipeline(dev: &Freenect2Dev) -> *const c_char;
+
         fn start_depth(dev: Pin<&mut Freenect2Dev>) -> bool;
 
         /// Start the requested streams. Useful for diagnostic tools that
@@ -231,9 +236,9 @@ pub use ffi::{
     Registration, RgbFrame,
 };
 pub use ffi::{
-    color_params, enumerate, install_logger, ir_params, map_depth_to_color, new_context,
-    new_registration, open_default, poll_depth, poll_ir, poll_rgb, register_bigdepth, start_depth,
-    start_streams, stop_device,
+    color_params, depth_pipeline, enumerate, install_logger, ir_params, map_depth_to_color,
+    new_context, new_registration, open_default, poll_depth, poll_ir, poll_rgb, register_bigdepth,
+    start_depth, start_streams, stop_device,
 };
 
 /// Length of the color-space depth buffer [`register_bigdepth`] fills:
@@ -255,3 +260,40 @@ unsafe impl Send for ffi::Freenect2Dev {}
 // through an exclusive borrow.
 unsafe impl Send for ffi::Registration {}
 unsafe impl Sync for ffi::Registration {}
+
+#[cfg(test)]
+mod gpu_pipeline_tests {
+    /// The Kinect v2 depth decode must be compiled with a GPU pipeline.
+    ///
+    /// On the CPU pipeline libfreenect2 does not merely run slower: it drops
+    /// USB depth packets it cannot consume in time and delivers roughly 5 fps
+    /// instead of 30, which downstream reads as a head position updating five
+    /// times a second. That shipped on Windows and macOS for months because
+    /// nothing checked — `ENABLE_OPENCL` is a *request*, and a build image
+    /// without the SDK silently produces a CPU-only library.
+    ///
+    /// Set `HT_ALLOW_CPU_ONLY=1` to build without it. Install the SDK to fix
+    /// it properly: `opencl-headers ocl-icd-opencl-dev` on Debian/Ubuntu,
+    /// `vcpkg install opencl:x64-windows` on Windows; macOS has the framework
+    /// already.
+    #[test]
+    fn gpu_depth_pipeline_is_compiled_in() {
+        if cfg!(freenect2_opencl) {
+            return;
+        }
+        if std::env::var_os("HT_ALLOW_CPU_ONLY").is_some() {
+            eprintln!(
+                "warning: libfreenect2 built without OpenCL — the Kinect v2 \
+                 depth pipeline will run on the CPU and drop USB packets"
+            );
+            return;
+        }
+        panic!(
+            "libfreenect2 was built WITHOUT the OpenCL depth pipeline: the \
+             Kinect v2 would run its depth decode on the CPU, drop USB packets \
+             and deliver ~5 fps instead of 30. Install the OpenCL SDK for this \
+             platform (Debian/Ubuntu: opencl-headers ocl-icd-opencl-dev), or \
+             set HT_ALLOW_CPU_ONLY=1 to accept a CPU-only build."
+        );
+    }
+}
