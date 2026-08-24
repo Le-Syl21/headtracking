@@ -498,8 +498,8 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         ),
         make_float_setting(
             c"Gain",
-            c"Gain",
-            c"Multiplier on the head-motion delta before it's applied to the camera",
+            c"Gain (all axes)",
+            c"Multiplier on the head-motion delta before it's applied to the camera. One value for the three axes: left/right, up/down and near/far alike.",
             0.0,
             5.0,
             0.05,
@@ -510,7 +510,7 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         make_int_setting(
             c"Smoothing",
             c"Smoothing",
-            c"Stable is the field-tested default (kills every tremor for a touch of lag), Normal follows quicker, Reactive follows fast moves closest",
+            c"Stable is the field-tested default (kills every tremor for a touch of lag), Normal follows quicker, Reactive follows fast moves closest. Each preset is tuned per axis already: near/far is smoothed hardest, since it is the noisiest reading and the one that re-skews the whole projection.",
             0,
             2,
             SmoothingPreset::Stable.to_i32(),
@@ -542,7 +542,7 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         ),
         make_bool_setting(
             c"InvertX",
-            c"Invert X",
+            c"Invert X (left/right)",
             c"Flip the left/right response (for mirrored or unusual camera mountings)",
             false,
             get_invert_x,
@@ -550,7 +550,7 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         ),
         make_bool_setting(
             c"InvertY",
-            c"Invert Y",
+            c"Invert Y (up/down)",
             c"Flip the up/down response",
             false,
             get_invert_y,
@@ -558,7 +558,7 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         ),
         make_bool_setting(
             c"InvertZ",
-            c"Invert Z",
+            c"Invert Z (near/far)",
             c"Flip the closer/farther response",
             false,
             get_invert_z,
@@ -577,7 +577,7 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         ),
         make_float_setting(
             c"BaselineOffsetX",
-            c"Baseline Offset X (mm)",
+            c"Baseline Offset X, left/right (mm)",
             c"Trim added to the captured neutral head position, left/right",
             -500.0,
             500.0,
@@ -588,7 +588,7 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         ),
         make_float_setting(
             c"BaselineOffsetY",
-            c"Baseline Offset Y (mm)",
+            c"Baseline Offset Y, up/down (mm)",
             c"Trim added to the captured neutral head position, up/down",
             -500.0,
             500.0,
@@ -599,7 +599,7 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
         ),
         make_float_setting(
             c"BaselineOffsetZ",
-            c"Baseline Offset Z (mm)",
+            c"Baseline Offset Z, near/far (mm)",
             c"Trim added to the captured neutral head position, closer/farther",
             -500.0,
             500.0,
