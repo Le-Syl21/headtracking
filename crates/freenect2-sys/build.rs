@@ -31,6 +31,7 @@ fn main() {
     // `$<TARGET_FILE:…>` generator expression forces cmake to emit
     // the resolved absolute path.
     patch_libfreenect2_resource_tool_path(&vendor_dir);
+    patch_libfreenect2_icdl_version_clash(&vendor_dir);
 
     // libfreenect2's CMakeLists `find_package(TurboJPEG REQUIRED)` — point it
     // at the vendored libjpeg-turbo built by `turbojpeg-sys` so we don't need
@@ -329,6 +330,46 @@ include("${CMAKE_SOURCE_DIR}/cmake_modules/FindLibUSB.cmake")
 /// Bare-name invocation breaks under cross-compile (macOS x86_64
 /// from an ARM runner) where the build dir's bin/ isn't on PATH and
 /// the make rule can't find the tool.
+/// libfreenect2 declares a local `const int CL_ICDL_VERSION = 2;` inside both
+/// OpenCL packet processors. Since OpenCL 3.0 the loader-info extension makes
+/// that an unconditional macro (`CL/cl_ext.h`: `#define CL_ICDL_VERSION 2`),
+/// so the declaration expands to `const int 2 = 2` and the compile dies with
+/// "expected unqualified-id before numeric constant".
+///
+/// Upstream v0.2.1 predates those headers and there is no release with the
+/// fix, so we guard the name ourselves. Doing it here rather than by hand:
+/// the same edit had been sitting uncommitted in the submodule's working tree,
+/// which is why OpenCL built on this machine and nowhere else — CI checks out
+/// a pristine v0.2.1 and the whole GPU pipeline failed to compile.
+///
+/// A submodule bump that renames or removes the declaration makes the anchor
+/// miss; the build then fails loudly on the original error rather than
+/// silently dropping the patch.
+fn patch_libfreenect2_icdl_version_clash(vendor_dir: &Path) {
+    const MARKER: &str = "// freenect2-sys: guard against the CL_ICDL_VERSION macro";
+    let target = "    const int CL_ICDL_VERSION = 2;";
+    let replacement = concat!(
+        "// freenect2-sys: guard against the CL_ICDL_VERSION macro\n",
+        "#ifdef CL_ICDL_VERSION\n",
+        "#undef CL_ICDL_VERSION\n",
+        "#endif\n",
+        "    const int CL_ICDL_VERSION = 2;"
+    );
+    for name in [
+        "src/opencl_depth_packet_processor.cpp",
+        "src/opencl_kde_depth_packet_processor.cpp",
+    ] {
+        let path = vendor_dir.join(name);
+        let Ok(original) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if original.contains(MARKER) || !original.contains(target) {
+            continue;
+        }
+        let _ = std::fs::write(&path, original.replace(target, replacement));
+    }
+}
+
 fn patch_libfreenect2_resource_tool_path(vendor_dir: &Path) {
     let path = vendor_dir.join("cmake_modules/GenerateResources.cmake");
     let Ok(original) = std::fs::read_to_string(&path) else {
