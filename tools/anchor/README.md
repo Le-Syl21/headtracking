@@ -92,6 +92,19 @@ Retraining rule: always train on the **cumulative** dataset (old + new
 images). Fine-tuning on new data alone makes a model this small forget
 everything it knew.
 
+The annotations themselves live in `annotations/anchor-lines.json`, which is
+**tracked** — everything under `dataset_*/` is a build artefact and is not.
+Hand-drawn lines are the expensive part; a model can always be retrained from
+them, so they must survive a `git clean`.
+
+Depth and IR frames are 16-bit. Train on the auto-levelled `_depthview` /
+`_irview` renderings, never on `_depth` / `_ir` directly: they share the same
+pixel grid, so the annotations transfer unchanged, but `cv2.imread` collapses
+16-bit to 8-bit by division — a depth map in millimetres arrives with a mean
+of 5.8/255, i.e. a black image, and nothing warns you. At *inference* the Rust
+decoder converts properly, so `_ir` scores like `_irview`; `_depth` still
+scores well below `_depthview`.
+
 ### What we learned the hard way
 
 Three non-obvious traps, all now baked into the scripts:
