@@ -66,6 +66,21 @@ impl KinectV2Backend {
             return Err(Error::Freenect2(freenect2::Error::NoDevice));
         }
         let device = ctx.open_default()?;
+        // Say which depth pipeline opened, before anything else can go wrong.
+        // On the CPU one the v2 drops USB depth packets and delivers ~5 fps
+        // instead of 30, and every number downstream inherits it — a report
+        // that starts with "CPU" needs no further diagnosis. Compiling the GPU
+        // path in is not the same as it running: a machine with no registered
+        // OpenCL ICD falls back here, silently, at runtime.
+        let pipeline = device.depth_pipeline();
+        if pipeline == "CPU" {
+            warn!(
+                "kinect-v2: depth pipeline is CPU — expect dropped USB packets and \
+                 ~5 fps of depth instead of 30. No usable OpenCL device (GPU driver ICD?)."
+            );
+        } else {
+            info!(pipeline, "kinect-v2: depth pipeline");
+        }
         // Colour always flows at open, whatever the target: the anchor
         // calibration phase needs RGB frames. `begin_tracking` then trades
         // colour for the IR/depth-only pipeline (halved USB load, no 8 MB

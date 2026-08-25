@@ -5773,11 +5773,20 @@ impl App {
                         .strong()
                         .color(Color32::from_rgb(0xff, 0xcc, 0x33)),
                 );
-                // Explicit opt-in as a highlight toggle (blue when on) — an
-                // affirmative, deliberate action before any upload is allowed.
-                ui.toggle_value(
+                // A real checkbox, not a toggle carrying a `☐` in its label.
+                // That glyph was hard-coded, so the box never filled in however
+                // many times it was clicked — reported from the field as "the
+                // checkbox is always empty". And neither embedded font subset
+                // even contains ☐/☑, so the character was at the mercy of
+                // whatever egui's default font happened to provide.
+                //
+                // `Checkbox` draws its box and its tick as vector shapes: no
+                // font involved, it ticks itself, and the whole sentence stays
+                // clickable — which is what makes it obvious the block is the
+                // thing to click.
+                ui.checkbox(
                     &mut self.consent_checked,
-                    "☐ I have read the above and I freely give my informed consent to share \
+                    "I have read the above and I freely give my informed consent to share \
                      these images under these terms.",
                 );
                 ui.add_space(6.0);
