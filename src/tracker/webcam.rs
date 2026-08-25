@@ -503,7 +503,7 @@ impl HeadTracker for WebcamBackend {
         self.camera.name.clone()
     }
 
-    fn poll_calibration_rgb(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+    fn poll_calibration_frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
         let api = sdl3().ok()?;
         let frame = self.camera.poll_rgb(api)?;
         Some((frame.width, frame.height, frame.data))

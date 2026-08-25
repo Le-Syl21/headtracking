@@ -651,7 +651,7 @@ fn camera_pose_note(
         .lockbar_width_mm;
     // Real factory intrinsics when the device provides them (Kinect v2);
     // demo-validated nominals otherwise (±0-3 % against tape measures).
-    let [fx, fy, cx, cy] = calib.color_intrinsics.unwrap_or_else(|| {
+    let [fx, fy, cx, cy] = calib.calibration_intrinsics.unwrap_or_else(|| {
         let fx = if backend.starts_with("kinect-v1") {
             525.0
         } else if cfg.webcam_focal_px > 0.0 {

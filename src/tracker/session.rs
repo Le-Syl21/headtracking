@@ -29,8 +29,9 @@ pub struct CameraCalibration {
     pub geometry: anchor::AnchorGeometry,
     pub frame_w: u32,
     pub frame_h: u32,
-    /// Real colour intrinsics `[fx, fy, cx, cy]` when the device knows them.
-    pub color_intrinsics: Option<[f32; 4]>,
+    /// Intrinsics `[fx, fy, cx, cy]` of the stream the anchor was detected
+    /// in -- colour, or infrared on a Kinect v2 tracking in IR.
+    pub calibration_intrinsics: Option<[f32; 4]>,
     pub score: f32,
 }
 
@@ -78,7 +79,7 @@ fn run_anchor_calibration(
             Some(t) if t.elapsed() > ANCHOR_WARMUP => break,
             _ => {}
         }
-        let Some((w, h, rgb)) = backend.poll_calibration_rgb() else {
+        let Some((w, h, rgb)) = backend.poll_calibration_frame() else {
             thread::sleep(Duration::from_millis(10));
             continue;
         };
@@ -91,15 +92,12 @@ fn run_anchor_calibration(
         thread::sleep(ANCHOR_INTERVAL);
     }
     let (score, d, w, h) = best?;
-    info!(
-        score,
-        w, h, "anchor: cabinet locked from live RGB detection"
-    );
+    info!(score, w, h, "anchor: cabinet locked from live detection");
     Some(CameraCalibration {
         geometry: d.geometry(w, h),
         frame_w: w,
         frame_h: h,
-        color_intrinsics: backend.color_intrinsics(),
+        calibration_intrinsics: backend.calibration_intrinsics(),
         score,
     })
 }

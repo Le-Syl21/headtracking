@@ -15,6 +15,16 @@
 //!
 //! Either way the v2 frame is mirrored vs the v1 — X is negated so
 //! left/right POV travel matches across backends.
+//!
+//! **Anchor calibration follows the tracking stream**, so in IR mode the
+//! cabinet is located in the IR frame and the geometry lands in the depth
+//! camera's own coordinates — the same lens again, so the per-head depth
+//! lookup needs no registration. It also means colour never starts: the
+//! session opens on IR/depth and stays there, with no stop/restart in the
+//! middle. Before this, calibration asked for colour frames while `open()`
+//! called `Device::start()` — which is `start_streams(false, true)` and does
+//! not start colour — so the anchor phase on a v2 waited out its timeout on
+//! a stream that was never running, every time.
 
 use std::time::Instant;
 
@@ -81,11 +91,20 @@ impl KinectV2Backend {
         } else {
             info!(pipeline, "kinect-v2: depth pipeline");
         }
-        // Colour always flows at open, whatever the target: the anchor
-        // calibration phase needs RGB frames. `begin_tracking` then trades
-        // colour for the IR/depth-only pipeline (halved USB load, no 8 MB
-        // BGRX conversions per frame).
-        device.start()?;
+        // Start exactly the streams this mode needs, and keep them for the
+        // whole session. In IR mode the anchor phase reads the IR frame, so
+        // colour never has to flow at all: half the USB load, no 8 MB BGRX
+        // conversion per frame, and no stop/restart between calibration and
+        // tracking. It also puts the cabinet geometry in the depth camera's
+        // own frame -- IR and depth share the lens on this sensor -- so the
+        // per-head depth lookup needs no colour-to-depth registration.
+        //
+        // Note `Device::start()` is `start_streams(false, true)`: it does NOT
+        // start colour. Anchor calibration in RGB mode has to ask for it.
+        match stream {
+            TrackingStream::Ir => device.start()?,
+            TrackingStream::Rgb => device.start_streams(true, true)?,
+        }
         let ir = device.ir_params();
         let ir_intr = Intrinsics {
             fx: ir.fx,
@@ -242,26 +261,29 @@ impl HeadTracker for KinectV2Backend {
         }
     }
 
-    fn poll_calibration_rgb(&mut self) -> Option<(u32, u32, Vec<u8>)> {
-        let rgb = self.device.poll_rgb()?;
-        Some((rgb.width, rgb.height, bgrx_to_rgb888(&rgb.data)))
-    }
-
-    fn begin_tracking(&mut self) {
-        if self.stream == TrackingStream::Ir {
-            let res = self
-                .device
-                .stop()
-                .and_then(|()| self.device.start_streams(false, true));
-            match res {
-                Ok(()) => info!("kinect-v2: calibration done, restarted on IR/depth only"),
-                Err(e) => warn!(?e, "kinect-v2: IR restart failed; streams may be stale"),
+    fn poll_calibration_frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        match self.stream {
+            // Same auto-levelling that produced the `_irview` frames the
+            // anchor model was trained on, so it sees the distribution it
+            // learned rather than the near-black native IR.
+            TrackingStream::Ir => {
+                let ir = self.device.poll_ir()?;
+                let raw: Vec<u16> = ir.data.iter().map(|&v| v as u16).collect();
+                let gray = autolevel_gray8_raw(&raw, false);
+                Some((ir.width, ir.height, gray8_to_rgb888(&gray)))
+            }
+            TrackingStream::Rgb => {
+                let rgb = self.device.poll_rgb()?;
+                Some((rgb.width, rgb.height, bgrx_to_rgb888(&rgb.data)))
             }
         }
     }
 
-    fn color_intrinsics(&self) -> Option<[f32; 4]> {
-        let c = &self.color_intr;
+    fn calibration_intrinsics(&self) -> Option<[f32; 4]> {
+        let c = match self.stream {
+            TrackingStream::Ir => &self.ir_intr,
+            TrackingStream::Rgb => &self.color_intr,
+        };
         Some([c.fx, c.fy, c.cx, c.cy])
     }
 

@@ -156,7 +156,7 @@ impl HeadTracker for KinectV1Backend {
         }
     }
 
-    fn poll_calibration_rgb(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+    fn poll_calibration_frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
         // libfreenect's colour stream is already RGB888.
         let rgb = self.device.poll_rgb()?;
         Some((rgb.width, rgb.height, rgb.data))

@@ -57,20 +57,23 @@ pub trait HeadTracker: Send {
         self.name().to_string()
     }
 
-    /// Poll one COLOUR frame (rgb888) for the anchor-calibration phase at
-    /// session start. Backends that cannot serve colour return `None`.
-    fn poll_calibration_rgb(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+    /// Poll one rgb888 frame for the anchor-calibration phase at session
+    /// start, from whichever stream the backend calibrates on -- colour for
+    /// webcams, infrared on a Kinect v2 tracking in IR. Backends that can
+    /// serve neither return `None`.
+    fn poll_calibration_frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
         None
     }
 
-    /// Leave the colour calibration phase and start the configured tracking
-    /// stream (IR on Kinects when requested). No-op by default; called
-    /// exactly once, before the first `poll`.
+    /// Leave the calibration phase and start the configured tracking stream.
+    /// No-op by default; called exactly once, before the first `poll`.
     fn begin_tracking(&mut self) {}
 
-    /// Real colour-stream intrinsics `[fx, fy, cx, cy]` when the device
-    /// knows them (Kinect v2 factory calibration). `None` = use nominals.
-    fn color_intrinsics(&self) -> Option<[f32; 4]> {
+    /// Intrinsics `[fx, fy, cx, cy]` of the stream [`poll_calibration_frame`]
+    /// serves, when the device knows them (Kinect factory calibration).
+    /// `None` = use nominals. Must match that stream, not merely the colour
+    /// one: on a Kinect v2 the IR camera has its own focal length.
+    fn calibration_intrinsics(&self) -> Option<[f32; 4]> {
         None
     }
 
