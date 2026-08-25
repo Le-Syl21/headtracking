@@ -20,7 +20,7 @@ const MODELS: &[(&str, &str)] = &[
 /// targets in parallel and each starts from a fresh checkout, so a
 /// single-shot download gets throttled regularly. Retry with a fixed
 /// backoff instead of failing the whole build on the first 429.
-fn download(name: &str, url: &str) -> Result<ureq::Response, String> {
+fn download(name: &str, url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
     const BACKOFF_SECS: &[u64] = &[0, 10, 30, 60];
     let mut last_err = String::new();
     for (attempt, wait) in BACKOFF_SECS.iter().enumerate() {
@@ -50,7 +50,15 @@ fn main() {
         println!("cargo:warning=blazepose: downloading {name} …");
         let resp =
             download(name, url).unwrap_or_else(|e| panic!("download {name} after retries: {e}"));
-        let mut reader = resp.into_reader();
+        // ureq 3 caps a response body at 10 MB by default. The pose models
+        // run past that, and a truncated model is worse than a failed
+        // download: it looks like a model and is not.
+        let mut resp = resp;
+        let mut reader = resp
+            .body_mut()
+            .with_config()
+            .limit(512 * 1024 * 1024)
+            .reader();
         let mut f = std::fs::File::create(&path).expect("create model file");
         std::io::copy(&mut reader, &mut f).expect("write model");
     }

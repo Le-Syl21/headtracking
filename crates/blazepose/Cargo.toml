@@ -14,4 +14,4 @@ thiserror = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [build-dependencies]
-ureq = "2"
+ureq = "3"

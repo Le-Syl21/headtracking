@@ -127,13 +127,20 @@ fn uploader_loop(rx: &Receiver<(String, Vec<u8>)>, status: &Arc<Mutex<UploadStat
 }
 
 fn put_file(name: &str, bytes: &[u8]) -> Result<(), String> {
-    match ureq::put(&drop_url(name))
-        .set("Authorization", &basic_auth())
-        .timeout(Duration::from_secs(30))
-        .send_bytes(bytes)
+    // ureq 3 moved timeouts onto the agent rather than the request, and no
+    // longer turns a non-2xx into `Error::Status`: it is `StatusCode` now, and
+    // the code is read off the response.
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    match agent
+        .put(&drop_url(name))
+        .header("Authorization", &basic_auth())
+        .send(bytes)
     {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(ureq::Error::StatusCode(code)) => Err(format!("HTTP {code}")),
         Err(e) => Err(e.to_string()),
     }
 }
