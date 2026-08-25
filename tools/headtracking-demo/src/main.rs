@@ -32,6 +32,13 @@ use egui::{
     self, Align, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, TextureHandle, Vec2,
 };
+// `glow` comes from `egui_glow`, which re-exports it (`pub use glow;`), rather
+// than being declared ourselves. Two crates naming the same GL bindings must
+// agree on the version or the types are different types — and the version is
+// egui's to choose, not ours. Taking it from there makes a mismatch
+// impossible instead of merely unlikely, and stops `cargo update` reporting a
+// glow bump we are not free to take.
+use egui_glow::glow;
 use egui_rotate::{Rotation, RotationPlugin, SoftwareCursor};
 use egui_winit::winit;
 use nalgebra::Matrix4;

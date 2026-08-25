@@ -1460,7 +1460,6 @@ dependencies = [
  "egui_glow",
  "freenect",
  "freenect2",
- "glow",
  "glutin",
  "glutin-winit",
  "headtracking",

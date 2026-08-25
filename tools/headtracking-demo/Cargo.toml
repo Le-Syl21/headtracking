@@ -29,7 +29,6 @@ egui = "0.36"
 egui_glow = "0.36"
 egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 egui-rotate = { version = "3.1", features = ["software-cursor", "inspection"] }
-glow = "0.17"
 glutin = "0.32"
 glutin-winit = "0.5"
 parking_lot = "0.12"
