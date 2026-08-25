@@ -2686,6 +2686,11 @@ struct Capture {
     /// Latest registration cost (ms) and a one-shot flag so a failing or
     /// missing registration warns once instead of every frame.
     reg_ms: f32,
+    /// Time spent turning the camera's surface into a packed RGB buffer.
+    /// Non-zero on the webcam only: a 1080p MJPG frame is fully decoded here
+    /// before the pose model takes a 224x224 square of it, and whether that
+    /// is a real ceiling or noise beside inference was never measured.
+    convert_ms: f32,
     reg_warned: bool,
     /// Which stream the user is viewing. Only used capture-side to skip
     /// building the (2 M pixel) colour-space depth view unless it's on screen.
@@ -2983,6 +2988,7 @@ impl Capture {
             Inner::Webcam { camera } => {
                 if let Some(rgb) = camera.poll_rgb() {
                     got_rgb = true;
+                    self.convert_ms = rgb.convert_ms;
                     self.last_rgb_at = Some(Instant::now());
                     let rgb888 = Arc::new(rgb.data);
                     self.blaze_worker
@@ -3066,6 +3072,7 @@ impl Capture {
             head_ms: self.head_ms,
             anchor_ms: self.anchor_ms,
             reg_ms: self.reg_ms,
+            convert_ms: self.convert_ms,
             anchor_locked: self.anchor_worker.is_locked(),
         }
     }
@@ -3176,6 +3183,8 @@ struct LatestFrame {
     lockbar: Option<headtracking::calibration::LockbarQuadRgb>,
     head_ms: f32,
     anchor_ms: f32,
+    /// Cost of decoding this frame into packed RGB (ms); webcam only.
+    convert_ms: f32,
     /// Cost of the v2 depth↔colour registration for this frame (ms); `0.0`
     /// when it isn't running.
     reg_ms: f32,
@@ -4272,6 +4281,9 @@ struct Metrics {
     /// isn't running. Surfaced because it's real per-frame work on the capture
     /// thread — if it ever gets expensive we want to see it, not hide it.
     reg_ms: f32,
+    /// Surface→RGB decode cost (ms, EWMA); webcam only. A 1080p MJPG frame is
+    /// decoded whole here before the pose model takes a 224x224 square of it.
+    convert_ms: f32,
     in_fps: f32,
     out_fps: f32,
     /// Display repaints per second — the GL thread's own cadence, independent
@@ -4311,6 +4323,7 @@ impl Metrics {
             head_ms: 0.0,
             anchor_ms: 0.0,
             reg_ms: 0.0,
+            convert_ms: 0.0,
             in_fps: 0.0,
             out_fps: 0.0,
             render_fps: 0.0,
@@ -4348,6 +4361,16 @@ impl Metrics {
     /// Registration cost for the latest frame. Reported as an EWMA like the
     /// inference times; an exact `0.0` means "not running" and is passed
     /// through so the figure drops out cleanly on v1 / webcam.
+    /// Same exponential smoothing as the other per-frame costs, so one slow
+    /// decode does not dominate the read-out.
+    fn note_convert_ms(&mut self, ms: f32) {
+        self.convert_ms = if ms == 0.0 || self.convert_ms == 0.0 {
+            ms
+        } else {
+            self.convert_ms * 0.8 + ms * 0.2
+        };
+    }
+
     fn note_reg_ms(&mut self, ms: f32) {
         self.reg_ms = if ms == 0.0 || self.reg_ms == 0.0 {
             ms
@@ -4851,6 +4874,7 @@ impl App {
                 active.metrics.note_head_ms(frame.head_ms);
             }
             active.metrics.note_reg_ms(frame.reg_ms);
+            active.metrics.note_convert_ms(frame.convert_ms);
             active.anchor_locked = frame.anchor_locked;
             if frame.anchor_locked {
                 active.metrics.note_anchor_locked();
@@ -6573,6 +6597,7 @@ fn new_capture(backend: Backend, intrinsics: Intrinsics, inner: Inner) -> Captur
         intrinsics,
         inner,
         hwlock: None,
+        convert_ms: 0.0,
         blaze_worker: BlazePoseWorker::spawn(),
         anchor_worker: AnchorWorker::spawn(),
         pose_filter: make_pose_filter(),

@@ -131,6 +131,14 @@ pub struct RgbFrame {
     /// expose a stable clock.
     pub timestamp_ns: u64,
     pub data: Vec<u8>,
+    /// How long turning the camera's surface into this packed RGB buffer
+    /// took, in milliseconds.
+    ///
+    /// Worth surfacing rather than assuming: a 1080p MJPG webcam decodes a
+    /// full 2 Mpixel frame here, and the pose model then consumes a 224x224
+    /// square of it. Whether that decode is a real ceiling or noise next to
+    /// inference is a measurement, and nobody had taken it.
+    pub convert_ms: f32,
 }
 
 // ============================================================ list()
@@ -407,7 +415,11 @@ impl Camera {
         if surf_ptr.is_null() {
             return None;
         }
-        let frame = self.surface_to_rgb(surf_ptr, ts_ns);
+        let t0 = std::time::Instant::now();
+        let mut frame = self.surface_to_rgb(surf_ptr, ts_ns);
+        if let Some(f) = frame.as_mut() {
+            f.convert_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        }
         // SAFETY: surf_ptr was just returned by Acquire; we own the
         // matching Release call.
         unsafe { sdl_cam::SDL_ReleaseCameraFrame(self.raw.as_ptr(), surf_ptr) };
@@ -509,6 +521,8 @@ impl Camera {
             height,
             timestamp_ns: ts_ns,
             data,
+            // Filled in by `poll_rgb`, which times the whole conversion.
+            convert_ms: 0.0,
         })
     }
 }
@@ -536,6 +550,8 @@ fn copy_rgb24_surface(surf: &SDL_Surface, ts_ns: u64) -> Option<RgbFrame> {
         height,
         timestamp_ns: ts_ns,
         data,
+        // Filled in by `poll_rgb`, which times the whole conversion.
+        convert_ms: 0.0,
     })
 }
 
