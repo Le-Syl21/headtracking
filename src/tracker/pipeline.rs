@@ -289,7 +289,8 @@ pub const DEPTH_MIN_SAMPLES: usize = 16;
 pub fn bgrx_to_rgb888(bgrx: &[u8]) -> Vec<u8> {
     let pixels = bgrx.len() / 4;
     let mut out = Vec::with_capacity(pixels * 3);
-    for chunk in bgrx.chunks_exact(4) {
+    let (chunks, _) = bgrx.as_chunks::<4>();
+    for chunk in chunks {
         out.push(chunk[2]); // R
         out.push(chunk[1]); // G
         out.push(chunk[0]); // B

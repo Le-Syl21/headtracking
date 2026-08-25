@@ -6825,7 +6825,8 @@ fn open_webcam(index: u32) -> Result<Capture, String> {
 /// compared to the detector's ~10 ms inference.
 fn bgrx_to_rgb888(bgrx: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bgrx.len() / 4 * 3);
-    for chunk in bgrx.chunks_exact(4) {
+    let (chunks, _) = bgrx.as_chunks::<4>();
+    for chunk in chunks {
         out.push(chunk[2]); // R from BGRX
         out.push(chunk[1]); // G
         out.push(chunk[0]); // B
