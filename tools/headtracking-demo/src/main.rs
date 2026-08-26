@@ -66,6 +66,7 @@ const WEBCAM_FX_PER_WIDTH: f32 = 0.9;
 const LOG_BUFFER_LINES: usize = 1_000;
 
 mod contribute;
+mod usb_check;
 
 /// Privacy-notice bullets for the Share-a-capture window (title, body).
 const CONTRIB_TERMS: &[(&str, &str)] = &[
@@ -2334,6 +2335,10 @@ enum SwitchState {
 
 struct App {
     selected: Backend,
+    /// Last USB verdict and when it was taken. Enumerating the bus is cheap
+    /// but not free, and the UI repaints far faster than a cable gets moved,
+    /// so it is refreshed on a timer rather than per frame.
+    usb_cache: Option<(Instant, usb_check::Sensor, usb_check::UsbReport)>,
     available: Vec<BackendEntry>,
     active: Option<Active>,
     error: Option<String>,
@@ -2489,6 +2494,19 @@ impl App {
         // loop poll fast enough to catch every camera frame; `in_fps` then settles
         // at the true camera/processing rate, and we still don't spin (VSync off).
         Duration::from_secs_f32(1.0 / 60.0)
+    }
+
+    /// USB verdict for `sensor`, re-read at most every two seconds.
+    fn usb_report(&mut self, sensor: usb_check::Sensor) -> Option<&usb_check::UsbReport> {
+        const REFRESH: Duration = Duration::from_secs(2);
+        let stale = match &self.usb_cache {
+            Some((at, s, _)) => *s != sensor || at.elapsed() >= REFRESH,
+            None => true,
+        };
+        if stale {
+            self.usb_cache = usb_check::check(sensor).map(|r| (Instant::now(), sensor, r));
+        }
+        self.usb_cache.as_ref().map(|(_, _, r)| r)
     }
 
     fn label_for(&self, backend: Backend) -> String {
@@ -4304,6 +4322,8 @@ struct Metrics {
     euro_us: f32,
     /// Locked anchors stop the detector, so a duration would be misleading.
     anchor_locked: bool,
+    /// Previous budget verdict, to log the moment it changes.
+    was_over: bool,
     /// One frame's worth of time at the sensor's nominal rate: the ceiling the
     /// per-frame costs must fit under to hold that rate. Both Kinects cap at
     /// 30 fps and most UVC webcams report 30, so that is the default.
@@ -4351,6 +4371,7 @@ impl Metrics {
             euro_us: 0.0,
             convert_ms: 0.0,
             anchor_locked: false,
+            was_over: false,
             budget_ms: 1000.0 / 30.0,
             in_fps: 0.0,
             out_fps: 0.0,
@@ -4415,6 +4436,14 @@ impl Metrics {
     }
     /// anchor calibration is locked → the detector no longer runs, so report
     /// 0 ms instead of holding the last inference time.
+    /// One frame's worth of time at the sensor's own rate. Called when a
+    /// backend opens: a 60 fps webcam has half the budget a Kinect has, and a
+    /// fixed 30 would have called it healthy at twice the real cost.
+    fn set_nominal_fps(&mut self, fps: f32) {
+        if fps > 1.0 {
+            self.budget_ms = 1000.0 / fps;
+        }
+    }
     fn note_anchor_locked(&mut self) {
         self.anchor_ms = 0.0;
         self.anchor_locked = true;
@@ -4480,7 +4509,15 @@ impl Metrics {
             self.ir_frames = 0;
             self.window_start = now;
         }
-        if now.duration_since(self.last_log).as_secs_f32() >= 2.0 {
+        // 5 s in the steady state -- 2 s filled a field log with 868 near
+        // identical lines -- but a status flip is logged the moment it
+        // happens, so a short stall is never averaged away.
+        let used_now =
+            self.reg_ms + self.head_ms + self.convert_ms + (self.median_us + self.euro_us) / 1000.0;
+        let over_now = used_now > self.budget_ms;
+        let flipped = over_now != self.was_over;
+        self.was_over = over_now;
+        if flipped || now.duration_since(self.last_log).as_secs_f32() >= 5.0 {
             // Only the per-frame work competes for the frame budget; the fps
             // readings are outcomes, not costs.
             let used = self.reg_ms
@@ -4569,6 +4606,7 @@ impl App {
         let kinect_access_hint = compute_kinect_access_hint();
         Self {
             selected: Backend::None,
+            usb_cache: None,
             available,
             active: None,
             error: None,
@@ -5251,6 +5289,28 @@ impl App {
             // onto extra lines instead of clipping controls off the edge.
             ui.horizontal_wrapped(|ui| {
                 ui.label("Input:");
+                // What USB gives this sensor, beside the sensor itself. A
+                // starved Kinect still opens and streams, so the only moment
+                // this is cheap to notice is while picking the device.
+                if let Some(sensor) = match self.selected {
+                    Backend::KinectV1 => Some(usb_check::Sensor::KinectV1),
+                    Backend::KinectV2 => Some(usb_check::Sensor::KinectV2),
+                    _ => None,
+                } && let Some(report) = self.usb_report(sensor)
+                {
+                    let resp = ui.label(
+                        RichText::new(report.level.glyph())
+                            .color(report.level.colour())
+                            .monospace()
+                            .strong(),
+                    );
+                    resp.on_hover_text(format!(
+                        "USB\nwants: {}\nhas:   {}\n\n{}",
+                        report.want,
+                        report.got,
+                        report.notes.join("\n")
+                    ));
+                }
                 let selected_label = self.label_for(self.selected);
                 // Size the combo to the widest label currently on offer so no
                 // entry wraps (a wrapped entry spans several lines and pushes
@@ -6016,13 +6076,19 @@ impl App {
     /// select IR and the colour chip goes red while IR goes green, so the
     /// either/or is visible rather than documented.
     fn stream_bar(&mut self, ui: &mut egui::Ui) {
-        let Some(active) = self.active.as_ref() else {
+        let Some(active) = self.active.as_mut() else {
             return;
         };
         let specs = stream_specs(active.backend, active.cam_spec);
         if specs.is_empty() {
             return;
         }
+        // The frame budget is one frame at the fastest rate this device
+        // offers: that is the cadence the pipeline has to keep up with.
+        if let Some(fps) = specs.iter().map(|s| s.fps).max() {
+            active.metrics.set_nominal_fps(fps as f32);
+        }
+        let active = &*active;
         // Aged here, at draw time — see [`Active::last_rgb_at`].
         let live = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < STREAM_LIVE_FOR);
         let (rgb_live, ir_live, depth_live) = (

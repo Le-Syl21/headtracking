@@ -58,6 +58,7 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # /proc/self/stat reader that silently reported 0% everywhere but Linux —
 # which hid the Kinect v2's CPU depth pipeline saturating on Windows.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+nusb = "0.2.7"
 
 [build-dependencies]
 # Embeds assets/icon.ico as the .exe icon on Windows; inert elsewhere.
