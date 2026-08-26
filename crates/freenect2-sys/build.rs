@@ -391,9 +391,19 @@ include("${CMAKE_SOURCE_DIR}/cmake_modules/FindLibUSB.cmake")
 /// is then silently skipped and Windows keeps upstream's override, which is
 /// the pre-existing behaviour rather than a broken build.
 fn patch_libfreenect2_windows_transfer_pool(vendor_dir: &Path) {
-    const MARKER: &str = "freenect2-sys: Windows takes the cross-platform defaults";
-    // Unique in the file (the only `_WIN32` branch), so a one-line anchor.
-    const TARGET: &str = "#elif defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)";
+    const MARKER: &str = "// freenect2-sys: Windows override removed";
+    // The whole `_WIN32` arm, verbatim. Matching the body and not just the
+    // `#elif` line means a submodule bump that changes any of these values
+    // misses the anchor and warns, instead of silently deleting something
+    // that is no longer what we read.
+    const TARGET: &str = concat!(
+        "#elif defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)\n",
+        "  // For multi-Kinect setup, there is a 64 fd limit on poll().\n",
+        "  rgb_xfer_size = 1048576;\n",
+        "  rgb_num_xfers = 3;\n",
+        "  ir_pkts_per_xfer = 64;\n",
+        "  ir_num_xfers = 8;\n",
+    );
     let path = vendor_dir.join("src/libfreenect2.cpp");
     let Ok(original) = std::fs::read_to_string(&path) else {
         return;
@@ -403,14 +413,12 @@ fn patch_libfreenect2_windows_transfer_pool(vendor_dir: &Path) {
     }
     if !original.contains(TARGET) {
         println!(
-            "cargo::warning=freenect2-sys: Windows transfer-pool override not found; \
-             leaving upstream values in place"
+            "cargo::warning=freenect2-sys: Windows transfer-pool override not found \
+             (submodule bumped?); leaving upstream values in place"
         );
         return;
     }
-    // `#elif 0` leaves the overriding assignments in place but unreachable, so
-    // the diff stays one line and what was overridden remains readable.
-    let replacement = format!("#elif 0 // {MARKER}");
+    let replacement = format!("{MARKER} -- Windows takes the cross-platform defaults\n");
     let _ = std::fs::write(&path, original.replacen(TARGET, &replacement, 1));
 }
 
