@@ -66,6 +66,7 @@ const WEBCAM_FX_PER_WIDTH: f32 = 0.9;
 const LOG_BUFFER_LINES: usize = 1_000;
 
 mod contribute;
+mod perf_table;
 mod usb_check;
 
 /// Privacy-notice bullets for the Share-a-capture window (title, body).
@@ -4525,6 +4526,22 @@ impl Metrics {
                 + self.convert_ms
                 + (self.median_us + self.euro_us) / 1000.0;
             let budget = self.budget_ms;
+            perf_table::push_perf(perf_table::PerfRow {
+                at: stamp_hms(),
+                cam_fps: self.in_fps,
+                ir_fps: self.ir_fps,
+                align_ms: self.reg_ms,
+                anchor_ms: (!self.anchor_locked).then_some(self.anchor_ms),
+                head_ms: self.head_ms,
+                median_us: self.median_us,
+                euro_us: self.euro_us,
+                image_fps: self.out_fps,
+                render_fps: self.render_fps,
+                cpu_pct: self.cpu_pct,
+                ram_mib: self.ram_mib,
+                used_ms: used,
+                budget_ms: budget,
+            });
             info!(
                 // Pipeline order, so the line reads the way the data flows.
                 // ASCII only: a `->` and not an arrow glyph, because Windows
@@ -5581,6 +5598,18 @@ impl App {
                     );
                 });
             }
+            // The same samples as history, with the labels in the header
+            // instead of on every line -- and device chatter interleaved, so
+            // "it started dropping here, and libfreenect2 said this at the
+            // same moment" is one glance rather than two windows. Collapsed
+            // by default: it is a diagnostic, not part of the normal view.
+            egui::CollapsingHeader::new("Diagnostics table")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::both()
+                        .max_height(220.0)
+                        .show(ui, perf_table::ui);
+                });
             ui.add_space(4.0);
         });
 
@@ -7714,6 +7743,22 @@ fn show_thumb(ui: &mut egui::Ui, tex: &TextureHandle, width: f32) {
 /// Format a UNIX-epoch-seconds value as `YYYYMMDD-HHMMSS` in UTC.
 /// Inlined to avoid pulling `time` / `chrono` for one timestamp.
 /// Algorithm: Howard Hinnant's civil-from-days. Valid 1970-01-01 → 9999.
+/// `HH:MM:SS` UTC, for the diagnostics table. The date is in the log file;
+/// on screen a session lasts minutes and the time of day is what locates an
+/// event against what the user was doing.
+fn stamp_hms() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
 fn format_utc_stamp(secs: u64) -> String {
     let total_days = (secs / 86_400) as i64;
     let secs_in_day = secs % 86_400;
@@ -8021,9 +8066,12 @@ fn init_tracing(sink: Arc<Mutex<VecDeque<String>>>) {
     // Same on every OS so triage instructions ("send me your log") are
     // uniform. If the file can't be opened (e.g. read-only Program Files
     // install), we skip it silently — the in-app panel still works.
+    // The file keeps the target: it is what fills the diagnostics table's
+    // `source` column, and it says at a glance whether a line came from us or
+    // from libfreenect2 -- without hunting for a `[Component]` prefix.
     let file_layer = open_log_file().map(|f| {
         tracing_subscriber::fmt::layer()
-            .with_target(false)
+            .with_target(true)
             .with_ansi(false)
             .with_writer(FileSink {
                 inner: Arc::new(Mutex::new(f)),
@@ -8037,6 +8085,7 @@ fn init_tracing(sink: Arc<Mutex<VecDeque<String>>>) {
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(perf_table::TableLayer)
         .with(stderr_layer)
         .with(file_layer)
         .with(panel_layer)
