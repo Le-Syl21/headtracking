@@ -36,6 +36,9 @@ pub const DEPTH_WIDTH: u32 = 640;
 pub const DEPTH_HEIGHT: u32 = 480;
 pub const VIDEO_WIDTH: u32 = 640;
 pub const VIDEO_HEIGHT: u32 = 480;
+/// The v1's high-resolution video mode. Same endpoint, a third of the rate.
+pub const VIDEO_HIGH_WIDTH: u32 = 1280;
+pub const VIDEO_HIGH_HEIGHT: u32 = 1024;
 
 /// One depth frame copied out of libfreenect's internal buffer.
 #[derive(Debug, Clone)]
@@ -80,6 +83,32 @@ pub enum VideoStream {
     /// its frame rate does not drop in a dark room the way the auto-exposed
     /// colour stream does.
     Ir,
+    /// 1280×1024 RGB888. Four times the pixels of [`Self::Rgb`] for **a third
+    /// of the rate**: libfreenect's mode table gives 10 fps here against 30 at
+    /// 640×480. The endpoint is the same, so this is the same either/or trade
+    /// as IR, just at a different resolution.
+    RgbHigh,
+}
+
+impl VideoStream {
+    /// Frame size this stream delivers.
+    #[must_use]
+    pub fn dims(self) -> (u32, u32) {
+        match self {
+            Self::Rgb | Self::Ir => (VIDEO_WIDTH, VIDEO_HEIGHT),
+            Self::RgbHigh => (VIDEO_HIGH_WIDTH, VIDEO_HIGH_HEIGHT),
+        }
+    }
+
+    /// Rate the sensor can sustain in this mode, from libfreenect's own mode
+    /// table (`src/cameras.c`).
+    #[must_use]
+    pub fn max_fps(self) -> u32 {
+        match self {
+            Self::Rgb | Self::Ir => 30,
+            Self::RgbHigh => 10,
+        }
+    }
 }
 
 /// Pinhole intrinsics for the Kinect v1 IR / depth camera. libfreenect does
@@ -497,7 +526,8 @@ impl Device {
     /// while [`Self::video_stream`] is [`VideoStream::Rgb`] — in IR mode the
     /// endpoint carries 8-bit gray, so use [`Self::poll_ir_frame`] instead.
     pub fn poll_rgb(&self) -> Option<RgbFrame> {
-        self.slots.video.poll()
+        let (w, h) = self.video_stream.dims();
+        self.slots.video.poll(w, h)
     }
 
     /// Read the latest 8-bit IR frame (640×480 gray), if any. Only meaningful
@@ -525,17 +555,25 @@ impl Device {
         if self.video_stream == s {
             return Ok(());
         }
-        let (format, bytes) = match s {
+        let (w, h) = s.dims();
+        let (resolution, format, bytes) = match s {
             VideoStream::Rgb => (
+                sys::freenect_resolution_FREENECT_RESOLUTION_MEDIUM,
                 sys::freenect_video_format_FREENECT_VIDEO_RGB,
-                (VIDEO_WIDTH * VIDEO_HEIGHT * 3) as usize,
+                (w * h * 3) as usize,
             ),
             VideoStream::Ir => (
+                sys::freenect_resolution_FREENECT_RESOLUTION_MEDIUM,
                 sys::freenect_video_format_FREENECT_VIDEO_IR_8BIT,
-                (VIDEO_WIDTH * VIDEO_HEIGHT) as usize,
+                (w * h) as usize,
+            ),
+            VideoStream::RgbHigh => (
+                sys::freenect_resolution_FREENECT_RESOLUTION_HIGH,
+                sys::freenect_video_format_FREENECT_VIDEO_RGB,
+                (w * h * 3) as usize,
             ),
         };
-        self.set_video_format(format, bytes)?;
+        self.set_video_format(resolution, format, bytes)?;
         self.video_stream = s;
         Ok(())
     }
@@ -570,6 +608,9 @@ impl Device {
     /// the IR stream selected. Same caveats: ~100–150 ms video gap per switch,
     /// manual-action cadence only, requires a running video stream.
     pub fn capture_rgb(&mut self, warmup: usize) -> Result<RgbFrame, Error> {
+        // Deliberately the 640x480 mode: this is the one-shot grab for a
+        // contribution, and the high-resolution mode would triple the stall
+        // for pixels nobody asked for here.
         let (data, timestamp_raw) = self.capture_video_as(VideoStream::Rgb, warmup)?;
         Ok(RgbFrame {
             width: VIDEO_WIDTH,
@@ -612,6 +653,7 @@ impl Device {
     /// call into libfreenect mid-switch.
     fn set_video_format(
         &mut self,
+        resolution: sys::freenect_resolution,
         format: sys::freenect_video_format,
         bytes: usize,
     ) -> Result<(), Error> {
@@ -623,12 +665,7 @@ impl Device {
         }
         // SAFETY: device is open and video is stopped — the only state in
         // which libfreenect allows a mode change.
-        let mode = unsafe {
-            sys::freenect_find_video_mode(
-                sys::freenect_resolution_FREENECT_RESOLUTION_MEDIUM,
-                format,
-            )
-        };
+        let mode = unsafe { sys::freenect_find_video_mode(resolution, format) };
         if mode.is_valid == 0 {
             drop(g);
             return Err(Error::ModeUnavailable);
@@ -848,7 +885,9 @@ impl VideoSlot {
         self.has_new.store(true, Ordering::Release);
     }
 
-    fn poll(&self) -> Option<RgbFrame> {
+    /// `w`/`h` come from the caller because the slot has no idea which video
+    /// mode is live -- and the v1's frame size changes with it.
+    fn poll(&self, w: u32, h: u32) -> Option<RgbFrame> {
         if !self.has_new.load(Ordering::Acquire) {
             return None;
         }
@@ -857,8 +896,8 @@ impl VideoSlot {
             return None;
         }
         let frame = RgbFrame {
-            width: VIDEO_WIDTH,
-            height: VIDEO_HEIGHT,
+            width: w,
+            height: h,
             timestamp_raw: g.timestamp,
             data: g.data.clone(),
         };

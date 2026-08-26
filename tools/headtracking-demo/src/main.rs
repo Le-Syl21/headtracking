@@ -3129,6 +3129,9 @@ enum StreamKind {
     Rgb,
     Ir,
     Depth,
+    /// Kinect v1 only: the 1280×1024 video mode. Nothing is disabled for it --
+    /// tracking simply runs at the 10 fps the sensor gives in this mode.
+    RgbHigh,
 }
 
 impl StreamKind {
@@ -3137,6 +3140,7 @@ impl StreamKind {
             StreamKind::Rgb => "RGB",
             StreamKind::Ir => "IR",
             StreamKind::Depth => "Depth",
+            StreamKind::RgbHigh => "RGB hi-res",
         }
     }
 }
@@ -3260,6 +3264,7 @@ fn stream_specs(backend: Backend, cam: Option<(u32, u32, u32)>) -> Vec<StreamSpe
         ],
         Backend::KinectV1 => vec![
             s(StreamKind::Rgb, 640, 480, 30),
+            s(StreamKind::RgbHigh, 1280, 1024, 10),
             s(StreamKind::Ir, 640, 480, 30),
             s(StreamKind::Depth, 640, 480, 30),
         ],
@@ -3558,6 +3563,7 @@ fn capture_thread_loop(
                             StreamKind::Ir => freenect::VideoStream::Ir,
                             // Depth streams on its own endpoint, so viewing it
                             // leaves the colour stream running.
+                            StreamKind::RgbHigh => freenect::VideoStream::RgbHigh,
                             StreamKind::Rgb | StreamKind::Depth => freenect::VideoStream::Rgb,
                         };
                         if device.video_stream() != want {
@@ -6278,7 +6284,9 @@ impl App {
             ui.separator();
             for spec in &specs {
                 let live = match spec.kind {
-                    StreamKind::Rgb => rgb_live,
+                    // Both colour modes ride the same endpoint, so the same
+                    // liveness answers for either.
+                    StreamKind::Rgb | StreamKind::RgbHigh => rgb_live,
                     StreamKind::Ir => ir_live,
                     StreamKind::Depth => depth_live,
                 };
@@ -7186,7 +7194,8 @@ fn stream_color_image(frame: &LatestFrame, want: StreamKind) -> ColorImage {
                 return rgb888_to_color_image(*w, *h, &depth_to_turbo_rgb888(mm));
             }
         }
-        StreamKind::Rgb => {}
+        // Both colour modes arrive on the same RGB frame; only the size differs.
+        StreamKind::Rgb | StreamKind::RgbHigh => {}
     }
     rgb888_to_color_image(frame.w, frame.h, &frame.rgb888)
 }
