@@ -72,6 +72,15 @@ mod usb_check;
 /// Privacy-notice bullets for the Share-a-capture window (title, body).
 const CONTRIB_TERMS: &[(&str, &str)] = &[
     (
+        "What is sent",
+        "one image per stream your sensor has -- colour, infrared, depth -- plus a \
+         diagnostics log: the app version, your OS, the sensor model, its USB speed \
+         and how many devices share its controller (a count, never their names), and \
+         the frame-rate measurements. No file names, no paths, nothing about the rest \
+         of your machine. The log is what lets a capture that tracks badly be told \
+         apart from one that was merely starved by USB.",
+    ),
+    (
         "Sole use",
         "to train and improve the pincab head-tracking model. Nothing else.",
     ),
@@ -4668,7 +4677,9 @@ impl Metrics {
                     "n/a".to_string()
                 },
                 if self.anchor_locked {
-                    "done".to_string()
+                    // Same word the calibration itself logs: "cabinet locked
+                    // from live detection". One state, one name.
+                    "locked".to_string()
                 } else {
                     format!("{:.1} ms", self.anchor_ms)
                 },
@@ -4701,7 +4712,7 @@ impl Metrics {
         s.push_str(&format!(
             " · anchor {} · head {:.0}ms · image {:.0} | render {:.0} fps · cpu {:.0}% · ram {} MiB",
             if self.anchor_locked {
-                "done".to_string()
+                "locked".to_string()
             } else {
                 format!("{:.0}ms", self.anchor_ms)
             },
@@ -7384,6 +7395,11 @@ fn build_contribution_files(
     // RGB planes are 8-bit colour; depth is 16-bit gray in raw mm; v2 IR is
     // 16-bit gray intensity; v1 IR is 8-bit gray.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    // The diagnostics log rides along: it is what separates "the model missed
+    // this cabinet" from "USB starved the sensor and it never saw it".
+    if let Some(log) = log_tail_for_contribution() {
+        files.push((format!("{stem}_log.txt"), log));
+    }
     for (kind, src) in [("raw", raw), ("det", det)] {
         match png_bytes_meta(w, h, src, meta) {
             Ok(bytes) => files.push((format!("{stem}_{kind}.png"), bytes)),
@@ -8253,6 +8269,24 @@ fn init_tracing(sink: Arc<Mutex<VecDeque<String>>>) {
 /// Returns `None` when the executable path can't be resolved or the file
 /// can't be opened (read-only install dir, missing permissions) — the
 /// caller drops the file layer in that case.
+/// The tail of our own log, for the contribution.
+///
+/// Only the last stretch: a capture is judged against the minutes around it,
+/// and the whole file would carry every earlier session for no gain. Sent as
+/// text so it stays readable and reviewable by whoever shares it -- and it is
+/// exactly the file the app itself writes, nothing assembled behind the
+/// user's back.
+fn log_tail_for_contribution() -> Option<Vec<u8>> {
+    const KEEP_BYTES: u64 = 256 * 1024;
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.join("headtracking-demo.log");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let start = text.len().saturating_sub(KEEP_BYTES as usize);
+    // Never cut mid-line: find the first newline at or after the cut.
+    let start = text[start..].find('\n').map_or(start, |i| start + i + 1);
+    Some(text.as_bytes()[start..].to_vec())
+}
+
 fn open_log_file() -> Option<std::fs::File> {
     let exe = std::env::current_exe().ok()?;
     let path = exe.parent()?.join("headtracking-demo.log");

@@ -207,8 +207,12 @@ pub fn ui(ui: &mut egui::Ui) {
                             "perf".into(),
                             num(p.cam_fps, 1),
                             num(p.ir_fps, 1),
-                            num(p.align_ms, 1),
-                            p.anchor_ms.map_or_else(|| "done".into(), |v| num(v, 1)),
+                            if p.align_ms > 0.0 {
+                                num(p.align_ms, 1)
+                            } else {
+                                "n/a".into()
+                            },
+                            p.anchor_ms.map_or_else(|| "locked".into(), |v| num(v, 1)),
                             num(p.head_ms, 1),
                             num(p.median_us, 0),
                             num(p.euro_us, 0),
