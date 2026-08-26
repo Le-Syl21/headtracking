@@ -4652,7 +4652,7 @@ impl Metrics {
                 // tools open this file as ANSI and turn UTF-8 arrows into
                 // mojibake.
                 "perf IN(cam {:.1} fps | ir+depth {:.1} fps), \
-                 MAP(align {:.1} ms), \
+                 MAP(align {}), \
                  AI(anchor {} | head {:.1} ms), \
                  FILTER(median {:.0} us | 1euro {:.0} us), \
                  OUT(image {:.1} fps | render {:.1} fps), \
@@ -4660,7 +4660,13 @@ impl Metrics {
                  used {:.1} / {:.1} ms {}",
                 self.in_fps,
                 self.ir_fps,
-                self.reg_ms,
+                if self.reg_ms > 0.0 {
+                    format!("{:.1} ms", self.reg_ms)
+                } else {
+                    // Not a zero cost: depth-to-colour alignment only exists on
+                    // the v2, and is skipped there when tracking on IR.
+                    "n/a".to_string()
+                },
                 if self.anchor_locked {
                     "done".to_string()
                 } else {
