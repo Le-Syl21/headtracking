@@ -3153,7 +3153,16 @@ struct StreamSpec {
 
 impl StreamSpec {
     fn caption(&self) -> String {
-        format!("{} {}×{} {}p", self.kind.label(), self.w, self.h, self.fps)
+        // "max" matters: the v2's colour sensor legitimately halves to ~15 fps
+        // in a dim room, and a bare "30" invites reading that as a fault. And
+        // `p` means progressive scan, not frames per second.
+        format!(
+            "{} {}×{} · {} fps max",
+            self.kind.label(),
+            self.w,
+            self.h,
+            self.fps
+        )
     }
 }
 
