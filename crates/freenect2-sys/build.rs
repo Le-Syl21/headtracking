@@ -32,7 +32,6 @@ fn main() {
     // the resolved absolute path.
     patch_libfreenect2_resource_tool_path(&vendor_dir);
     patch_libfreenect2_icdl_version_clash(&vendor_dir);
-    patch_libfreenect2_windows_transfer_pool(&vendor_dir);
 
     // libfreenect2's CMakeLists `find_package(TurboJPEG REQUIRED)` — point it
     // at the vendored libjpeg-turbo built by `turbojpeg-sys` so we don't need
@@ -363,65 +362,6 @@ include("${CMAKE_SOURCE_DIR}/cmake_modules/FindLibUSB.cmake")
 /// A submodule bump that renames or removes the declaration makes the anchor
 /// miss; the build then fails loudly on the original error rather than
 /// silently dropping the patch.
-/// Idempotently drop libfreenect2's Windows-only override of the USB transfer
-/// pool, so Windows gets the same defaults as every other platform.
-///
-/// Upstream sets 60 isochronous transfers of 8 packets everywhere, then
-/// replaces them on Windows with **8** transfers of 64 packets, and the colour
-/// bulk pool with 3 transfers of 1 MB instead of 20 of 16 KB. It is the number
-/// of transfers *in flight* that absorbs scheduling latency on an isochronous
-/// endpoint: when one completes and resubmission is late, 7 remain to keep
-/// receiving. A Windows field log shows the result — hundreds of
-/// `[DepthPacketStreamParser] 30 packets were lost`, with depth and IR pinned
-/// at ~10 fps while the GPU pipeline sat idle on an RTX 4060 Ti.
-///
-/// The override's own comment justifies it with "there is a 64 fd limit on
-/// poll()" — a Linux constraint, quoted inside the `_WIN32` branch, for a
-/// multi-Kinect case. It reads as a value set for one situation and never
-/// revisited, not as a measured Windows tuning.
-///
-/// Deliberately NOT done with the `LIBFREENECT2_*_TRANSFERS` environment
-/// variables: upstream documents those as "Use only if you know what you are
-/// doing" and publishes no recommended values, so shipping numbers of our own
-/// invention would be a setting we could not justify on someone else's USB
-/// controller. Removing the override picks no value — it lets the library's
-/// own defaults apply.
-///
-/// A submodule bump that reshapes this block makes the anchor miss; the patch
-/// is then silently skipped and Windows keeps upstream's override, which is
-/// the pre-existing behaviour rather than a broken build.
-fn patch_libfreenect2_windows_transfer_pool(vendor_dir: &Path) {
-    const MARKER: &str = "// freenect2-sys: Windows override removed";
-    // The whole `_WIN32` arm, verbatim. Matching the body and not just the
-    // `#elif` line means a submodule bump that changes any of these values
-    // misses the anchor and warns, instead of silently deleting something
-    // that is no longer what we read.
-    const TARGET: &str = concat!(
-        "#elif defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)\n",
-        "  // For multi-Kinect setup, there is a 64 fd limit on poll().\n",
-        "  rgb_xfer_size = 1048576;\n",
-        "  rgb_num_xfers = 3;\n",
-        "  ir_pkts_per_xfer = 64;\n",
-        "  ir_num_xfers = 8;\n",
-    );
-    let path = vendor_dir.join("src/libfreenect2.cpp");
-    let Ok(original) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    if original.contains(MARKER) {
-        return;
-    }
-    if !original.contains(TARGET) {
-        println!(
-            "cargo::warning=freenect2-sys: Windows transfer-pool override not found \
-             (submodule bumped?); leaving upstream values in place"
-        );
-        return;
-    }
-    let replacement = format!("{MARKER} -- Windows takes the cross-platform defaults\n");
-    let _ = std::fs::write(&path, original.replacen(TARGET, &replacement, 1));
-}
-
 fn patch_libfreenect2_icdl_version_clash(vendor_dir: &Path) {
     const MARKER: &str = "// freenect2-sys: guard against the CL_ICDL_VERSION macro";
     let target = "    const int CL_ICDL_VERSION = 2;";
