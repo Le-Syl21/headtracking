@@ -200,6 +200,47 @@ pub fn check(sensor: Sensor) -> Option<UsbReport> {
     })
 }
 
+/// Log the bus context once at startup.
+///
+/// Deliberately narrow: the Kinect's own connection, and how many other
+/// devices share its controller -- **counted, never named**. A full
+/// enumeration would list every keyboard, phone and licence dongle on the
+/// machine, and this log is meant to be pasteable into a bug report and to
+/// travel with a contribution. The count is what diagnoses contention; the
+/// names only identify the person.
+pub fn log_startup() {
+    let Ok(devices) = nusb::list_devices().wait() else {
+        tracing::info!(target: "usb", "bus enumeration unavailable on this platform");
+        return;
+    };
+    let devices: Vec<DeviceInfo> = devices.collect();
+    for (sensor, name) in [
+        (Sensor::KinectV1, "kinect-v1"),
+        (Sensor::KinectV2, "kinect-v2"),
+    ] {
+        let ours: Vec<&DeviceInfo> = devices
+            .iter()
+            .filter(|d| d.vendor_id() == VID_MICROSOFT && pids(sensor).contains(&d.product_id()))
+            .collect();
+        let Some(first) = ours.first() else { continue };
+        let bus = first.bus_id();
+        let neighbours = devices
+            .iter()
+            .filter(|d| d.bus_id() == bus && d.class() != 0x09)
+            .count()
+            .saturating_sub(ours.len());
+        tracing::info!(
+            target: "usb",
+            sensor = name,
+            functions = ours.len(),
+            speed = speed_name(first.speed()),
+            port = ?first.port_chain(),
+            neighbours_on_controller = neighbours,
+            "usb context"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

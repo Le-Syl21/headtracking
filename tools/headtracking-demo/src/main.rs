@@ -139,6 +139,10 @@ fn main() {
         arch = host.architecture().unwrap_or("unknown"),
         "headtracking-demo starting"
     );
+    // Bus context right under the banner: speed and contention explain most
+    // of what the perf numbers below will show, and deducing them after the
+    // fact took an hour on the first Windows report.
+    usb_check::log_startup();
 
     // Hidden `--upload-test`: exercise the contribution upload path (ureq /
     // rustls / auth / write-only drop) end to end without the GUI, then exit.
@@ -2340,6 +2344,9 @@ struct App {
     /// but not free, and the UI repaints far faster than a cable gets moved,
     /// so it is refreshed on a timer rather than per frame.
     usb_cache: Option<(Instant, usb_check::Sensor, usb_check::UsbReport)>,
+    /// What the freshly opened device can deliver, shown once. `None` when
+    /// there is nothing to say or the user has dismissed it.
+    brief: Option<DeviceBrief>,
     available: Vec<BackendEntry>,
     active: Option<Active>,
     error: Option<String>,
@@ -3152,6 +3159,88 @@ impl StreamSpec {
 
 /// Streams each backend advertises. Kinect figures are the fixed sensor modes;
 /// the webcam's come from the opened format (SDL only ever gives us one mode).
+/// What a device can deliver, in the tester's terms.
+///
+/// The numbers in the perf read-out mean nothing without this. `render` is the
+/// UI repaint rate and happily sits at 60 while the camera feeds 10; a Kinect
+/// v2 colour stream at 15 fps is not a fault but an auto-exposure lengthening
+/// its integration time in a dim room. Both are read as breakage by someone
+/// seeing them for the first time, so the device says so itself on open.
+struct DeviceBrief {
+    title: String,
+    /// One line per stream: what it is, and the rate to expect.
+    streams: Vec<String>,
+    /// Things that look like faults and are not.
+    notes: Vec<String>,
+}
+
+fn device_brief(backend: Backend) -> Option<DeviceBrief> {
+    let (title, streams, notes) = match backend {
+        Backend::KinectV2 => (
+            "Kinect v2 — what to expect",
+            vec![
+                "colour 1920x1080 up to 30 fps".to_string(),
+                "infrared 512x424 at 30 fps".to_string(),
+                "depth 512x424 at 30 fps".to_string(),
+            ],
+            vec![
+                "Colour halves to ~15 fps in a dim room: the sensor lengthens its \
+                 exposure. Turn a light on and it returns to 30. Infrared and depth \
+                 are unaffected -- the sensor lights the scene itself."
+                    .to_string(),
+                "It needs USB 3.0 and its own power adapter. On USB 2.0 it still \
+                 opens, then drops depth packets."
+                    .to_string(),
+            ],
+        ),
+        Backend::KinectV1 => (
+            "Kinect v1 — what to expect",
+            vec![
+                "colour 640x480 at 30 fps (1280x1024 drops to 10)".to_string(),
+                "infrared 640x480 at 30 fps".to_string(),
+                "depth 640x480 at 30 fps".to_string(),
+            ],
+            vec![
+                "The high-resolution modes are a third of the rate: 1280x1024 runs \
+                 at 10 fps, not 30."
+                    .to_string(),
+                "USB 2.0 is enough for this one.".to_string(),
+            ],
+        ),
+        Backend::Webcam(_) => (
+            "Webcam — what to expect",
+            vec!["rate and resolution are whatever the camera reports".to_string()],
+            vec![
+                "Most webcams drop their frame rate in low light exactly like the \
+                 Kinect v2 colour sensor does."
+                    .to_string(),
+            ],
+        ),
+        Backend::None => return None,
+    };
+    let mut notes = notes;
+    if matches!(backend, Backend::KinectV1 | Backend::KinectV2) {
+        notes.push(
+            "In VPX, the plugin tracks on infrared only -- it never opens the colour \
+             stream on a Kinect. So a slow colour rate here costs the game nothing, \
+             and tracking works in the dark. 30 head positions per second is far more \
+             than head movement needs."
+                .to_string(),
+        );
+    }
+    notes.push(
+        "`render` in the perf read-out is how often the window repaints, not what \
+         the camera delivers. It is normally higher, because the smoothed pose \
+         keeps moving between captures."
+            .to_string(),
+    );
+    Some(DeviceBrief {
+        title: title.to_string(),
+        streams,
+        notes,
+    })
+}
+
 fn stream_specs(backend: Backend, cam: Option<(u32, u32, u32)>) -> Vec<StreamSpec> {
     let s = |kind, w, h, fps| StreamSpec { kind, w, h, fps };
     match backend {
@@ -4624,6 +4713,7 @@ impl App {
         Self {
             selected: Backend::None,
             usb_cache: None,
+            brief: None,
             available,
             active: None,
             error: None,
@@ -4772,6 +4862,12 @@ impl App {
                         // colour — so the view selection starts over too.
                         self.selected_stream = StreamKind::Rgb;
                         self.active = Some(Active::new_live(worker, intr)); // → Idle
+                        // Say what this sensor can actually deliver, once,
+                        // while the user is looking at it. Otherwise a 60 fps
+                        // render bar reads as "all good" next to a camera
+                        // feeding 10, and a colour stream at 15 in a dim room
+                        // looks broken when it only wants a light switch.
+                        self.brief = device_brief(self.selected);
                     }
                     Some(Err(e)) => {
                         error!("{e}");
@@ -5597,6 +5693,43 @@ impl App {
                             .color(Color32::LIGHT_BLUE),
                     );
                 });
+            }
+            // Shown once when a device opens: what it can deliver, and the
+            // two readings that look like faults and are not.
+            if let Some(brief) = &self.brief {
+                let mut close = false;
+                egui::Modal::new(egui::Id::new("device_brief")).show(ui.ctx(), |ui| {
+                    ui.set_max_width(460.0);
+                    ui.heading(&brief.title);
+                    ui.add_space(6.0);
+                    for line in &brief.streams {
+                        ui.label(RichText::new(format!("- {line}")).monospace());
+                    }
+                    if let Some(sensor) = match self.selected {
+                        Backend::KinectV1 => Some(usb_check::Sensor::KinectV1),
+                        Backend::KinectV2 => Some(usb_check::Sensor::KinectV2),
+                        _ => None,
+                    } && let Some(r) = usb_check::check(sensor)
+                    {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!("USB: {} (wants {})", r.got, r.want))
+                                .color(r.level.colour()),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    for n in &brief.notes {
+                        ui.label(n);
+                        ui.add_space(4.0);
+                    }
+                    ui.add_space(4.0);
+                    if ui.button("Got it").clicked() {
+                        close = true;
+                    }
+                });
+                if close {
+                    self.brief = None;
+                }
             }
             // The same samples as history, with the labels in the header
             // instead of on every line -- and device chatter interleaved, so
