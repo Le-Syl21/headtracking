@@ -2693,6 +2693,8 @@ struct Capture {
     /// Latest registration cost (ms) and a one-shot flag so a failing or
     /// missing registration warns once instead of every frame.
     reg_ms: f32,
+    /// Per-stage smoothing cost for the latest head.
+    filter_us: FilterUs,
     /// Time spent turning the camera's surface into a packed RGB buffer.
     /// Non-zero on the webcam only: a 1080p MJPG frame is fully decoded here
     /// before the pose model takes a 224x224 square of it, and whether that
@@ -2898,13 +2900,14 @@ impl Capture {
                                 h.x_mm = -h.x_mm;
                                 h
                             });
-                        let smoothed = smooth_head(
+                        let (smoothed, filter_us) = smooth_head(
                             head,
                             &mut self.pose_filter,
                             &mut self.median_gate,
                             self.started_at,
                             bypass,
                         );
+                        self.filter_us = filter_us;
                         capture_baseline(&mut self.baseline, smoothed);
                         self.last_head = smoothed;
                     }
@@ -2978,13 +2981,14 @@ impl Capture {
                                 depth_min,
                             )
                         });
-                        let smoothed = smooth_head(
+                        let (smoothed, filter_us) = smooth_head(
                             head,
                             &mut self.pose_filter,
                             &mut self.median_gate,
                             self.started_at,
                             bypass,
                         );
+                        self.filter_us = filter_us;
                         capture_baseline(&mut self.baseline, smoothed);
                         self.last_head = smoothed;
                     }
@@ -3011,13 +3015,14 @@ impl Capture {
                             .last_pose
                             .as_ref()
                             .and_then(|p| head_pixel_from_pose_webcam(p, rgb.width, rgb.height));
-                        let smoothed = smooth_head(
+                        let (smoothed, filter_us) = smooth_head(
                             head,
                             &mut self.pose_filter,
                             &mut self.median_gate,
                             self.started_at,
                             bypass,
                         );
+                        self.filter_us = filter_us;
                         capture_baseline(&mut self.baseline, smoothed);
                         self.last_head = smoothed;
                     }
@@ -3079,6 +3084,7 @@ impl Capture {
             head_ms: self.head_ms,
             anchor_ms: self.anchor_ms,
             reg_ms: self.reg_ms,
+            filter_us: self.filter_us,
             convert_ms: self.convert_ms,
             anchor_locked: self.anchor_worker.is_locked(),
         }
@@ -3192,9 +3198,11 @@ struct LatestFrame {
     anchor_ms: f32,
     /// Cost of decoding this frame into packed RGB (ms); webcam only.
     convert_ms: f32,
-    /// Cost of the v2 depth↔colour registration for this frame (ms); `0.0`
+    /// Cost of the v2 depth-to-colour alignment for this frame (ms); `0.0`
     /// when it isn't running.
     reg_ms: f32,
+    /// Per-stage smoothing cost for this frame.
+    filter_us: FilterUs,
     anchor_locked: bool,
 }
 
@@ -4291,6 +4299,15 @@ struct Metrics {
     /// Surface→RGB decode cost (ms, EWMA); webcam only. A 1080p MJPG frame is
     /// decoded whole here before the pose model takes a 224x224 square of it.
     convert_ms: f32,
+    /// Per-stage smoothing cost, smoothed like the other per-frame costs.
+    median_us: f32,
+    euro_us: f32,
+    /// Locked anchors stop the detector, so a duration would be misleading.
+    anchor_locked: bool,
+    /// One frame's worth of time at the sensor's nominal rate: the ceiling the
+    /// per-frame costs must fit under to hold that rate. Both Kinects cap at
+    /// 30 fps and most UVC webcams report 30, so that is the default.
+    budget_ms: f32,
     in_fps: f32,
     out_fps: f32,
     /// Display repaints per second — the GL thread's own cadence, independent
@@ -4330,7 +4347,11 @@ impl Metrics {
             head_ms: 0.0,
             anchor_ms: 0.0,
             reg_ms: 0.0,
+            median_us: 0.0,
+            euro_us: 0.0,
             convert_ms: 0.0,
+            anchor_locked: false,
+            budget_ms: 1000.0 / 30.0,
             in_fps: 0.0,
             out_fps: 0.0,
             render_fps: 0.0,
@@ -4370,6 +4391,13 @@ impl Metrics {
     /// through so the figure drops out cleanly on v1 / webcam.
     /// Same exponential smoothing as the other per-frame costs, so one slow
     /// decode does not dominate the read-out.
+    /// Same smoothing as the other per-frame costs. Instrumented to check the
+    /// claim that it is negligible, rather than assume it.
+    fn note_filter_us(&mut self, c: FilterUs) {
+        let ewma = |cur: f32, v: f32| if cur == 0.0 { v } else { cur * 0.8 + v * 0.2 };
+        self.median_us = ewma(self.median_us, c.median);
+        self.euro_us = ewma(self.euro_us, c.euro);
+    }
     fn note_convert_ms(&mut self, ms: f32) {
         self.convert_ms = if ms == 0.0 || self.convert_ms == 0.0 {
             ms
@@ -4389,6 +4417,7 @@ impl Metrics {
     /// 0 ms instead of holding the last inference time.
     fn note_anchor_locked(&mut self) {
         self.anchor_ms = 0.0;
+        self.anchor_locked = true;
     }
     /// Add `n` captured RGB frames to the IN counter. Called with the
     /// cumulative-capture delta each time the GL thread consumes a published
@@ -4452,46 +4481,84 @@ impl Metrics {
             self.window_start = now;
         }
         if now.duration_since(self.last_log).as_secs_f32() >= 2.0 {
+            // Only the per-frame work competes for the frame budget; the fps
+            // readings are outcomes, not costs.
+            let used = self.reg_ms
+                + self.head_ms
+                + self.convert_ms
+                + (self.median_us + self.euro_us) / 1000.0;
+            let budget = self.budget_ms;
             info!(
-                "perf: head {:.1}ms | anchor {:.1}ms | reg {:.1}ms | cpu {:.0}% | ram {} MiB | in {:.1} fps | out {:.1} fps | render {:.1} fps | depth {:.1} fps | ir {:.1} fps",
-                self.head_ms,
-                self.anchor_ms,
-                self.reg_ms,
-                self.cpu_pct,
-                self.ram_mib,
+                // Pipeline order, so the line reads the way the data flows.
+                // ASCII only: a `->` and not an arrow glyph, because Windows
+                // tools open this file as ANSI and turn UTF-8 arrows into
+                // mojibake.
+                "perf IN(cam {:.1} fps | ir+depth {:.1} fps), \
+                 MAP(align {:.1} ms), \
+                 AI(anchor {} | head {:.1} ms), \
+                 FILTER(median {:.0} us | 1euro {:.0} us), \
+                 OUT(image {:.1} fps | render {:.1} fps), \
+                 SYS(cpu {:.0}% | ram {} MiB) \
+                 used {:.1} / {:.1} ms {}",
                 self.in_fps,
+                self.ir_fps,
+                self.reg_ms,
+                if self.anchor_locked {
+                    "done".to_string()
+                } else {
+                    format!("{:.1} ms", self.anchor_ms)
+                },
+                self.head_ms,
+                self.median_us,
+                self.euro_us,
                 self.out_fps,
                 self.render_fps,
-                self.depth_fps,
-                self.ir_fps
+                self.cpu_pct,
+                self.ram_mib,
+                used,
+                budget,
+                if used > budget { "OVERLOAD!" } else { "OK" }
             );
             self.last_log = now;
         }
     }
 
     /// One-line summary for the toolbar.
+    /// Same fields and names as the log line, minus what the log carries for
+    /// post-mortem only -- the toolbar has far less room than a file.
     fn summary(&self) -> String {
-        // Depth / IR only exist on the Kinects — appended when they're flowing
-        // so the webcam read-out stays uncluttered.
-        let mut s = format!(
-            "head {:.0}ms · anchor {:.0}ms · cpu {:.0}% · ram {} MiB · in {:.0} / out {:.0} / render {:.0} fps",
+        let mut s = format!("cam {:.0}", self.in_fps);
+        if self.ir_fps > 0.0 {
+            s.push_str(&format!(" | ir+depth {:.0}", self.ir_fps));
+        }
+        if self.reg_ms > 0.0 {
+            s.push_str(&format!(" · align {:.0}ms", self.reg_ms));
+        }
+        s.push_str(&format!(
+            " · anchor {} · head {:.0}ms · image {:.0} | render {:.0} fps · cpu {:.0}% · ram {} MiB",
+            if self.anchor_locked {
+                "done".to_string()
+            } else {
+                format!("{:.0}ms", self.anchor_ms)
+            },
             self.head_ms,
-            self.anchor_ms,
+            self.out_fps,
+            self.render_fps,
             self.cpu_pct,
             self.ram_mib,
-            self.in_fps,
-            self.out_fps,
-            self.render_fps
-        );
-        if self.reg_ms > 0.0 {
-            s.push_str(&format!(" · reg {:.0}ms", self.reg_ms));
-        }
-        if self.depth_fps > 0.0 {
-            s.push_str(&format!(" · depth {:.0}", self.depth_fps));
-        }
-        if self.ir_fps > 0.0 {
-            s.push_str(&format!(" · ir {:.0}", self.ir_fps));
-        }
+        ));
+        let used =
+            self.reg_ms + self.head_ms + self.convert_ms + (self.median_us + self.euro_us) / 1000.0;
+        s.push_str(&format!(
+            " · {:.1}/{:.1}ms {}",
+            used,
+            self.budget_ms,
+            if used > self.budget_ms {
+                "OVERLOAD!"
+            } else {
+                "OK"
+            }
+        ));
         s
     }
 }
@@ -4881,6 +4948,7 @@ impl App {
                 active.metrics.note_head_ms(frame.head_ms);
             }
             active.metrics.note_reg_ms(frame.reg_ms);
+            active.metrics.note_filter_us(frame.filter_us);
             active.metrics.note_convert_ms(frame.convert_ms);
             active.anchor_locked = frame.anchor_locked;
             if frame.anchor_locked {
@@ -4895,25 +4963,44 @@ impl App {
 /// Apply the 1€ filter to the head pose in millimetres. The pixel coords
 /// `u`, `v` are passed through unchanged — they record where on the depth
 /// frame we sampled, not a re-projected smoothed point.
+/// Per-stage cost of [`smooth_head`], in microseconds. Both stages are a
+/// handful of arithmetic ops, so `Instant::now()` overhead (tens of ns each)
+/// is a real fraction of what is being measured -- read these as an order of
+/// magnitude, not an exact figure.
+#[derive(Clone, Copy, Default)]
+struct FilterUs {
+    median: f32,
+    euro: f32,
+}
+
 fn smooth_head(
     raw: Option<HeadPixel>,
     filter: &mut filter_alias::OneEuroPose3D,
     gate: &mut headtracking::filter::MedianGate,
     started_at: Instant,
     bypass: bool,
-) -> Option<HeadPixel> {
-    let head = raw?;
+) -> (Option<HeadPixel>, FilterUs) {
+    let Some(head) = raw else {
+        return (None, FilterUs::default());
+    };
     if bypass {
-        return Some(head); // raw pose, no median gate, no 1€ smoothing
+        // raw pose, no median gate, no 1-euro smoothing
+        return (Some(head), FilterUs::default());
     }
     let mut head = head;
     let t_us = started_at.elapsed().as_micros() as u64;
+    let t0 = Instant::now();
     let gated = gate.push([head.x_mm, head.y_mm, head.depth_mm]);
+    let t1 = Instant::now();
     let smoothed = filter.update(gated, t_us);
+    let cost = FilterUs {
+        median: t1.duration_since(t0).as_secs_f32() * 1e6,
+        euro: t1.elapsed().as_secs_f32() * 1e6,
+    };
     head.x_mm = smoothed[0];
     head.y_mm = smoothed[1];
     head.depth_mm = smoothed[2];
-    Some(head)
+    (Some(head), cost)
 }
 
 impl App {
@@ -6636,6 +6723,7 @@ fn new_capture(backend: Backend, intrinsics: Intrinsics, inner: Inner) -> Captur
         rgb_scratch: Vec::new(),
         bigdepth_ok: false,
         reg_ms: 0.0,
+        filter_us: FilterUs::default(),
         reg_warned: false,
         selected_stream: StreamKind::Rgb,
         last_rgb_refresh: None,
