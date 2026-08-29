@@ -7079,6 +7079,23 @@ impl App {
                 .monospace()
                 .color(Color32::GRAY),
         );
+        // `pitch` is measured against the playfield, so a sloped table reads
+        // its own slope back even with a perfectly level camera — the one
+        // number here that looks broken when it is right. We know the incline,
+        // so we can hand over the angle the reader can check with a level.
+        if self.table_incl_deg > 0.5 {
+            let vs_horizon = pose.pitch_deg - self.table_incl_deg;
+            ui.label(
+                RichText::new(format!(
+                    "pitch is against the {:.0}° playfield — the camera itself is {:.0}° {} level",
+                    self.table_incl_deg,
+                    vs_horizon.abs(),
+                    if vs_horizon >= 0.0 { "below" } else { "above" },
+                ))
+                .monospace()
+                .color(Color32::GRAY),
+            );
+        }
         if out_of_square {
             ui.label(
                 RichText::new(

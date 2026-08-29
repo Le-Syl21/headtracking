@@ -420,8 +420,11 @@ impl CameraPose {
             PoseField {
                 label: "pitch",
                 value: format!("{:.0}\u{00b0}", self.pitch_deg),
-                help: "How far the camera looks down at the playfield. 0 = \
-                       looking flat along it, 90 = straight down onto it.",
+                help: "How far the camera looks down at the playfield, \
+                       measured against the playfield itself and NOT against \
+                       the horizon. A table sloped 6\u{00b0} therefore reads \
+                       6\u{00b0} even with a perfectly level camera: subtract the \
+                       table's incline to get the camera's own tilt.",
             },
             PoseField {
                 label: "yaw",
@@ -443,9 +446,13 @@ impl CameraPose {
                 value: format!("{:.0}\u{00b0}", self.rect_angle_deg),
                 help: "Self-test: rebuilt in 3D, the rails and the lockbar \
                        should meet at 90\u{00b0}. Far from 90 means the focal \
-                       length or the detected lines are wrong. It says \
-                       nothing when the camera faces the cabinet head-on — \
-                       the check needs some angle to work with.",
+                       length or the detected lines are wrong. It is blind \
+                       while 'yaw' is near zero — aimed straight down the \
+                       cabinet, the check reads 90\u{00b0} whatever focal it is \
+                       given. Nothing rescues it there: not the table's \
+                       slope, not the camera's tilt, not an offset to one \
+                       side. Only turning the camera off the axis makes it \
+                       able to answer at all.",
             },
         ]
     }
@@ -470,7 +477,7 @@ impl CameraPose {
         };
         format!(
             "camera {offset}, {:.0} cm above the playfield, {:.2} m from the lockbar, \
-             aimed {aim}, looking {:.0}\u{00b0} down",
+             aimed {aim}, looking {:.0}\u{00b0} down onto the playfield",
             self.height_mm / 10.0,
             self.distance_mm / 1000.0,
             self.pitch_deg,

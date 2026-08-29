@@ -40,9 +40,13 @@ fn add(a: V3, b: V3) -> V3 {
     (a.0 + b.0, a.1 + b.1, a.2 + b.2)
 }
 
-/// Camera placement in world terms.
+/// Camera placement in world terms, plus the cabinet it looks at.
 #[derive(Clone, Copy)]
 struct Cam {
+    /// Playfield inclination, degrees: the rails rise by this much on their
+    /// way to the backbox. The lockbar is the hinge, so its two edges stay
+    /// along `+X` whatever this is.
+    incline_deg: f64,
     /// Position: `x` right of the cabinet centreline, `y` above the playfield
     /// plane, `z` in front of the lockbar (negative = on the player side).
     pos: V3,
@@ -83,6 +87,12 @@ impl Cam {
         ))
     }
 
+    /// Far end of a rail, risen by the playfield inclination.
+    fn rail_far(self, x: f64) -> V3 {
+        let (s, c) = self.incline_deg.to_radians().sin_cos();
+        (x, RAIL_LEN * s, RAIL_LEN * c)
+    }
+
     /// The four annotated lines, as the annotator would have drawn them.
     fn lines(self) -> (LineSeg, LineSeg, LineSeg, LineSeg) {
         let seg = |a: V3, b: V3| -> LineSeg {
@@ -91,8 +101,8 @@ impl Cam {
             [[pa.0, pa.1], [pb.0, pb.1]]
         };
         (
-            seg((-HALF, 0.0, 0.0), (-HALF, 0.0, RAIL_LEN)),
-            seg((HALF, 0.0, 0.0), (HALF, 0.0, RAIL_LEN)),
+            seg((-HALF, 0.0, 0.0), self.rail_far(-HALF)),
+            seg((HALF, 0.0, 0.0), self.rail_far(HALF)),
             seg((-HALF, 0.0, -BAR_DEPTH), (HALF, 0.0, -BAR_DEPTH)),
             seg((-HALF, 0.0, 0.0), (HALF, 0.0, 0.0)),
         )
@@ -111,12 +121,23 @@ impl Cam {
     }
 }
 
+/// A flat cabinet — the simplest thing that isolates one convention at a
+/// time. Real playfields slope; see [`sloped`].
 fn base() -> Cam {
     Cam {
+        incline_deg: 0.0,
         pos: (0.0, 760.0, -1270.0),
         yaw_deg: 0.0,
         pitch_deg: 0.0,
         roll_deg: 0.0,
+    }
+}
+
+/// A real cabinet: 6.5 degrees of playfield slope, the usual pincab figure.
+fn sloped() -> Cam {
+    Cam {
+        incline_deg: 6.5,
+        ..base()
     }
 }
 
@@ -269,10 +290,12 @@ fn rect_angle_detects_a_wrong_focal_when_the_camera_is_off_axis() {
     );
 }
 
-/// The counter-case, stated as a test so it cannot be forgotten when writing
-/// the help text: head-on, the check is blind.
+/// The counter-case on a flat table, stated as a test so it cannot be
+/// forgotten when writing the help text. The sloped-table version — which is
+/// the one that matters, and the one people expect to behave differently — is
+/// `the_square_check_is_blind_at_zero_yaw_even_on_a_sloped_table`.
 #[test]
-fn rect_angle_is_blind_to_the_focal_when_the_camera_is_head_on() {
+fn rect_angle_is_blind_to_the_focal_when_aimed_down_the_cabinet_axis() {
     let c = base();
     let (sl, sr, lp, ls) = c.lines();
     let geom = geometry_from_lines(sl, sr, lp, ls, W, H).expect("valid line set");
@@ -316,4 +339,101 @@ fn the_description_reads_the_signs_the_way_they_are_defined() {
     let centred = base().recovered().describe();
     assert!(centred.contains("on the centreline"), "{centred}");
     assert!(!centred.contains("cm left"), "{centred}");
+}
+
+/// `pitch_deg` is measured against the **playfield**, not against the
+/// horizontal — so a level camera looking at a sloped table does not read
+/// zero. It reads the slope. This is the single most confusing number in the
+/// read-out, and the help text has to say it.
+#[test]
+fn pitch_is_relative_to_the_playfield_not_the_horizon() {
+    let level_camera_flat_table = base().recovered().pitch_deg;
+    let level_camera_sloped_table = sloped().recovered().pitch_deg;
+    assert!(level_camera_flat_table.abs() < 0.05);
+    assert!(
+        (level_camera_sloped_table - 6.5).abs() < 0.2,
+        "a level camera on a 6.5 deg table should read 6.5, got {level_camera_sloped_table}"
+    );
+}
+
+/// The playfield slope does **not** rescue the square check.
+///
+/// It is tempting to think it would: the rails climb, so surely nothing is
+/// parallel any more. But the two lockbar edges both run across the cabinet,
+/// and the slope is a rotation *about* that very direction — it cannot make
+/// them converge. Their vanishing point stays at infinity, the width
+/// direction stays a pure image direction the focal never touches, and the
+/// rails' own vanishing point stays on the vertical through the principal
+/// point, so the reconstructed rail direction is perpendicular to it whatever
+/// focal it is built with. The check is governed by **yaw**, and by nothing
+/// else.
+#[test]
+fn the_square_check_is_blind_at_zero_yaw_even_on_a_sloped_table() {
+    let wrong = CameraIntrinsics {
+        fx: (FX * 1.25) as f32,
+        fy: (FX * 1.25) as f32,
+        cx: W as f32 * 0.5,
+        cy: H as f32 * 0.5,
+    };
+    // Slope, camera pitch, lateral offset and roll: none of them make the
+    // check fire while the camera is aimed down the cabinet's axis.
+    for c in [
+        sloped(),
+        Cam {
+            pitch_deg: 15.0,
+            ..sloped()
+        },
+        Cam {
+            pos: (450.0, 760.0, -1270.0),
+            ..sloped()
+        },
+        Cam {
+            roll_deg: 7.0,
+            ..sloped()
+        },
+    ] {
+        let (sl, sr, lp, ls) = c.lines();
+        let geom = geometry_from_lines(sl, sr, lp, ls, W, H).expect("valid line set");
+        let pose = camera_pose(&geom, &wrong, LOCKBAR_MM).expect("pose recoverable");
+        assert!(
+            (pose.rect_angle_deg - 90.0).abs() < 0.2,
+            "expected the check to stay blind at zero yaw, got {} for {:?}",
+            pose.rect_angle_deg,
+            (c.incline_deg, c.pitch_deg, c.pos.0, c.roll_deg)
+        );
+    }
+
+    // Turn the camera a few degrees off the axis and the same wrong focal
+    // shows up immediately.
+    let c = Cam {
+        yaw_deg: -12.0,
+        ..sloped()
+    };
+    let (sl, sr, lp, ls) = c.lines();
+    let geom = geometry_from_lines(sl, sr, lp, ls, W, H).expect("valid line set");
+    let pose = camera_pose(&geom, &wrong, LOCKBAR_MM).expect("pose recoverable");
+    assert!(
+        (pose.rect_angle_deg - 90.0).abs() > 2.0,
+        "off-axis, a 25% focal error must show, got {}",
+        pose.rect_angle_deg
+    );
+}
+
+/// Playfield pitch and camera pitch differ by exactly the slope, so a UI that
+/// knows the table's inclination can show the reader the angle they can
+/// actually check with a spirit level.
+#[test]
+fn playfield_pitch_minus_the_slope_is_the_pitch_against_the_horizon() {
+    for nose_down in [0.0, 8.0, 15.0] {
+        let c = Cam {
+            pitch_deg: nose_down,
+            ..sloped()
+        };
+        let got = c.recovered().pitch_deg;
+        let expected = nose_down as f32 + 6.5;
+        assert!(
+            (got - expected).abs() < 0.2,
+            "nose-down {nose_down} on a 6.5 deg table should read {expected}, got {got}"
+        );
+    }
 }
