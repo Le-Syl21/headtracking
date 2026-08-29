@@ -524,24 +524,17 @@ fn line_h(p1: Point, p2: Point) -> V3 {
     )
 }
 
-/// Full camera pose relative to the cab from a detected anchor geometry, the
-/// colour-frame intrinsics, and the real lockbar width in millimetres.
+/// The cabinet's two in-plane directions and its normal, in camera
+/// coordinates, reconstructed from the vanishing points and the focal.
 ///
-/// Returns `None` when the geometry is degenerate: rails (near-)parallel in
-/// the image (depth VP at infinity — fronto-parallel camera), non-positive
-/// focal, or a collapsed lockbar segment. The width VP *at* infinity is fine
-/// and handled (fronto-parallel lockbar, the common centred-camera case).
-#[must_use]
-pub fn camera_pose(
-    geom: &AnchorGeometry,
-    intr: &CameraIntrinsics,
-    lockbar_mm: f32,
-) -> Option<CameraPose> {
+/// Shared by [`camera_pose`] and [`flatten_homography`] so the pose and the
+/// picture can never be built from different geometry. Returns
+/// `(depth_vp, width_vp, rail_dir, width_dir, normal)`; `None` when the rails
+/// are parallel in the image (fronto-parallel camera: the plane is
+/// unobservable).
+fn plane_basis(geom: &AnchorGeometry, intr: &CameraIntrinsics) -> Option<(V3, V3, V3, V3, V3)> {
     let f = f64::from(intr.fx);
-    // NaN-safe positivity gates (NaN fails both comparisons → rejected).
-    if f.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
-        || lockbar_mm.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
-    {
+    if f.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return None;
     }
     let (cx, cy) = (f64::from(intr.cx), f64::from(intr.cy));
@@ -579,15 +572,40 @@ pub fn camera_pose(
         w3 = neg3(w3); // +X_cab = image left → right
     }
 
-    // 3D angle between rails and lockbar — 90° when the focal is right.
-    let rect_angle = dot3(r, w3).clamp(-1.0, 1.0).acos().to_degrees();
-
     // Playfield normal (X_cab × D_cab, right-handed), signed to point "up"
     // out of the playfield toward the camera side (negative image-y-ish).
     let mut n = unit3(cross3(w3, r));
     if n.1 > 0.0 {
         n = neg3(n);
     }
+    Some((vd, vw, r, w3, n))
+}
+
+/// Full camera pose relative to the cab from a detected anchor geometry, the
+/// colour-frame intrinsics, and the real lockbar width in millimetres.
+///
+/// Returns `None` when the geometry is degenerate: rails (near-)parallel in
+/// the image (depth VP at infinity — fronto-parallel camera), non-positive
+/// focal, or a collapsed lockbar segment. The width VP *at* infinity is fine
+/// and handled (fronto-parallel lockbar, the common centred-camera case).
+#[must_use]
+pub fn camera_pose(
+    geom: &AnchorGeometry,
+    intr: &CameraIntrinsics,
+    lockbar_mm: f32,
+) -> Option<CameraPose> {
+    let f = f64::from(intr.fx);
+    // NaN-safe positivity gates (NaN fails both comparisons → rejected).
+    if f.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+        || lockbar_mm.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+    {
+        return None;
+    }
+    let (cx, cy) = (f64::from(intr.cx), f64::from(intr.cy));
+    let (vd, vw, r, w3, n) = plane_basis(geom, intr)?;
+
+    // 3D angle between rails and lockbar — 90° when the focal is right.
+    let rect_angle = dot3(r, w3).clamp(-1.0, 1.0).acos().to_degrees();
 
     let z_axis: V3 = (0.0, 0.0, 1.0);
     // Camera pitch vs the playfield plane: 0 = grazing, 90 = straight down.
@@ -638,6 +656,165 @@ pub fn camera_pose(
         height_mm: height as f32,
         rect_angle_deg: rect_angle as f32,
     })
+}
+
+/// A 3x3 matrix, row-major. Small enough that a dependency would cost more
+/// than the twenty lines below.
+type M3 = [f64; 9];
+
+fn mat_mul(a: &M3, b: &M3) -> M3 {
+    let mut out = [0.0; 9];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r * 3 + c] = (0..3).map(|k| a[r * 3 + k] * b[k * 3 + c]).sum();
+        }
+    }
+    out
+}
+
+/// Apply to a homogeneous point; `None` when the result is at infinity.
+fn mat_apply(m: &M3, x: f64, y: f64) -> Option<(f64, f64)> {
+    let w = m[6] * x + m[7] * y + m[8];
+    if w.abs() < 1e-12 {
+        return None;
+    }
+    Some((
+        (m[0] * x + m[1] * y + m[2]) / w,
+        (m[3] * x + m[4] * y + m[5]) / w,
+    ))
+}
+
+fn mat_invert(m: &M3) -> Option<M3> {
+    let c = [
+        m[4] * m[8] - m[5] * m[7],
+        m[5] * m[6] - m[3] * m[8],
+        m[3] * m[7] - m[4] * m[6],
+        m[2] * m[7] - m[1] * m[8],
+        m[0] * m[8] - m[2] * m[6],
+        m[1] * m[6] - m[0] * m[7],
+        m[1] * m[5] - m[2] * m[4],
+        m[2] * m[3] - m[0] * m[5],
+        m[0] * m[4] - m[1] * m[3],
+    ];
+    let det = m[0] * c[0] + m[1] * c[1] + m[2] * c[2];
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    // `c` is already the adjugate laid out transposed.
+    Some([
+        c[0] / det,
+        c[3] / det,
+        c[6] / det,
+        c[1] / det,
+        c[4] / det,
+        c[7] / det,
+        c[2] / det,
+        c[5] / det,
+        c[8] / det,
+    ])
+}
+
+/// Homography that shows the cabinet **face-on**: the camera image as it
+/// would look from a viewpoint square to the playfield.
+///
+/// Built from the focal length and the two vanishing points — deliberately
+/// **not** from the four detected corners. Mapping four corners onto a
+/// rectangle would produce a rectangle whatever the calibration says, which
+/// is worthless as a check. Going through the reconstructed plane means the
+/// picture can come out wrong, and comes out wrong for the same reasons
+/// [`CameraPose::rect_angle_deg`] leaves 90: a bad focal, or lines that do
+/// not follow the real rails. It is that number as a picture.
+///
+/// Only the playfield plane is rectified. Everything standing off it — the
+/// player, the backbox — smears, because it is being shown from a viewpoint
+/// it was never seen from. That is expected, not a defect.
+///
+/// Returns the 3x3 matrix, row-major, mapping a **destination pixel to a
+/// source pixel**, ready for an inverse-mapping resampler. The cabinet is
+/// laid out with the lockbar across the bottom and the playfield running up,
+/// filling `dst_w` x `dst_h`. `None` when the plane is unobservable (rails
+/// parallel in the image) or the geometry is degenerate.
+#[must_use]
+pub fn flatten_homography(
+    geom: &AnchorGeometry,
+    intr: &CameraIntrinsics,
+    dst_w: u32,
+    dst_h: u32,
+) -> Option<M3> {
+    if dst_w < 2 || dst_h < 2 {
+        return None;
+    }
+    let (vd, _vw, r, w3, n) = plane_basis(geom, intr)?;
+    let f = f64::from(intr.fx);
+    let (cx, cy) = (f64::from(intr.cx), f64::from(intr.cy));
+
+    // Virtual camera looking along the playfield normal, from the same
+    // centre. `n` points back toward the camera, so the view direction is its
+    // opposite; check against the lockbar's own ray rather than trusting the
+    // sign convention twice over.
+    let lc = geom.lockbar_center;
+    let to_lockbar = unit3((f64::from(lc.0) - cx, f64::from(lc.1) - cy, f));
+    let z_v = if dot3(n, to_lockbar) > 0.0 {
+        n
+    } else {
+        neg3(n)
+    };
+    let x_v = w3;
+    let y_v = cross3(z_v, x_v);
+
+    // H_rot = K * R * K^-1, with R the rotation into the virtual frame.
+    let k = [f, 0.0, cx, 0.0, f, cy, 0.0, 0.0, 1.0];
+    let k_inv = [1.0 / f, 0.0, -cx / f, 0.0, 1.0 / f, -cy / f, 0.0, 0.0, 1.0];
+    let rot = [
+        x_v.0, x_v.1, x_v.2, y_v.0, y_v.1, y_v.2, z_v.0, z_v.1, z_v.2,
+    ];
+    let h_rot = mat_mul(&k, &mat_mul(&rot, &k_inv));
+
+    // Scale from the one length the geometry knows: the lockbar's screen
+    // edge. Two thirds of the destination width leaves room for the rails to
+    // sit inside the frame when the calibration is off.
+    let a = mat_apply(
+        &h_rot,
+        f64::from(geom.corners[3].0),
+        f64::from(geom.corners[3].1),
+    )?;
+    let b = mat_apply(
+        &h_rot,
+        f64::from(geom.corners[2].0),
+        f64::from(geom.corners[2].1),
+    )?;
+    let bar_px = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    if bar_px < 1e-6 {
+        return None;
+    }
+    let scale = f64::from(dst_w) * 2.0 / 3.0 / bar_px;
+
+    // Which way the playfield runs in the virtual image: the rail vanishing
+    // point is at infinity there, so its mapped direction is the rail axis.
+    // The cabinet must run UP the destination, whichever way it ran here.
+    let vdn = (vd.0 / vd.2, vd.1 / vd.2);
+    let rail_dir = {
+        let d = (
+            rot[0] * (vdn.0 - cx) + rot[1] * (vdn.1 - cy) + rot[2] * f,
+            rot[3] * (vdn.0 - cx) + rot[4] * (vdn.1 - cy) + rot[5] * f,
+        );
+        let len = (d.0 * d.0 + d.1 * d.1).sqrt();
+        if len < 1e-9 {
+            return None;
+        }
+        (d.0 / len, d.1 / len)
+    };
+    // `r` is unused beyond the basis, but naming it keeps the tuple readable.
+    let _ = r;
+    let flip_y = if rail_dir.1 > 0.0 { -1.0 } else { 1.0 };
+
+    // Lockbar centred across the frame, sitting near the bottom edge.
+    let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    let tx = f64::from(dst_w) / 2.0 - scale * mid.0;
+    let ty = f64::from(dst_h) * 0.88 - scale * flip_y * mid.1;
+    let fit = [scale, 0.0, tx, 0.0, scale * flip_y, ty, 0.0, 0.0, 1.0];
+
+    mat_invert(&mat_mul(&fit, &h_rot))
 }
 
 #[inline]

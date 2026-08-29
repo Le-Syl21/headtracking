@@ -2441,6 +2441,10 @@ struct App {
     /// panel shows the camera feed with the off-axis 3D scene stacked below
     /// it (see `docs/parallax-validation-window.md`).
     parallax_enabled: bool,
+    /// Show the camera view rectified onto the playfield plane — the cabinet
+    /// as it would look from square-on. Off by default: it is a check, not a
+    /// way to watch yourself.
+    flatten_view: bool,
     /// egui handle to the parallax scene's offscreen colour texture, set
     /// by [`DemoShell::redraw`] each frame the window is on (the FBO lives
     /// with the GL context in `DemoShell`, not here). `None` when off.
@@ -5122,6 +5126,7 @@ impl App {
             contrib_thumbs: None,
             switch_state: SwitchState::Idle,
             parallax_enabled: true,
+            flatten_view: false,
             parallax_tex: None,
             // Auto-orbit by default: the parallax illusion shows immediately
             // with no camera and no need to move — switch to Live on the cab.
@@ -5454,7 +5459,28 @@ impl App {
             active.last_depth_count = frame.depth_captured;
             active.last_ir_count = frame.ir_captured;
             active.last_consumed_id = frame.frame_id;
-            let img = stream_color_image(&frame, self.selected_stream);
+            let mut img = stream_color_image(&frame, self.selected_stream);
+            if self.flatten_view
+                && let Some(geom) = frame.anchor.as_ref()
+            {
+                let fx = color_focal_px(active.backend, frame.w);
+                let intr = anchor::CameraIntrinsics {
+                    fx,
+                    fy: fx,
+                    cx: frame.w as f32 * 0.5,
+                    cy: frame.h as f32 * 0.5,
+                };
+                // Half resolution: this is a diagnostic view that gets scaled
+                // into a panel anyway, and the resampler walks every
+                // destination pixel on the GL thread.
+                let (dw, dh) = (
+                    (img.width() / 2).max(2) as u32,
+                    (img.height() / 2).max(2) as u32,
+                );
+                if let Some(h) = anchor::flatten_homography(geom, &intr, dw, dh) {
+                    img = flatten_image(&img, &h, dw as usize, dh as usize);
+                }
+            }
             upload_texture(egui_ctx, &mut active.rgb_texture, img);
             active.metrics.note_output_frame();
             active.last_rgb_at = frame.last_rgb_at;
@@ -5991,6 +6017,18 @@ impl App {
                 // `install_extra_glyph_fonts`).
                 ui.toggle_value(&mut self.parallax_enabled, "🪟 Parallax")
                     .on_hover_text("Show the off-axis 3D validation scene below the camera feed");
+                ui.toggle_value(&mut self.flatten_view, "⊞ Flatten")
+                    .on_hover_text(
+                        "Redraw the camera view from square-on to the playfield, using the \
+                         focal length and the detected rails. Right calibration: the cabinet \
+                         stands upright as a rectangle. Wrong focal: it leans over like a \
+                         parallelogram — but only if the camera is turned off the cabinet's \
+                         axis, the same blind spot as 'square'. Wrong lines: the cabinet's \
+                         real edges come out crooked while the detected ones sit straight, \
+                         and that shows whatever the camera is aimed at. Everything off the \
+                         playfield — you included — smears, because it is being shown from a \
+                         viewpoint it was never seen from. Needs the anchor to have locked.",
+                    );
                 // 🎁 Contribute — same highlight toggle as the others (so it
                 // never shifts the bar), with a red outline *painted on top* of
                 // its rect as a call to action. Painting the border rather than
@@ -6739,7 +6777,10 @@ impl App {
                     (w, h) if w > 0 && h > 0 => (w as f32, h as f32),
                     _ => (tex_size.x, tex_size.y),
                 };
-                if sw > 0.0 && sh > 0.0 {
+                // The overlay lives in camera pixels; the flattened view is a
+                // different space, and the pose is off the plane the warp is
+                // built for. Drawing it there would place bones nowhere.
+                if sw > 0.0 && sh > 0.0 && !self.flatten_view {
                     let clipped = ui.painter().with_clip_rect(rect);
                     let mut canvas = EguiOverlay {
                         painter: &clipped,
@@ -7717,6 +7758,41 @@ fn gray8_to_rgb888(gray: &[u8]) -> Vec<u8> {
 fn rgb888_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
     debug_assert_eq!(data.len(), (width * height * 3) as usize);
     ColorImage::from_rgb([width as usize, height as usize], data)
+}
+
+/// Resample `src` through `h`, a destination-to-source homography, into a
+/// `dst_w` x `dst_h` image.
+///
+/// Nearest neighbour on purpose: this is a geometry check, and a blurrier
+/// picture would hide exactly the edge that has to be judged straight or not.
+/// Destination pixels that fall outside the source come back dark grey, so
+/// the extent of the real frame stays visible inside the rectified one.
+fn flatten_image(src: &ColorImage, h: &[f64; 9], dst_w: usize, dst_h: usize) -> ColorImage {
+    const OUTSIDE: egui::Color32 = egui::Color32::from_rgb(0x20, 0x20, 0x20);
+    let (sw, sh) = (src.width(), src.height());
+    let px = &src.pixels;
+    let mut out = vec![OUTSIDE; dst_w * dst_h];
+    for y in 0..dst_h {
+        let fy = y as f64 + 0.5;
+        for x in 0..dst_w {
+            let fx = x as f64 + 0.5;
+            let w = h[6] * fx + h[7] * fy + h[8];
+            if w.abs() < 1e-12 {
+                continue;
+            }
+            let u = (h[0] * fx + h[1] * fy + h[2]) / w;
+            let v = (h[3] * fx + h[4] * fy + h[5]) / w;
+            if u < 0.0 || v < 0.0 {
+                continue;
+            }
+            let (u, v) = (u as usize, v as usize);
+            if u >= sw || v >= sh {
+                continue;
+            }
+            out[y * dst_w + x] = px[v * sw + u];
+        }
+    }
+    ColorImage::new([dst_w, dst_h], out)
 }
 
 /// A published frame as an egui image, reading the driver's layout directly.

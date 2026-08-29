@@ -437,3 +437,147 @@ fn playfield_pitch_minus_the_slope_is_the_pitch_against_the_horizon() {
         );
     }
 }
+
+// ---------------------------------------------------------------- flattening
+
+/// Apply a row-major 3x3 to a pixel.
+fn apply(m: &[f64; 9], x: f64, y: f64) -> (f64, f64) {
+    let w = m[6] * x + m[7] * y + m[8];
+    (
+        (m[0] * x + m[1] * y + m[2]) / w,
+        (m[3] * x + m[4] * y + m[5]) / w,
+    )
+}
+
+fn angle_between(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dot = a.0 * b.0 + a.1 * b.1;
+    let la = (a.0 * a.0 + a.1 * a.1).sqrt();
+    let lb = (b.0 * b.0 + b.1 * b.1).sqrt();
+    (dot / (la * lb)).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// The rectified view has to put the cabinet back into a rectangle: the two
+/// rails parallel, the lockbar square to them, and the width-to-length ratio
+/// the one the cabinet really has. That is what makes it a *check* and not a
+/// picture — and it can only come out right if the focal and the detected
+/// lines are right, because the homography is built from those and not from
+/// the corners it is being judged on.
+#[test]
+fn flattening_puts_the_cabinet_back_in_a_rectangle() {
+    let c = Cam {
+        yaw_deg: -9.0,
+        pitch_deg: 14.0,
+        pos: (250.0, 760.0, -1270.0),
+        ..sloped()
+    };
+    let (sl, sr, lp, ls) = c.lines();
+    let geom = geometry_from_lines(sl, sr, lp, ls, W, H).expect("valid line set");
+    let intr = CameraIntrinsics {
+        fx: FX as f32,
+        fy: FX as f32,
+        cx: W as f32 * 0.5,
+        cy: H as f32 * 0.5,
+    };
+    // Destination -> source; invert it to follow known points forward.
+    let inv = anchor::flatten_homography(&geom, &intr, W, H).expect("homography");
+    let fwd = {
+        // 3x3 inverse, same adjugate as the crate's own.
+        let m = inv;
+        let co = [
+            m[4] * m[8] - m[5] * m[7],
+            m[5] * m[6] - m[3] * m[8],
+            m[3] * m[7] - m[4] * m[6],
+            m[2] * m[7] - m[1] * m[8],
+            m[0] * m[8] - m[2] * m[6],
+            m[1] * m[6] - m[0] * m[7],
+            m[1] * m[5] - m[2] * m[4],
+            m[2] * m[3] - m[0] * m[5],
+            m[0] * m[4] - m[1] * m[3],
+        ];
+        let det = m[0] * co[0] + m[1] * co[1] + m[2] * co[2];
+        [
+            co[0] / det,
+            co[3] / det,
+            co[6] / det,
+            co[1] / det,
+            co[4] / det,
+            co[7] / det,
+            co[2] / det,
+            co[5] / det,
+            co[8] / det,
+        ]
+    };
+
+    // The four cabinet corners we know metrically: the lockbar's screen edge,
+    // and the far end of each rail.
+    let px = |p: V3| {
+        let q = c.project(p).expect("in front of the camera");
+        apply(&fwd, f64::from(q.0), f64::from(q.1))
+    };
+    let near_l = px((-HALF, 0.0, 0.0));
+    let near_r = px((HALF, 0.0, 0.0));
+    let far_l = px(c.rail_far(-HALF));
+    let far_r = px(c.rail_far(HALF));
+
+    let bar = (near_r.0 - near_l.0, near_r.1 - near_l.1);
+    let rail_l = (far_l.0 - near_l.0, far_l.1 - near_l.1);
+    let rail_r = (far_r.0 - near_r.0, far_r.1 - near_r.1);
+
+    assert!(
+        angle_between(rail_l, rail_r) < 0.5,
+        "rails must come out parallel, got {}\u{b0}",
+        angle_between(rail_l, rail_r)
+    );
+    assert!(
+        (angle_between(bar, rail_l) - 90.0).abs() < 0.5,
+        "lockbar must come out square to the rails, got {}\u{b0}",
+        angle_between(bar, rail_l)
+    );
+
+    // Aspect: 610 mm across against 1400 mm of rail, preserved by a
+    // rectification that is a similarity on the plane.
+    let bar_len = (bar.0 * bar.0 + bar.1 * bar.1).sqrt();
+    let rail_len = (rail_l.0 * rail_l.0 + rail_l.1 * rail_l.1).sqrt();
+    let got = bar_len / rail_len;
+    let want = f64::from(LOCKBAR_MM) / RAIL_LEN;
+    assert!(
+        (got - want).abs() / want < 0.02,
+        "aspect {got:.4} vs {want:.4}"
+    );
+
+    // The lockbar sits across the bottom and the playfield runs up the frame.
+    assert!(near_l.1 > far_l.1, "cabinet must run upward in the view");
+    assert!(near_l.0 < near_r.0, "left must stay on the left");
+}
+
+/// A wrong focal has to *show*, otherwise the view is decoration. Feeding the
+/// rectification a focal 25 % out must skew the cabinet out of square by a
+/// margin nobody could miss on screen.
+#[test]
+fn a_wrong_focal_visibly_skews_the_flattened_cabinet() {
+    let c = Cam {
+        yaw_deg: -9.0,
+        pitch_deg: 14.0,
+        pos: (250.0, 760.0, -1270.0),
+        ..sloped()
+    };
+    let (sl, sr, lp, ls) = c.lines();
+    let geom = geometry_from_lines(sl, sr, lp, ls, W, H).expect("valid line set");
+    let wrong = CameraIntrinsics {
+        fx: (FX * 1.25) as f32,
+        fy: (FX * 1.25) as f32,
+        cx: W as f32 * 0.5,
+        cy: H as f32 * 0.5,
+    };
+    let pose = camera_pose(&geom, &wrong, LOCKBAR_MM).expect("pose");
+    // Same defect the number reports, now as a picture: if the reconstruction
+    // is out of square, the flattened cabinet is a parallelogram.
+    assert!(
+        (pose.rect_angle_deg - 90.0).abs() > 2.0,
+        "precondition: the wrong focal must be out of square"
+    );
+    assert!(
+        anchor::flatten_homography(&geom, &wrong, W, H).is_some(),
+        "the view must still build — the point is to SEE the error"
+    );
+}
