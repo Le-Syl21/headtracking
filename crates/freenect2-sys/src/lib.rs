@@ -57,42 +57,73 @@ pub fn take_last_log_error() -> Option<String> {
     LAST_LOG_ERROR.with(|cell| cell.borrow_mut().take())
 }
 
+/// Depth frame copied out of libfreenect2's internal buffer.
+/// `data` holds `width * height` floats, each in millimeters.
+/// `0.0` denotes "no data" (out of range or low confidence).
+///
+/// Plain Rust, not a cxx shared struct: the shim copies straight into
+/// `data`'s storage through a slice, so C++ never names the type.
+#[derive(Clone, Default)]
+pub struct DepthFrame {
+    pub width: u32,
+    pub height: u32,
+    /// `timestamp` field from libfreenect2 (units of 0.125 ms per tick).
+    pub timestamp_raw: u32,
+    pub data: Vec<f32>,
+}
+
+/// IR frame from the Kinect v2 (512×424, same geometry as depth).
+/// `data` holds `width * height` floats, each an IR intensity in roughly
+/// `[0, 65535]`. Delivered on the same listener as depth.
+#[derive(Clone, Default)]
+pub struct IrFrame {
+    pub width: u32,
+    pub height: u32,
+    /// `timestamp` field from libfreenect2 (units of 0.125 ms per tick).
+    pub timestamp_raw: u32,
+    pub data: Vec<f32>,
+}
+
+/// Color frame from the Kinect v2 (1920×1080, BGRX 4 bytes per pixel).
+/// libfreenect2 decodes the on-wire MJPEG via TurboJPEG transparently;
+/// we just hand the decoded buffer up.
+#[derive(Clone, Default)]
+pub struct RgbFrame {
+    pub width: u32,
+    pub height: u32,
+    pub timestamp_raw: u32,
+    /// Row-major BGRX bytes — `width * height * 4` entries.
+    pub data: Vec<u8>,
+}
+
 #[cxx::bridge(namespace = "freenect2_shim")]
 mod ffi {
-    /// Depth frame copied out of libfreenect2's internal buffer.
-    /// `data` holds `width * height` floats, each in millimeters.
-    /// `0.0` denotes "no data" (out of range or low confidence).
-    #[derive(Clone)]
-    pub struct DepthFrame {
+    /// Geometry and timestamp of the frame a `poll_*_into` just copied out.
+    /// The pixels went straight into the caller's buffer, so this is all that
+    /// travels through the bridge.
+    #[derive(Clone, Copy, Default)]
+    pub struct FrameMeta {
         pub width: u32,
         pub height: u32,
         /// `timestamp` field from libfreenect2 (units of 0.125 ms per tick).
         pub timestamp_raw: u32,
-        pub data: Vec<f32>,
     }
 
-    /// IR frame from the Kinect v2 (512×424, same geometry as depth).
-    /// `data` holds `width * height` floats, each an IR intensity in roughly
-    /// `[0, 65535]`. Delivered on the same listener as depth.
-    #[derive(Clone)]
-    pub struct IrFrame {
-        pub width: u32,
-        pub height: u32,
-        /// `timestamp` field from libfreenect2 (units of 0.125 ms per tick).
-        pub timestamp_raw: u32,
-        pub data: Vec<f32>,
-    }
-
-    /// Color frame from the Kinect v2 (1920×1080, BGRX 4 bytes per pixel).
-    /// libfreenect2 decodes the on-wire MJPEG via TurboJPEG transparently;
-    /// we just hand the decoded buffer up.
-    #[derive(Clone)]
-    pub struct RgbFrame {
-        pub width: u32,
-        pub height: u32,
-        pub timestamp_raw: u32,
-        /// Row-major BGRX bytes — `width * height * 4` entries.
-        pub data: Vec<u8>,
+    /// Per-stream frame accounting, straight from the listener slots.
+    ///
+    /// `*_received` counts what libfreenect2 delivered — the sensor's own
+    /// rate. `*_dropped` counts deliveries that landed on a slot the reader
+    /// had not drained yet: frames the *application* threw away. The pair is
+    /// the difference between "the Kinect is slow" and "we are slow", which
+    /// is otherwise unknowable from a log.
+    #[derive(Clone, Copy, Default)]
+    pub struct StreamStats {
+        pub rgb_received: u64,
+        pub rgb_dropped: u64,
+        pub depth_received: u64,
+        pub depth_dropped: u64,
+        pub ir_received: u64,
+        pub ir_dropped: u64,
     }
 
     /// IR camera intrinsics (depth camera). Matches `Freenect2Device::IrCameraParams`.
@@ -109,16 +140,42 @@ mod ffi {
         pub p2: f32,
     }
 
-    /// Color camera intrinsics. Matches `Freenect2Device::ColorCameraParams`
-    /// (only the pinhole terms — the distortion coefficients aren't needed:
-    /// libfreenect2's registration already outputs undistorted color-space
-    /// depth). Valid once the device has started streaming.
+    /// Color camera intrinsics — the full `Freenect2Device::ColorCameraParams`,
+    /// pinhole terms plus the depth-to-color polynomial libfreenect2 fits per
+    /// unit. Valid once the device has started streaming.
+    ///
+    /// Callers that only deproject want `fx/fy/cx/cy`; the rest is carried so
+    /// a [`Registration`] can be rebuilt from a recorded calibration with no
+    /// device attached — which is what makes the colour-space projection
+    /// testable at all.
     #[derive(Clone, Copy, Default)]
     pub struct ColorCameraParams {
         pub fx: f32,
         pub fy: f32,
         pub cx: f32,
         pub cy: f32,
+        pub shift_d: f32,
+        pub shift_m: f32,
+        pub mx_x3y0: f32,
+        pub mx_x0y3: f32,
+        pub mx_x2y1: f32,
+        pub mx_x1y2: f32,
+        pub mx_x2y0: f32,
+        pub mx_x0y2: f32,
+        pub mx_x1y1: f32,
+        pub mx_x1y0: f32,
+        pub mx_x0y1: f32,
+        pub mx_x0y0: f32,
+        pub my_x3y0: f32,
+        pub my_x0y3: f32,
+        pub my_x2y1: f32,
+        pub my_x1y2: f32,
+        pub my_x2y0: f32,
+        pub my_x0y2: f32,
+        pub my_x1y1: f32,
+        pub my_x1y0: f32,
+        pub my_x0y1: f32,
+        pub my_x0y0: f32,
     }
 
     /// A depth pixel mapped onto the color image via [`map_depth_to_color`].
@@ -184,17 +241,26 @@ mod ffi {
         /// Stop the device. Idempotent.
         fn stop_device(dev: Pin<&mut Freenect2Dev>) -> bool;
 
-        /// Read the most recent depth frame, if any. Returns `false` if no new
-        /// frame has arrived since the last call.
-        fn poll_depth(dev: Pin<&mut Freenect2Dev>, out: &mut DepthFrame) -> bool;
+        /// Copy the most recent depth frame into `out`, which the caller owns
+        /// and reuses. Returns `false` if no new frame has arrived since the
+        /// last call, or if `out` is too small for it.
+        fn poll_depth_into(
+            dev: Pin<&mut Freenect2Dev>,
+            out: &mut [f32],
+            meta: &mut FrameMeta,
+        ) -> bool;
 
-        /// Read the most recent IR frame, if any. Returns `false` if no new
-        /// frame has arrived since the last call. IR is produced by the depth
+        /// Same for the most recent IR frame. IR is produced by the depth
         /// pipeline, so it flows whenever the depth stream is running.
-        fn poll_ir(dev: Pin<&mut Freenect2Dev>, out: &mut IrFrame) -> bool;
+        fn poll_ir_into(dev: Pin<&mut Freenect2Dev>, out: &mut [f32], meta: &mut FrameMeta)
+        -> bool;
 
-        /// Read the most recent color frame, if any.
-        fn poll_rgb(dev: Pin<&mut Freenect2Dev>, out: &mut RgbFrame) -> bool;
+        /// Same for the most recent colour frame (BGRX, `1920*1080*4` bytes).
+        fn poll_rgb_into(dev: Pin<&mut Freenect2Dev>, out: &mut [u8], meta: &mut FrameMeta)
+        -> bool;
+
+        /// Frames delivered and frames dropped, per stream. See [`StreamStats`].
+        fn stream_stats(dev: &Freenect2Dev) -> StreamStats;
 
         /// IR / depth camera intrinsics, available after the device starts.
         fn ir_params(dev: &Freenect2Dev) -> IrCameraParams;
@@ -208,6 +274,14 @@ mod ffi {
         /// intrinsics. Call after `start_streams` — before the camera params
         /// have loaded the returned registration maps nothing (all `valid=false`).
         fn new_registration(dev: &Freenect2Dev) -> UniquePtr<Registration>;
+
+        /// Same model, built straight from a recorded pair of intrinsics
+        /// instead of a live device. Lets the depth↔colour projection be
+        /// exercised without a Kinect on the bus.
+        fn new_registration_from_params(
+            ir: IrCameraParams,
+            color: ColorCameraParams,
+        ) -> UniquePtr<Registration>;
 
         /// Map a depth pixel `(dx, dy)` at depth `dz` (mm) onto the color image.
         /// See [`ColorPixel`]. Pure/const — safe to call from any thread.
@@ -228,17 +302,36 @@ mod ffi {
             depth: &[f32],
             bigdepth: &mut [f32],
         ) -> bool;
+
+        /// Colour-space depth over a `(2*half+1)²` window centred on colour
+        /// pixel `(center_x, center_y)`, written row-major into `out`.
+        ///
+        /// Same values [`register_bigdepth`] would have left in that window —
+        /// libfreenect2's nearest-z-per-colour-pixel filter map — without
+        /// building the other two million pixels. Pixels no depth sample
+        /// reaches come back `+inf`, as in `bigdepth`. Returns `false` on a
+        /// length mismatch or a registration built before the camera params
+        /// loaded.
+        fn depth_window_min(
+            reg: Pin<&mut Registration>,
+            depth: &[f32],
+            center_x: i32,
+            center_y: i32,
+            half: i32,
+            out: &mut [f32],
+        ) -> bool;
     }
 }
 
 pub use ffi::{
-    ColorCameraParams, ColorPixel, DepthFrame, Freenect2Ctx, Freenect2Dev, IrCameraParams, IrFrame,
-    Registration, RgbFrame,
+    ColorCameraParams, ColorPixel, FrameMeta, Freenect2Ctx, Freenect2Dev, IrCameraParams,
+    Registration, StreamStats,
 };
 pub use ffi::{
-    color_params, depth_pipeline, enumerate, install_logger, ir_params, map_depth_to_color,
-    new_context, new_registration, open_default, poll_depth, poll_ir, poll_rgb, register_bigdepth,
-    start_depth, start_streams, stop_device,
+    color_params, depth_pipeline, depth_window_min, enumerate, install_logger, ir_params,
+    map_depth_to_color, new_context, new_registration, new_registration_from_params, open_default,
+    poll_depth_into, poll_ir_into, poll_rgb_into, register_bigdepth, start_depth, start_streams,
+    stop_device, stream_stats,
 };
 
 /// Length of the color-space depth buffer [`register_bigdepth`] fills:

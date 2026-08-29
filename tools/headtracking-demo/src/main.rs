@@ -2713,6 +2713,16 @@ struct Capture {
     /// the v2 if the model couldn't be built — see [`Capture::reg_warned`].
     registration: Option<freenect2::Registration>,
     color_intr: Intrinsics,
+    /// Reused Kinect v2 frame buffers. The colour frame is 8.3 MB and depth
+    /// and IR 868 KB each: the shim copies straight into these, so a poll is
+    /// one memcpy and, after the first frame, no allocation at all.
+    v2_rgb: freenect2::RgbFrame,
+    v2_ir: freenect2::IrFrame,
+    v2_depth: freenect2::DepthFrame,
+    /// Colour-space depth around the head only — what the tracker actually
+    /// reads out of the registration. See [`Capture::bigdepth`], which is now
+    /// built for the on-screen depth *view* and nothing else.
+    head_window: Vec<f32>,
     /// Reused `1920 × 1082` colour-space depth buffer (~8 MB) — allocated once
     /// per v2 open so the per-frame registration never reallocates.
     bigdepth: Vec<f32>,
@@ -2725,9 +2735,21 @@ struct Capture {
     /// `true` once [`Capture::bigdepth`] holds a registration of the current
     /// depth frame; cleared when the registration is unavailable or failed.
     bigdepth_ok: bool,
+    /// Same, for [`Capture::head_window`] — the head path no longer depends on
+    /// the full-plane projection, so it needs its own validity flag.
+    head_window_ok: bool,
+    /// One-shot: the windowed and full projections have been compared on a
+    /// live frame (see the depth arm of [`Capture::poll_once`]).
+    window_checked: bool,
     /// Latest registration cost (ms) and a one-shot flag so a failing or
     /// missing registration warns once instead of every frame.
     reg_ms: f32,
+    /// Time spent moving one frame out of the driver and into the shape the
+    /// pose model reads: the poll copy plus the colour conversion. Measured
+    /// because it is the largest per-frame cost on a modest CPU and used to
+    /// be invisible — the perf line summed the model and the registration,
+    /// and could not explain the frame rate it printed beside them.
+    copy_ms: f32,
     /// Per-stage smoothing cost for the latest head.
     filter_us: FilterUs,
     /// Time spent turning the camera's surface into a packed RGB buffer.
@@ -2807,7 +2829,8 @@ impl Capture {
                     || self
                         .last_rgb_refresh
                         .is_none_or(|t| t.elapsed() >= Duration::from_millis(400));
-                if want_rgb && let Some(rgb) = device.poll_rgb() {
+                let t_copy = Instant::now();
+                if want_rgb && device.poll_rgb_into(&mut self.v2_rgb) {
                     self.last_rgb_at = Some(Instant::now());
                     self.last_rgb_refresh = Some(Instant::now());
                     // A contribution capture asked for an un-throttled frame:
@@ -2815,23 +2838,33 @@ impl Capture {
                     if let Some(ack) = self.rgb_refresh_ack.take() {
                         let _ = ack.send(());
                     }
-                    let rgb888 = Arc::new(bgrx_to_rgb888(&rgb.data));
+                    let (w, h) = (self.v2_rgb.width, self.v2_rgb.height);
+                    let rgb888 = Arc::new(bgrx_to_rgb888(&self.v2_rgb.data));
                     if !track_on_ir {
+                        // Poll copy + colour conversion: the two steps that
+                        // move 8.3 MB and 6.2 MB per frame, and the reason a
+                        // 30 Hz sensor used to arrive at 11 fps. Recorded only
+                        // on the stream that feeds the pose model — while
+                        // tracking on IR this conversion runs at 2.5 Hz for
+                        // the preview alone, and charging it to every frame
+                        // would libel the IR path.
+                        self.copy_ms = t_copy.elapsed().as_secs_f32() * 1000.0;
                         got_rgb = true;
-                        self.blaze_worker
-                            .submit(Arc::clone(&rgb888), rgb.width, rgb.height);
-                        self.pose_src = (rgb.width, rgb.height);
+                        self.blaze_worker.submit(Arc::clone(&rgb888), w, h);
+                        self.pose_src = (w, h);
                         let pose_out = self.blaze_worker.snapshot();
                         self.last_pose = pose_out.pose;
                         if pose_out.ms > 0.0 {
                             self.head_ms = pose_out.ms;
                         }
                     }
-                    self.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
+                    self.last_rgb_frame = Some((w, h, rgb888));
                 }
                 // IR streams on the same listener as depth. Keep the latest for
                 // the capture export; f32 intensity rounds into u16.
-                if let Some(ir) = device.poll_ir() {
+                let t_ir = Instant::now();
+                if device.poll_ir_into(&mut self.v2_ir) {
+                    let ir = &self.v2_ir;
                     self.ir_frames += 1;
                     self.last_ir_at = Some(Instant::now());
                     let mm: Vec<u16> = ir.data.iter().map(|&v| v as u16).collect();
@@ -2842,6 +2875,10 @@ impl Capture {
                         got_rgb = true;
                         let gray = autolevel_gray8_raw(&mm, false);
                         let rgb888 = Arc::new(gray8_to_rgb888(&gray));
+                        // Same measurement as the colour path, on the stream
+                        // that actually feeds the model here: poll copy plus
+                        // the widening and levelling the model reads.
+                        self.copy_ms = t_ir.elapsed().as_secs_f32() * 1000.0;
                         self.blaze_worker.submit(rgb888, ir.width, ir.height);
                         self.pose_src = (ir.width, ir.height);
                         let pose_out = self.blaze_worker.snapshot();
@@ -2852,31 +2889,70 @@ impl Capture {
                     }
                     self.last_ir = Some(Arc::new((ir.width, ir.height, mm)));
                 }
-                if let Some(depth) = device.poll_depth() {
+                if device.poll_depth_into(&mut self.v2_depth) {
+                    let depth = &self.v2_depth;
                     self.depth_frames += 1;
                     self.last_depth_at = Some(Instant::now());
-                    // Project this depth frame into colour space. The colour and
-                    // depth lenses sit ~5 cm apart with different fields of view,
-                    // so scaling a colour coordinate into the 512×424 depth grid
+                    // Project depth into colour space. The colour and depth
+                    // lenses sit ~5 cm apart with different fields of view, so
+                    // scaling a colour coordinate into the 512×424 depth grid
                     // by resolution ratio samples the wrong pixel — worse the
                     // closer the player is. libfreenect2's registration is the
                     // proper correction.
-                    // Skipped while tracking on IR: the pose is already in the
-                    // depth grid there, so the colour projection buys nothing —
-                    // and those milliseconds are exactly the headroom the IR
-                    // path exists to gain.
-                    // Also gated on a pose (or the depth view being watched):
-                    // with nobody in frame there is no head to sample, so the
-                    // 2 M-point projection would be pure waste.
+                    //
+                    // Two different questions, deliberately priced apart. The
+                    // tracker wants depth at *one* place, so it gets the 17×17
+                    // window around the head. The depth *view* wants the whole
+                    // colour plane, so it pays for the full `bigdepth` — and
+                    // only while it is on screen. Asking the full projection
+                    // for a head was ~12 ms a frame: an 8.3 MB infinity fill,
+                    // 3.3 M scattered min-writes and a registered colour image
+                    // nobody ever read, to answer a question about 289 pixels.
+                    //
+                    // Both skipped while tracking on IR: the pose is already in
+                    // the depth grid there, so the colour projection buys
+                    // nothing — and those milliseconds are exactly the headroom
+                    // the IR path exists to gain.
                     self.bigdepth_ok = false;
-                    if !track_on_ir
-                        && (self.last_pose.is_some() || self.selected_stream == StreamKind::Depth)
-                        && let Some(reg) = self.registration.as_mut()
-                    {
+                    self.head_window_ok = false;
+                    let want_view = self.selected_stream == StreamKind::Depth;
+                    if !track_on_ir && let Some(reg) = self.registration.as_mut() {
                         let t0 = Instant::now();
-                        let ok = reg.bigdepth(&self.rgb_scratch, &depth.data, &mut self.bigdepth);
+                        let mut ok = true;
+                        if let Some(pose) = self.last_pose.as_ref() {
+                            let (hx, hy) = head_center_xy(pose);
+                            self.head_window_ok = reg.depth_window(
+                                &depth.data,
+                                (hx as i32, hy as i32),
+                                HEAD_WINDOW_HALF,
+                                &mut self.head_window,
+                            );
+                            ok = self.head_window_ok;
+                        }
+                        if want_view {
+                            self.bigdepth_ok =
+                                reg.bigdepth(&self.rgb_scratch, &depth.data, &mut self.bigdepth);
+                            ok = ok && self.bigdepth_ok;
+                        }
                         self.reg_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                        self.bigdepth_ok = ok;
+                        // The windowed projection is meant to be *identical*
+                        // to the patch of the full one it replaces. Whenever
+                        // both happen to be live (the depth view is on screen
+                        // and a pose is found) check that once, on real data,
+                        // and say so: this is the only place the claim can be
+                        // tested — a Registration needs a device, so no unit
+                        // test can reach it.
+                        if !self.window_checked && self.head_window_ok && self.bigdepth_ok {
+                            self.window_checked = true;
+                            if let Some(pose) = self.last_pose.as_ref() {
+                                let (hx, hy) = head_center_xy(pose);
+                                report_window_match(
+                                    &self.head_window,
+                                    &self.bigdepth,
+                                    (hx as i32, hy as i32),
+                                );
+                            }
+                        }
                         if !ok && !self.reg_warned {
                             self.reg_warned = true;
                             warn!(
@@ -2909,10 +2985,10 @@ impl Capture {
                                         &self.intrinsics,
                                         depth_min,
                                     )
-                                } else if self.bigdepth_ok {
-                                    head_pixel_from_bigdepth(
+                                } else if self.head_window_ok {
+                                    head_pixel_from_window(
                                         p,
-                                        &self.bigdepth,
+                                        &self.head_window,
                                         &self.color_intr,
                                         depth_min,
                                     )
@@ -2947,9 +3023,9 @@ impl Capture {
                         self.last_head = smoothed;
                     }
                     self.last_depth = Some(Arc::new((
-                        depth.width,
-                        depth.height,
-                        depth.data.iter().map(|&z| z as u16).collect(),
+                        self.v2_depth.width,
+                        self.v2_depth.height,
+                        self.v2_depth.data.iter().map(|&z| z as u16).collect(),
                     )));
                 }
             }
@@ -3095,6 +3171,23 @@ impl Capture {
             .last_rgb_frame
             .clone()
             .expect("snapshot_frame with no RGB frame");
+        // Only libfreenect2 tells us what it delivered versus what we read.
+        let (rgb_counts, depth_counts) = match &self.inner {
+            Inner::KinectV2 { device, .. } => {
+                let s = device.stream_stats();
+                (
+                    SensorCounts {
+                        delivered: s.rgb_received,
+                        dropped: s.rgb_dropped,
+                    },
+                    SensorCounts {
+                        delivered: s.depth_received,
+                        dropped: s.depth_dropped,
+                    },
+                )
+            }
+            _ => (SensorCounts::default(), SensorCounts::default()),
+        };
         LatestFrame {
             frame_id,
             captured,
@@ -3121,6 +3214,9 @@ impl Capture {
             reg_ms: self.reg_ms,
             filter_us: self.filter_us,
             convert_ms: self.convert_ms,
+            copy_ms: self.copy_ms,
+            sensor_rgb: rgb_counts,
+            sensor_depth: depth_counts,
             anchor_locked: self.anchor_worker.is_locked(),
         }
     }
@@ -3285,6 +3381,19 @@ fn stream_specs(backend: Backend, cam: Option<(u32, u32, u32)>) -> Vec<StreamSpe
     }
 }
 
+/// What the driver delivered and what we let die in its slot, cumulative
+/// since the device opened.
+///
+/// The listener keeps one frame per stream and overwrites it on the next
+/// delivery, so a reader slower than the sensor silently loses the
+/// difference. Counting both halves is the only way a log can tell a slow
+/// Kinect from a slow us — the two look identical in a frame rate.
+#[derive(Clone, Copy, Default)]
+struct SensorCounts {
+    delivered: u64,
+    dropped: u64,
+}
+
 /// Immutable snapshot the capture thread publishes once per new RGB frame,
 /// read by the GL thread through [`CaptureWorker::latest`].
 struct LatestFrame {
@@ -3329,6 +3438,14 @@ struct LatestFrame {
     anchor_ms: f32,
     /// Cost of decoding this frame into packed RGB (ms); webcam only.
     convert_ms: f32,
+    /// Cost of getting this frame out of the driver and into the shape the
+    /// pose model reads: the poll copy plus the colour conversion (ms).
+    /// Kinect v2 only — the other backends hand over a ready buffer.
+    copy_ms: f32,
+    /// Sensor-side frame accounting for this instant. Kinect v2 only; zeroed
+    /// elsewhere, where the capture counters already are the sensor rate.
+    sensor_rgb: SensorCounts,
+    sensor_depth: SensorCounts,
     /// Cost of the v2 depth-to-colour alignment for this frame (ms); `0.0`
     /// when it isn't running.
     reg_ms: f32,
@@ -4134,10 +4251,10 @@ impl Capture {
     /// Non-blocking check for whether the RGB stream has produced a frame yet.
     /// Consumes that frame (the poll loop will get the next one) — used only to
     /// confirm the stream is alive right after opening.
-    fn poll_first_rgb(&self) -> bool {
-        match &self.inner {
+    fn poll_first_rgb(&mut self) -> bool {
+        match &mut self.inner {
             Inner::KinectV1 { device, .. } => device.poll_rgb().is_some(),
-            Inner::KinectV2 { device, .. } => device.poll_rgb().is_some(),
+            Inner::KinectV2 { device, .. } => device.poll_rgb_into(&mut self.v2_rgb),
             Inner::Webcam { camera } => camera.poll_rgb().is_some(),
         }
     }
@@ -4146,7 +4263,6 @@ impl Capture {
     /// Kinects, reopen the SDL device for the webcam. Returns the failure
     /// reason if the restart itself errors.
     fn bounce_stream(&mut self) -> Result<(), String> {
-        let backend = self.backend;
         match &mut self.inner {
             Inner::KinectV1 { device, .. } => {
                 device.stop().map_err(|e| format!("v1 stop: {e}"))?;
@@ -4160,14 +4276,9 @@ impl Capture {
                     .start_streams(true, true)
                     .map_err(|e| format!("v2 start: {e}"))
             }
-            Inner::Webcam { camera } => {
-                let id = match backend {
-                    Backend::Webcam(i) => i,
-                    _ => 1,
-                };
-                *camera = webcam::Camera::open(id).map_err(|e| format!("webcam reopen: {e}"))?;
-                Ok(())
-            }
+            // Close-then-open, inside the crate: SDL will not open a device
+            // that is still open, and this call site could not close first.
+            Inner::Webcam { camera } => camera.reopen().map_err(|e| format!("webcam reopen: {e}")),
         }
     }
 }
@@ -4199,55 +4310,95 @@ const BIGDEPTH_W: usize = 1920;
 const BIGDEPTH_H: usize = 1080;
 const BIGDEPTH_ROW_OFFSET: usize = 1;
 
-/// Head pixel from a BlazePose landmark sampled in **colour space**, using the
-/// registration's `bigdepth` map instead of the raw depth grid.
+/// Compare the windowed colour-space projection against the same patch of the
+/// full `bigdepth` plane and log the verdict once.
 ///
-/// This is the accurate path for the Kinect v2: the landmark is already in
-/// colour pixels, `bigdepth` is depth expressed in those same pixels, so no
-/// cross-sensor mapping is needed at all. Deprojection therefore uses the
-/// **colour** intrinsics — passing the IR ones here would reintroduce the very
-/// error the registration removes.
-///
-/// Unmapped pixels come back `+inf` from libfreenect2 (not `0`), so the
-/// validity gate checks `is_finite()` before the range test.
-///
-/// Note the ±8 sampling window is in **colour** pixels here, against ±8
-/// *depth* pixels on the legacy path — the same 17×17 pixel box, but colour
-/// pixels are ~3.7× finer horizontally, so it covers a physically smaller
-/// patch of the subject. That's the point (less background bleeding into the
-/// median), but it does mean fewer contributing readings; if head distance
-/// ever starts dropping out at range, this window is the knob.
-fn head_pixel_from_bigdepth(
-    pose: &blazepose::Pose,
-    bigdepth: &[f32],
-    color: &Intrinsics,
-    min_samples: usize,
-) -> Option<HeadPixel> {
-    if bigdepth.len() < (BIGDEPTH_H + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W || color.fx <= 0.0 {
-        return None;
-    }
-    let (hx, hy) = head_center_xy(pose);
-    let (cx, cy) = (hx as i32, hy as i32);
-    let half = 8i32;
-    let mut samples: Vec<f32> = Vec::new();
-    for dv in -half..=half {
+/// `Registration::depth_window` reimplements libfreenect2's own splat loop
+/// over a 17×17 window instead of 1920×1082; the values are supposed to match
+/// exactly. Nothing but a live Kinect can check that, so the check lives here
+/// and runs on the first frame where both projections happen to be valid.
+fn report_window_match(window: &[f32], bigdepth: &[f32], center: (i32, i32)) {
+    let (cx, cy) = center;
+    let mut compared = 0u32;
+    let mut mismatched = 0u32;
+    let mut worst = 0.0f32;
+    for dv in -HEAD_WINDOW_HALF..=HEAD_WINDOW_HALF {
         let v = cy + dv;
         if v < 0 || v >= BIGDEPTH_H as i32 {
             continue;
         }
-        // Colour row `v` → bigdepth row `v + 1`.
         let row = (v as usize + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W;
-        for du in -half..=half {
+        for du in -HEAD_WINDOW_HALF..=HEAD_WINDOW_HALF {
             let u = cx + du;
             if u < 0 || u >= BIGDEPTH_W as i32 {
                 continue;
             }
-            let z = bigdepth[row + u as usize];
-            if z.is_finite() && z > 0.0 {
-                samples.push(z);
+            let full = bigdepth[row + u as usize];
+            let win = window[((dv + HEAD_WINDOW_HALF) * (2 * HEAD_WINDOW_HALF + 1)
+                + (du + HEAD_WINDOW_HALF)) as usize];
+            compared += 1;
+            if full.is_infinite() && win.is_infinite() {
+                continue;
+            }
+            let d = (full - win).abs();
+            if d > worst {
+                worst = d;
+            }
+            // Both come from the same `min` over the same samples, so equality
+            // is exact; anything else is a real divergence, not rounding.
+            if d != 0.0 {
+                mismatched += 1;
             }
         }
     }
+    if mismatched == 0 {
+        info!(
+            compared,
+            "depth window: matches the full colour-space projection exactly"
+        );
+    } else {
+        warn!(
+            compared,
+            mismatched,
+            worst_mm = worst,
+            "depth window: diverges from the full colour-space projection"
+        );
+    }
+}
+
+/// Half-width of the colour-space depth window sampled around the head, and
+/// the resulting square side. 17×17 colour pixels: wide enough for a stable
+/// median at cabinet distance, small enough that projecting depth into it
+/// costs a fraction of a millisecond.
+const HEAD_WINDOW_HALF: i32 = 8;
+const HEAD_WINDOW_SIDE: usize = (2 * HEAD_WINDOW_HALF + 1) as usize;
+
+/// Head pixel from a BlazePose landmark sampled in **colour space**, from the
+/// depth window `Registration::depth_window` filled around it.
+///
+/// This is the accurate path for the Kinect v2: the landmark is already in
+/// colour pixels and the window holds depth expressed in those same pixels,
+/// so no cross-sensor mapping is needed at all. Deprojection therefore uses
+/// the **colour** intrinsics — passing the IR ones here would reintroduce the
+/// very error the registration removes.
+///
+/// Unmapped pixels come back `+inf` from libfreenect2 (not `0`), so the
+/// validity gate checks `is_finite()` on top of the `> 0` no-reading test.
+fn head_pixel_from_window(
+    pose: &blazepose::Pose,
+    window: &[f32],
+    color: &Intrinsics,
+    min_samples: usize,
+) -> Option<HeadPixel> {
+    if window.len() != HEAD_WINDOW_SIDE * HEAD_WINDOW_SIDE || color.fx <= 0.0 {
+        return None;
+    }
+    let (hx, hy) = head_center_xy(pose);
+    let mut samples: Vec<f32> = window
+        .iter()
+        .copied()
+        .filter(|z| z.is_finite() && *z > 0.0)
+        .collect();
     if samples.len() < min_samples.max(1) {
         return None;
     }
@@ -4431,6 +4582,11 @@ struct Metrics {
     /// Surface→RGB decode cost (ms, EWMA); webcam only. A 1080p MJPG frame is
     /// decoded whole here before the pose model takes a 224x224 square of it.
     convert_ms: f32,
+    /// Poll copy + colour conversion (ms, EWMA); Kinect v2 only. Moving an
+    /// 8.3 MB colour frame out of the driver and rewriting it as 6.2 MB of
+    /// packed RGB is the largest per-frame cost on a modest CPU, and it used
+    /// to be the one thing the budget line did not count.
+    copy_ms: f32,
     /// Per-stage smoothing cost, smoothed like the other per-frame costs.
     median_us: f32,
     euro_us: f32,
@@ -4449,6 +4605,19 @@ struct Metrics {
     /// near the ~60 Hz repaint cap even when `in`/`out` are camera-bound (e.g.
     /// 20 fps webcam). Makes the capture/render decoupling visible.
     render_fps: f32,
+    /// What the sensor delivered over the window and the share of it we let
+    /// die unread, per stream. `None` on backends whose driver cannot report
+    /// it — there the capture rate already *is* the sensor rate.
+    sensor_in_fps: Option<f32>,
+    sensor_ir_fps: Option<f32>,
+    in_drop_pct: Option<f32>,
+    ir_drop_pct: Option<f32>,
+    /// Latest cumulative counters, and the values at the start of the current
+    /// window: the rates above are their difference over `elapsed`.
+    sensor_rgb: SensorCounts,
+    sensor_depth: SensorCounts,
+    sensor_rgb_base: SensorCounts,
+    sensor_depth_base: SensorCounts,
     /// Depth / IR capture rates. Diagnostic only — neither is a display rate.
     /// The Kinect streams them from its **own IR illuminator**, so they hold
     /// ~30 Hz in the dark while the auto-exposed colour stream halves to 15:
@@ -4484,6 +4653,15 @@ impl Metrics {
             median_us: 0.0,
             euro_us: 0.0,
             convert_ms: 0.0,
+            copy_ms: 0.0,
+            sensor_in_fps: None,
+            sensor_ir_fps: None,
+            in_drop_pct: None,
+            ir_drop_pct: None,
+            sensor_rgb: SensorCounts::default(),
+            sensor_depth: SensorCounts::default(),
+            sensor_rgb_base: SensorCounts::default(),
+            sensor_depth_base: SensorCounts::default(),
             anchor_locked: false,
             was_over: false,
             budget_ms: 1000.0 / 30.0,
@@ -4541,6 +4719,21 @@ impl Metrics {
         };
     }
 
+    fn note_copy_ms(&mut self, ms: f32) {
+        self.copy_ms = if ms == 0.0 || self.copy_ms == 0.0 {
+            ms
+        } else {
+            self.copy_ms * 0.8 + ms * 0.2
+        };
+    }
+
+    /// Latest cumulative sensor counters from the capture thread. Differenced
+    /// against the window base in [`Self::tick`] — cumulative in, rates out.
+    fn note_sensor(&mut self, rgb: SensorCounts, depth: SensorCounts) {
+        self.sensor_rgb = rgb;
+        self.sensor_depth = depth;
+    }
+
     fn note_reg_ms(&mut self, ms: f32) {
         self.reg_ms = if ms == 0.0 || self.reg_ms == 0.0 {
             ms
@@ -4590,6 +4783,27 @@ impl Metrics {
         self.ir_frames += n as u32;
     }
 
+    /// What one frame costs the capture thread *in series*: the driver copy
+    /// and colour conversion, the depth-to-colour alignment, and the filters.
+    ///
+    /// The pose model is deliberately absent. It runs on its own thread and
+    /// overlaps the next capture, so charging it to the frame budget both
+    /// over-counted the wall clock and — because nothing counted the copy —
+    /// produced a figure that could not explain the frame rate printed beside
+    /// it. This one can: at 30 Hz, over 33.3 ms here *is* the reason.
+    fn serial_ms(&self) -> f32 {
+        self.copy_ms + self.reg_ms + self.convert_ms + (self.median_us + self.euro_us) / 1000.0
+    }
+
+    /// ` of 30.0 sensor, 67% dropped`, or nothing when the driver does not
+    /// report what it delivered.
+    fn sensor_note(fps: Option<f32>, drop_pct: Option<f32>) -> String {
+        match (fps, drop_pct) {
+            (Some(f), Some(d)) => format!(" of {f:.1} sensor, {d:.0}% dropped"),
+            _ => String::new(),
+        }
+    }
+
     /// Called once per poll: roll the 1 s window (recompute FPS + CPU%) and
     /// log a line every ~2 s so the downloadable log carries the same numbers
     /// as the toolbar.
@@ -4602,6 +4816,22 @@ impl Metrics {
             self.render_fps = self.render_frames as f32 / elapsed;
             self.depth_fps = self.depth_frames as f32 / elapsed;
             self.ir_fps = self.ir_frames as f32 / elapsed;
+            // Cumulative counters differenced over the same window as the
+            // capture rates, so the two are directly comparable: "9.9 of 30"
+            // means the sensor did its job and we read one frame in three.
+            let rate = |now: SensorCounts, base: SensorCounts| {
+                let got = now.delivered.saturating_sub(base.delivered);
+                let lost = now.dropped.saturating_sub(base.dropped);
+                (got > 0).then(|| (got as f32 / elapsed, 100.0 * lost as f32 / got as f32))
+            };
+            let rgb = rate(self.sensor_rgb, self.sensor_rgb_base);
+            let depth = rate(self.sensor_depth, self.sensor_depth_base);
+            self.sensor_in_fps = rgb.map(|(f, _)| f);
+            self.in_drop_pct = rgb.map(|(_, d)| d);
+            self.sensor_ir_fps = depth.map(|(f, _)| f);
+            self.ir_drop_pct = depth.map(|(_, d)| d);
+            self.sensor_rgb_base = self.sensor_rgb;
+            self.sensor_depth_base = self.sensor_depth;
             // sysinfo derives CPU% from the gap between two refreshes, so it
             // needs the previous sample to still be there — hence the long-lived
             // `System`. The 1 s window is comfortably above its 200 ms minimum.
@@ -4626,23 +4856,20 @@ impl Metrics {
         // 5 s in the steady state -- 2 s filled a field log with 868 near
         // identical lines -- but a status flip is logged the moment it
         // happens, so a short stall is never averaged away.
-        let used_now =
-            self.reg_ms + self.head_ms + self.convert_ms + (self.median_us + self.euro_us) / 1000.0;
+        let used_now = self.serial_ms();
         let over_now = used_now > self.budget_ms;
         let flipped = over_now != self.was_over;
         self.was_over = over_now;
         if flipped || now.duration_since(self.last_log).as_secs_f32() >= 5.0 {
-            // Only the per-frame work competes for the frame budget; the fps
-            // readings are outcomes, not costs.
-            let used = self.reg_ms
-                + self.head_ms
-                + self.convert_ms
-                + (self.median_us + self.euro_us) / 1000.0;
+            let used = self.serial_ms();
             let budget = self.budget_ms;
             perf_table::push_perf(perf_table::PerfRow {
                 at: stamp_hms(),
                 cam_fps: self.in_fps,
+                sensor_fps: self.sensor_in_fps,
+                drop_pct: self.in_drop_pct,
                 ir_fps: self.ir_fps,
+                copy_ms: self.copy_ms,
                 align_ms: self.reg_ms,
                 anchor_ms: (!self.anchor_locked).then_some(self.anchor_ms),
                 head_ms: self.head_ms,
@@ -4660,15 +4887,19 @@ impl Metrics {
                 // ASCII only: a `->` and not an arrow glyph, because Windows
                 // tools open this file as ANSI and turn UTF-8 arrows into
                 // mojibake.
-                "perf IN(cam {:.1} fps | ir+depth {:.1} fps), \
+                "perf IN(cam {:.1} fps{} | ir+depth {:.1} fps{}), \
+                 COPY(frame {:.1} ms), \
                  MAP(align {}), \
-                 AI(anchor {} | head {:.1} ms), \
+                 AI(anchor {} | head {:.1} ms, own thread), \
                  FILTER(median {:.0} us | 1euro {:.0} us), \
                  OUT(image {:.1} fps | render {:.1} fps), \
                  SYS(cpu {:.0}% | ram {} MiB) \
                  used {:.1} / {:.1} ms {}",
                 self.in_fps,
+                Self::sensor_note(self.sensor_in_fps, self.in_drop_pct),
                 self.ir_fps,
+                Self::sensor_note(self.sensor_ir_fps, self.ir_drop_pct),
+                self.copy_ms,
                 if self.reg_ms > 0.0 {
                     format!("{:.1} ms", self.reg_ms)
                 } else {
@@ -4703,8 +4934,18 @@ impl Metrics {
     /// post-mortem only -- the toolbar has far less room than a file.
     fn summary(&self) -> String {
         let mut s = format!("cam {:.0}", self.in_fps);
+        // The sensor rate only earns toolbar room when we are losing frames:
+        // "cam 10 of 30" is the whole diagnosis, and at 0% it is noise.
+        if let (Some(sensor), Some(drop)) = (self.sensor_in_fps, self.in_drop_pct)
+            && drop >= 1.0
+        {
+            s.push_str(&format!(" of {sensor:.0}, {drop:.0}% dropped"));
+        }
         if self.ir_fps > 0.0 {
             s.push_str(&format!(" | ir+depth {:.0}", self.ir_fps));
+        }
+        if self.copy_ms > 0.0 {
+            s.push_str(&format!(" · copy {:.0}ms", self.copy_ms));
         }
         if self.reg_ms > 0.0 {
             s.push_str(&format!(" · align {:.0}ms", self.reg_ms));
@@ -4722,8 +4963,7 @@ impl Metrics {
             self.cpu_pct,
             self.ram_mib,
         ));
-        let used =
-            self.reg_ms + self.head_ms + self.convert_ms + (self.median_us + self.euro_us) / 1000.0;
+        let used = self.serial_ms();
         s.push_str(&format!(
             " · {:.1}/{:.1}ms {}",
             used,
@@ -5133,6 +5373,10 @@ impl App {
             active.metrics.note_reg_ms(frame.reg_ms);
             active.metrics.note_filter_us(frame.filter_us);
             active.metrics.note_convert_ms(frame.convert_ms);
+            active.metrics.note_copy_ms(frame.copy_ms);
+            active
+                .metrics
+                .note_sensor(frame.sensor_rgb, frame.sensor_depth);
             active.anchor_locked = frame.anchor_locked;
             if frame.anchor_locked {
                 active.metrics.note_anchor_locked();
@@ -6981,10 +7225,17 @@ fn new_capture(backend: Backend, intrinsics: Intrinsics, inner: Inner) -> Captur
             cx: 0.0,
             cy: 0.0,
         },
+        v2_rgb: freenect2::RgbFrame::default(),
+        v2_ir: freenect2::IrFrame::default(),
+        v2_depth: freenect2::DepthFrame::default(),
+        head_window: Vec::new(),
         bigdepth: Vec::new(),
         rgb_scratch: Vec::new(),
         bigdepth_ok: false,
+        head_window_ok: false,
+        window_checked: false,
         reg_ms: 0.0,
+        copy_ms: 0.0,
         filter_us: FilterUs::default(),
         reg_warned: false,
         selected_stream: StreamKind::Rgb,
@@ -7065,6 +7316,7 @@ fn open_kinect_v2() -> Result<Capture, String> {
         };
         cap.bigdepth = vec![0.0; freenect2::BIGDEPTH_LEN];
         cap.rgb_scratch = vec![0u8; 1920 * 1080 * 4];
+        cap.head_window = vec![f32::INFINITY; HEAD_WINDOW_SIDE * HEAD_WINDOW_SIDE];
         cap.registration = Some(registration);
     } else {
         // Not fatal: the head path falls back to naive depth-grid scaling.
@@ -7174,12 +7426,14 @@ fn open_webcam(index: u32) -> Result<Capture, String> {
 /// `width * height * 3`. ~6 MB for 1920×1080; copy cost is negligible
 /// compared to the detector's ~10 ms inference.
 fn bgrx_to_rgb888(bgrx: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bgrx.len() / 4 * 3);
-    let (chunks, _) = bgrx.as_chunks::<4>();
-    for chunk in chunks {
-        out.push(chunk[2]); // R from BGRX
-        out.push(chunk[1]); // G
-        out.push(chunk[0]); // B
+    let (src, _) = bgrx.as_chunks::<4>();
+    // Sized up front and written through fixed-width chunks rather than
+    // pushed a byte at a time: at 1080p that is 6.2 M pushes a frame, and the
+    // bounds-checked push loop refuses to vectorise.
+    let mut out = vec![0u8; src.len() * 3];
+    let (dst, _) = out.as_chunks_mut::<3>();
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = [s[2], s[1], s[0]]; // R, G, B from B, G, R, X
     }
     out
 }

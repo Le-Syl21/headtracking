@@ -30,12 +30,12 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use freenect2::{BIGDEPTH_LEN, Context, Device, Registration};
+use freenect2::{Context, DepthFrame, Device, IrFrame, Registration, RgbFrame};
 
 use super::pipeline::{
-    BIGDEPTH_H, BIGDEPTH_W, DEPTH_MIN_SAMPLES, HeadPixel, Intrinsics, TrackingStream,
-    autolevel_gray8_raw, bgrx_to_rgb888, gray8_to_rgb888, head_pixel_from_bigdepth,
-    head_pixel_from_pose_depth,
+    DEPTH_MIN_SAMPLES, HEAD_WINDOW_HALF, HeadPixel, Intrinsics, TrackingStream,
+    autolevel_gray8_raw, bgrx_to_rgb888, gray8_to_rgb888, head_center_xy,
+    head_pixel_from_pose_depth, head_pixel_from_window,
 };
 use super::{HeadTracker, Pose};
 
@@ -53,11 +53,14 @@ pub struct KinectV2Backend {
     /// Latest BlazePose fix + the dimensions of the frame it was found in.
     last_pose: Option<blazepose::Pose>,
     pose_src: (u32, u32),
-    /// Scratch for the registration output (colour mode only).
-    bigdepth: Vec<f32>,
-    /// Zeroed BGRX scratch: `Registration::apply` demands a colour buffer,
-    /// but `bigdepth` is computed from depth alone — zeros are fine.
-    rgb_zero: Vec<u8>,
+    /// Reused frame buffers. The v2 colour frame is 8.3 MB and depth/IR
+    /// 868 KB each: allocating them per poll cost more than the copy.
+    depth_buf: DepthFrame,
+    ir_buf: IrFrame,
+    rgb_buf: RgbFrame,
+    /// Colour-space depth around the head only (colour mode) — see
+    /// [`Registration::depth_window`].
+    head_window: Vec<f32>,
     started_at: Instant,
     /// Declared last: released only after the device handle above closes.
     _hwlock: crate::hwlock::HwLock,
@@ -141,8 +144,13 @@ impl KinectV2Backend {
             color_intr,
             last_pose: None,
             pose_src: (0, 0),
-            bigdepth: vec![0.0; BIGDEPTH_LEN],
-            rgb_zero: vec![0u8; BIGDEPTH_W * BIGDEPTH_H * 4],
+            depth_buf: DepthFrame::default(),
+            ir_buf: IrFrame::default(),
+            rgb_buf: RgbFrame::default(),
+            head_window: vec![
+                f32::INFINITY;
+                ((2 * HEAD_WINDOW_HALF + 1) * (2 * HEAD_WINDOW_HALF + 1)) as usize
+            ],
             started_at: Instant::now(),
             _hwlock: hwlock,
         })
@@ -152,16 +160,17 @@ impl KinectV2Backend {
     fn refresh_pose(&mut self) {
         match self.stream {
             TrackingStream::Ir => {
-                if let Some(ir) = self.device.poll_ir() {
+                if self.device.poll_ir_into(&mut self.ir_buf) {
                     // v2 IR is a wide-range f32 intensity; round to u16 and
                     // auto-level, or the untouched high byte is nearly black.
-                    let raw: Vec<u16> = ir.data.iter().map(|&v| v as u16).collect();
+                    let raw: Vec<u16> = self.ir_buf.data.iter().map(|&v| v as u16).collect();
                     let gray = autolevel_gray8_raw(&raw, false);
                     let rgb888 = gray8_to_rgb888(&gray);
-                    match self.blaze.poll(&rgb888, ir.width, ir.height) {
+                    let (w, h) = (self.ir_buf.width, self.ir_buf.height);
+                    match self.blaze.poll(&rgb888, w, h) {
                         Ok(pose) => {
                             if pose.is_some() {
-                                self.pose_src = (ir.width, ir.height);
+                                self.pose_src = (w, h);
                             }
                             self.last_pose = pose;
                         }
@@ -170,12 +179,13 @@ impl KinectV2Backend {
                 }
             }
             TrackingStream::Rgb => {
-                if let Some(rgb) = self.device.poll_rgb() {
-                    let rgb888 = bgrx_to_rgb888(&rgb.data);
-                    match self.blaze.poll(&rgb888, rgb.width, rgb.height) {
+                if self.device.poll_rgb_into(&mut self.rgb_buf) {
+                    let rgb888 = bgrx_to_rgb888(&self.rgb_buf.data);
+                    let (w, h) = (self.rgb_buf.width, self.rgb_buf.height);
+                    match self.blaze.poll(&rgb888, w, h) {
                         Ok(pose) => {
                             if pose.is_some() {
-                                self.pose_src = (rgb.width, rgb.height);
+                                self.pose_src = (w, h);
                             }
                             self.last_pose = pose;
                         }
@@ -186,8 +196,9 @@ impl KinectV2Backend {
         }
     }
 
-    fn head_from_depth(&mut self, depth: &freenect2::DepthFrame) -> Option<HeadPixel> {
+    fn head_from_depth(&mut self) -> Option<HeadPixel> {
         let pose = self.last_pose.as_ref()?;
+        let depth = &self.depth_buf;
         let head = match self.stream {
             // Pose already lives in the depth camera's own grid (IR and
             // depth are the same sensor, pixel aligned) — exact sampling.
@@ -200,13 +211,20 @@ impl KinectV2Backend {
                 DEPTH_MIN_SAMPLES,
             ),
             TrackingStream::Rgb => {
+                // Only the neighbourhood of the head is projected into colour
+                // space — the whole-frame `bigdepth` answered the same
+                // question for two million pixels nobody read.
+                let (hx, hy) = head_center_xy(pose);
+                let center = (hx as i32, hy as i32);
+                let window = &mut self.head_window;
                 let reg_ok = self.registration.as_mut().is_some_and(|reg| {
-                    reg.bigdepth(&self.rgb_zero, &depth.data, &mut self.bigdepth)
+                    reg.depth_window(&depth.data, center, HEAD_WINDOW_HALF, window)
                 });
                 if reg_ok {
-                    head_pixel_from_bigdepth(
+                    head_pixel_from_window(
                         pose,
-                        &self.bigdepth,
+                        &self.head_window,
+                        HEAD_WINDOW_HALF,
                         &self.color_intr,
                         DEPTH_MIN_SAMPLES,
                     )
@@ -238,8 +256,10 @@ impl KinectV2Backend {
 impl HeadTracker for KinectV2Backend {
     fn poll(&mut self) -> Option<Pose> {
         self.refresh_pose();
-        let depth = self.device.poll_depth()?;
-        let head = self.head_from_depth(&depth)?;
+        if !self.device.poll_depth_into(&mut self.depth_buf) {
+            return None;
+        }
+        let head = self.head_from_depth()?;
         Some(Pose {
             position_mm: [head.x_mm, head.y_mm, head.depth_mm],
             timestamp_us: self.started_at.elapsed().as_micros() as u64,
@@ -267,14 +287,26 @@ impl HeadTracker for KinectV2Backend {
             // anchor model was trained on, so it sees the distribution it
             // learned rather than the near-black native IR.
             TrackingStream::Ir => {
-                let ir = self.device.poll_ir()?;
-                let raw: Vec<u16> = ir.data.iter().map(|&v| v as u16).collect();
+                if !self.device.poll_ir_into(&mut self.ir_buf) {
+                    return None;
+                }
+                let raw: Vec<u16> = self.ir_buf.data.iter().map(|&v| v as u16).collect();
                 let gray = autolevel_gray8_raw(&raw, false);
-                Some((ir.width, ir.height, gray8_to_rgb888(&gray)))
+                Some((
+                    self.ir_buf.width,
+                    self.ir_buf.height,
+                    gray8_to_rgb888(&gray),
+                ))
             }
             TrackingStream::Rgb => {
-                let rgb = self.device.poll_rgb()?;
-                Some((rgb.width, rgb.height, bgrx_to_rgb888(&rgb.data)))
+                if !self.device.poll_rgb_into(&mut self.rgb_buf) {
+                    return None;
+                }
+                Some((
+                    self.rgb_buf.width,
+                    self.rgb_buf.height,
+                    bgrx_to_rgb888(&self.rgb_buf.data),
+                ))
             }
         }
     }

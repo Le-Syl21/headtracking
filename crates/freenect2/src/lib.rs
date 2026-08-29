@@ -30,9 +30,14 @@ use parking_lot::Mutex;
 
 use freenect2_sys as sys;
 pub use freenect2_sys::{
-    BIGDEPTH_LEN, ColorCameraParams, DepthFrame, IrCameraParams, IrFrame, RgbFrame,
+    BIGDEPTH_LEN, ColorCameraParams, DepthFrame, IrCameraParams, IrFrame, RgbFrame, StreamStats,
     take_last_log_error,
 };
+
+/// Samples in one Kinect v2 depth or IR frame (512 × 424).
+pub const DEPTH_LEN: usize = 512 * 424;
+/// Bytes in one Kinect v2 colour frame (1920 × 1080, BGRX).
+pub const COLOR_BYTES: usize = 1920 * 1080 * 4;
 
 /// Depth↔color registration model (IR-vs-RGB parallax correction).
 ///
@@ -81,6 +86,43 @@ impl Registration {
             return false;
         }
         sys::register_bigdepth(self.inner.pin_mut(), rgb, depth, out)
+    }
+
+    /// Colour-space depth over a small window instead of the whole frame:
+    /// fills `out` (row-major, `(2*half+1)²` floats) with the same values
+    /// [`Registration::bigdepth`] would have written around colour pixel
+    /// `center`, `+inf` where no depth sample reaches.
+    ///
+    /// Use this whenever the caller only samples a neighbourhood — a head, a
+    /// marker. `bigdepth` costs an 8.3 MB infinity fill, 3.3 M scattered
+    /// min-writes and a 512×424 colour image nobody reads, all to answer a
+    /// question about a few hundred pixels.
+    ///
+    /// `depth` is the raw `512*424` millimetre frame from
+    /// [`Device::poll_depth_into`]; no colour frame is needed at all.
+    pub fn depth_window(
+        &mut self,
+        depth: &[f32],
+        center: (i32, i32),
+        half: i32,
+        out: &mut [f32],
+    ) -> bool {
+        if self.inner.is_null() {
+            return false;
+        }
+        sys::depth_window_min(self.inner.pin_mut(), depth, center.0, center.1, half, out)
+    }
+}
+
+impl Registration {
+    /// Build the model from a recorded pair of intrinsics rather than a live
+    /// device — the same maths, no Kinect on the bus. Exists so the
+    /// depth↔colour projection can be exercised offline.
+    #[must_use]
+    pub fn from_params(ir: IrCameraParams, color: ColorCameraParams) -> Self {
+        Self {
+            inner: sys::new_registration_from_params(ir, color),
+        }
     }
 }
 
@@ -216,56 +258,69 @@ impl Device {
         Ok(())
     }
 
-    /// Read the latest depth frame, if any. Returns `None` if no new sample
-    /// has arrived since the last call.
-    pub fn poll_depth(&self) -> Option<DepthFrame> {
+    /// Copy the latest depth frame into `out`, returning `false` if no new
+    /// sample has arrived since the last call.
+    ///
+    /// The caller owns `out` and reuses it across frames: the shim memcpy's
+    /// its slot straight into `out.data`, so a poll is one copy and — after
+    /// the first frame — no allocation.
+    pub fn poll_depth_into(&self, out: &mut DepthFrame) -> bool {
         let mut guard = self.inner.lock();
-        let mut out = DepthFrame {
-            width: 0,
-            height: 0,
-            timestamp_raw: 0,
-            data: Vec::new(),
-        };
-        if sys::poll_depth(guard.pin_mut(), &mut out) {
-            Some(out)
-        } else {
-            None
+        if out.data.len() != DEPTH_LEN {
+            out.data.resize(DEPTH_LEN, 0.0);
         }
+        let mut meta = sys::FrameMeta::default();
+        if !sys::poll_depth_into(guard.pin_mut(), &mut out.data, &mut meta) {
+            return false;
+        }
+        out.width = meta.width;
+        out.height = meta.height;
+        out.timestamp_raw = meta.timestamp_raw;
+        true
     }
 
-    /// Read the latest IR frame (512×424, f32 intensity ~0..65535), if any.
-    /// Returns `None` if no new sample has arrived since the last call. IR is
+    /// Same for the latest IR frame (512×424, f32 intensity ~0..65535). IR is
     /// produced by the same depth pipeline, so it streams whenever depth does
     /// (see [`Device::start_streams`] with `depth = true`).
-    pub fn poll_ir(&self) -> Option<IrFrame> {
+    pub fn poll_ir_into(&self, out: &mut IrFrame) -> bool {
         let mut guard = self.inner.lock();
-        let mut out = IrFrame {
-            width: 0,
-            height: 0,
-            timestamp_raw: 0,
-            data: Vec::new(),
-        };
-        if sys::poll_ir(guard.pin_mut(), &mut out) {
-            Some(out)
-        } else {
-            None
+        if out.data.len() != DEPTH_LEN {
+            out.data.resize(DEPTH_LEN, 0.0);
         }
+        let mut meta = sys::FrameMeta::default();
+        if !sys::poll_ir_into(guard.pin_mut(), &mut out.data, &mut meta) {
+            return false;
+        }
+        out.width = meta.width;
+        out.height = meta.height;
+        out.timestamp_raw = meta.timestamp_raw;
+        true
     }
 
-    /// Read the latest color frame (BGRX, 1920×1080), if any.
-    pub fn poll_rgb(&self) -> Option<RgbFrame> {
+    /// Same for the latest colour frame (BGRX, 1920×1080 — 8.3 MB).
+    pub fn poll_rgb_into(&self, out: &mut RgbFrame) -> bool {
         let mut guard = self.inner.lock();
-        let mut out = RgbFrame {
-            width: 0,
-            height: 0,
-            timestamp_raw: 0,
-            data: Vec::new(),
-        };
-        if sys::poll_rgb(guard.pin_mut(), &mut out) {
-            Some(out)
-        } else {
-            None
+        if out.data.len() != COLOR_BYTES {
+            out.data.resize(COLOR_BYTES, 0);
         }
+        let mut meta = sys::FrameMeta::default();
+        if !sys::poll_rgb_into(guard.pin_mut(), &mut out.data, &mut meta) {
+            return false;
+        }
+        out.width = meta.width;
+        out.height = meta.height;
+        out.timestamp_raw = meta.timestamp_raw;
+        true
+    }
+
+    /// Frames libfreenect2 delivered, and frames it delivered onto a slot we
+    /// had not read yet. See [`StreamStats`] — the second number is how many
+    /// frames the *application* dropped, which is the only way to tell a slow
+    /// reader from a slow sensor after the fact.
+    #[must_use]
+    pub fn stream_stats(&self) -> StreamStats {
+        let guard = self.inner.lock();
+        sys::stream_stats(&guard)
     }
 
     /// IR camera intrinsics. Valid after [`Device::start`].
@@ -327,4 +382,122 @@ pub enum Error {
     StartFailed,
     #[error("libfreenect2 stop returned false")]
     StopFailed,
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    /// Factory intrinsics off a real Kinect v2 — the values the field log
+    /// printed (`fx=366.25` IR, `fx=1081.37` colour) plus a representative
+    /// depth↔colour polynomial. Nothing here needs a device.
+    fn params() -> (IrCameraParams, ColorCameraParams) {
+        let ir = IrCameraParams {
+            fx: 366.249,
+            fy: 366.249,
+            cx: 256.0,
+            cy: 208.0,
+            k1: 0.0937,
+            k2: -0.2731,
+            k3: 0.0919,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let color = ColorCameraParams {
+            fx: 1081.37,
+            fy: 1081.37,
+            cx: 959.5,
+            cy: 539.5,
+            shift_d: 863.0,
+            shift_m: 52.0,
+            mx_x3y0: 0.000_433,
+            mx_x0y3: 3.1e-5,
+            mx_x2y1: 4.5e-5,
+            mx_x1y2: 0.000_284,
+            mx_x2y0: -0.000_371,
+            mx_x0y2: -3.6e-5,
+            mx_x1y1: 0.000_121,
+            mx_x1y0: 0.6392,
+            mx_x0y1: 0.0017,
+            mx_x0y0: 0.0553,
+            my_x3y0: 3.4e-5,
+            my_x0y3: 0.000_431,
+            my_x2y1: 0.000_282,
+            my_x1y2: 3.9e-5,
+            my_x2y0: 0.0014,
+            my_x0y2: -0.0022,
+            my_x1y1: -0.000_376,
+            my_x1y0: -0.0021,
+            my_x0y1: 0.6386,
+            my_x0y0: -0.0333,
+        };
+        (ir, color)
+    }
+
+    /// A depth frame with structure and dropouts, so the min-per-colour-pixel
+    /// filter actually has something to choose between.
+    fn depth_frame() -> Vec<f32> {
+        (0..DEPTH_LEN)
+            .map(|i| {
+                if i % 17 == 0 {
+                    0.0 // no reading
+                } else {
+                    900.0 + ((i * 7) % 400) as f32
+                }
+            })
+            .collect()
+    }
+
+    /// [`Registration::depth_window`] must return exactly what
+    /// [`Registration::bigdepth`] holds in the same window — it is the same
+    /// splat loop restricted to a neighbourhood, not an approximation of it.
+    ///
+    /// This is the guard on a 6x cut in per-frame cost: the head sampler asks
+    /// for 289 colour pixels, and used to pay for two million.
+    #[test]
+    fn depth_window_matches_bigdepth() {
+        let (ir, color) = params();
+        let mut reg = Registration::from_params(ir, color);
+        let depth = depth_frame();
+
+        let mut big = vec![0.0f32; BIGDEPTH_LEN];
+        let rgb = vec![0u8; COLOR_BYTES];
+        assert!(reg.bigdepth(&rgb, &depth, &mut big), "bigdepth failed");
+
+        let half = 8i32;
+        let side = (2 * half + 1) as usize;
+        let mut window = vec![0.0f32; side * side];
+
+        // Several centres, including one far to the side where the depth
+        // frustum does not reach: there both projections must agree that
+        // there is nothing, which is its own thing worth checking.
+        let mut finite = 0;
+        for center in [(960, 540), (640, 400), (1400, 700), (200, 540)] {
+            assert!(
+                reg.depth_window(&depth, center, half, &mut window),
+                "depth_window failed at {center:?}"
+            );
+            for dv in -half..=half {
+                for du in -half..=half {
+                    let v = center.1 + dv;
+                    let u = center.0 + du;
+                    // bigdepth pads one border row: colour row v is row v + 1.
+                    let full = big[(v + 1) as usize * 1920 + u as usize];
+                    let win = window[((dv + half) * (2 * half + 1) + (du + half)) as usize];
+                    if full.is_finite() {
+                        finite += 1;
+                    }
+                    assert_eq!(
+                        full.to_bits(),
+                        win.to_bits(),
+                        "mismatch at {center:?} + ({du}, {dv})"
+                    );
+                }
+            }
+        }
+        assert!(
+            finite > 0,
+            "every window came back empty — the comparison would pass on nothing"
+        );
+    }
 }

@@ -28,7 +28,14 @@ const CAPACITY: usize = 400;
 pub struct PerfRow {
     pub at: String,
     pub cam_fps: f32,
+    /// What the sensor itself delivered, and the share of it that died unread
+    /// in the driver slot. `None` on backends that cannot report it (Kinect
+    /// v1, webcam), where `cam_fps` already *is* the sensor rate.
+    pub sensor_fps: Option<f32>,
+    pub drop_pct: Option<f32>,
     pub ir_fps: f32,
+    /// Poll copy + colour conversion for one frame.
+    pub copy_ms: f32,
     pub align_ms: f32,
     /// `None` once the anchor is locked: the detector has stopped, so a
     /// duration would be a stale reading rather than a measurement.
@@ -149,7 +156,8 @@ impl<S: tracing::Subscriber> Layer<S> for TableLayer {
 /// over the one-line form the log file uses.
 const GROUPS: &[(&str, &[&str])] = &[
     ("", &["time", "source"]),
-    ("IN (fps)", &["cam", "ir+depth"]),
+    ("IN (fps)", &["cam", "sensor", "drop %", "ir+depth"]),
+    ("COPY (ms)", &["frame"]),
     ("MAP (ms)", &["align"]),
     ("AI (ms)", &["anchor", "head"]),
     ("FILTER (us)", &["median", "1euro"]),
@@ -206,7 +214,10 @@ pub fn ui(ui: &mut egui::Ui) {
                             p.at.clone(),
                             "perf".into(),
                             num(p.cam_fps, 1),
+                            p.sensor_fps.map_or_else(|| "n/a".into(), |v| num(v, 1)),
+                            p.drop_pct.map_or_else(|| "n/a".into(), |v| num(v, 0)),
                             num(p.ir_fps, 1),
+                            num(p.copy_ms, 1),
                             if p.align_ms > 0.0 {
                                 num(p.align_ms, 1)
                             } else {

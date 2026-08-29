@@ -72,49 +72,45 @@ pub const BIGDEPTH_W: usize = 1920;
 pub const BIGDEPTH_H: usize = 1080;
 pub const BIGDEPTH_ROW_OFFSET: usize = 1;
 
-/// Head pixel from a BlazePose landmark sampled in **colour space**, using
-/// the registration's `bigdepth` map instead of the raw depth grid.
+/// Half-width of the square colour-space window sampled around the head:
+/// 17×17 colour pixels, wide enough for a stable median at cabinet distance
+/// and small enough that projecting depth into it is a rounding error.
+pub const HEAD_WINDOW_HALF: i32 = 8;
+
+/// Head pixel from a BlazePose landmark sampled in **colour space**: the
+/// colour-space depth **window** around the head, as filled by
+/// `Registration::depth_window`.
 ///
 /// This is the accurate path for the Kinect v2: the landmark is already in
-/// colour pixels, `bigdepth` is depth expressed in those same pixels, so no
-/// cross-sensor mapping is needed at all. Deprojection therefore uses the
+/// colour pixels and the window is depth expressed in those same pixels, so
+/// no cross-sensor mapping is needed at all. Deprojection therefore uses the
 /// **colour** intrinsics — passing the IR ones here would reintroduce the
 /// very error the registration removes.
 ///
 /// Unmapped pixels come back `+inf` from libfreenect2 (not `0`), so the
 /// validity gate checks `is_finite()` on top of the `> 0` no-reading test.
+///
+/// `window` is row-major `(2*half+1)²`, centred on the pose's own head point,
+/// so the caller must have asked for the window at `head_center_xy(pose)`
+/// rounded down — which is what `depth_window` is given.
 #[must_use]
-pub fn head_pixel_from_bigdepth(
+pub fn head_pixel_from_window(
     pose: &blazepose::Pose,
-    bigdepth: &[f32],
+    window: &[f32],
+    half: i32,
     color: &Intrinsics,
     min_samples: usize,
 ) -> Option<HeadPixel> {
-    if bigdepth.len() < (BIGDEPTH_H + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W || color.fx <= 0.0 {
+    let side = (2 * half + 1).max(0) as usize;
+    if window.len() != side * side || color.fx <= 0.0 {
         return None;
     }
     let (hx, hy) = head_center_xy(pose);
-    let (cx, cy) = (hx as i32, hy as i32);
-    let half = 8i32;
-    let mut samples: Vec<f32> = Vec::new();
-    for dv in -half..=half {
-        let v = cy + dv;
-        if v < 0 || v >= BIGDEPTH_H as i32 {
-            continue;
-        }
-        // Colour row `v` → bigdepth row `v + 1`.
-        let row = (v as usize + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W;
-        for du in -half..=half {
-            let u = cx + du;
-            if u < 0 || u >= BIGDEPTH_W as i32 {
-                continue;
-            }
-            let z = bigdepth[row + u as usize];
-            if z.is_finite() && z > 0.0 {
-                samples.push(z);
-            }
-        }
-    }
+    let mut samples: Vec<f32> = window
+        .iter()
+        .copied()
+        .filter(|z| z.is_finite() && *z > 0.0)
+        .collect();
     if samples.len() < min_samples.max(1) {
         return None;
     }
@@ -287,13 +283,14 @@ pub const DEPTH_MIN_SAMPLES: usize = 16;
 /// libfreenect2's colour stream is BGRX; BlazePose wants RGB888.
 #[must_use]
 pub fn bgrx_to_rgb888(bgrx: &[u8]) -> Vec<u8> {
-    let pixels = bgrx.len() / 4;
-    let mut out = Vec::with_capacity(pixels * 3);
-    let (chunks, _) = bgrx.as_chunks::<4>();
-    for chunk in chunks {
-        out.push(chunk[2]); // R
-        out.push(chunk[1]); // G
-        out.push(chunk[0]); // B
+    let (src, _) = bgrx.as_chunks::<4>();
+    // Sized up front and written through fixed-width chunks rather than
+    // pushed a byte at a time: at 1080p that is 6.2 M pushes a frame, and the
+    // bounds-checked push loop refuses to vectorise.
+    let mut out = vec![0u8; src.len() * 3];
+    let (dst, _) = out.as_chunks_mut::<3>();
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = [s[2], s[1], s[0]]; // R, G, B from B, G, R, X
     }
     out
 }

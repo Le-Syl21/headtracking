@@ -280,7 +280,13 @@ struct MjpgState {
 
 /// Single open webcam streaming RGB frames.
 pub struct Camera {
-    raw: NonNull<sdl_cam::SDL_Camera>,
+    /// `None` only between [`Camera::close`] and the reopen that follows it.
+    /// SDL refuses to open a device that is still open, so a reopen has to be
+    /// able to put the handle down first — see [`Camera::reopen`].
+    raw: Option<NonNull<sdl_cam::SDL_Camera>>,
+    /// The `SDL_CameraID` this was opened from, kept so the device can be
+    /// reopened without the caller having to remember it.
+    id: u32,
     width: u32,
     height: u32,
     mjpg: RefCell<MjpgState>,
@@ -389,11 +395,41 @@ impl Camera {
         info!(id, width, height, format = %fmt.to_string_lossy(), "webcam opened");
 
         Ok(Self {
-            raw,
+            raw: Some(raw),
+            id,
             width,
             height,
             mjpg: RefCell::new(MjpgState::default()),
         })
+    }
+
+    /// Close and reopen the device, keeping the same `Camera`.
+    ///
+    /// SDL refuses to open a camera that is already open, and the obvious
+    /// `*cam = Camera::open(id)?` cannot help: the assignment — and so the
+    /// drop that would have closed the old handle — only happens *after* the
+    /// new open has already run and failed. That is why a stream bounce on a
+    /// webcam came back `Camera already opened` every time and the recovery
+    /// recovered nothing. So: put the handle down first, then open.
+    ///
+    /// On failure the camera is left closed; [`Self::poll_rgb`] then yields
+    /// `None` rather than touching a stale handle.
+    pub fn reopen(&mut self) -> Result<(), Error> {
+        self.close();
+        let fresh = Self::open(self.id)?;
+        // Drops the closed husk (its `raw` is already `None`, so no second
+        // `SDL_CloseCamera`) and takes over the fresh handle.
+        *self = fresh;
+        Ok(())
+    }
+
+    /// Release the SDL handle. Idempotent; leaves the camera inert.
+    fn close(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            // SAFETY: raw came from SDL_OpenCamera, is closed exactly once,
+            // and nothing can reach it afterwards — `raw` is now `None`.
+            unsafe { sdl_cam::SDL_CloseCamera(raw.as_ptr()) };
+        }
     }
 
     pub fn width(&self) -> u32 {
@@ -407,11 +443,12 @@ impl Camera {
     /// Read the latest RGB frame, if any. Returns `None` when no new frame
     /// has arrived since the last call.
     pub fn poll_rgb(&self) -> Option<RgbFrame> {
+        let raw = self.raw?;
         let mut ts_ns: u64 = 0;
         // SAFETY: raw is alive for the duration of self; ts_ns is a valid
         // out-pointer. AcquireCameraFrame returns a Surface we must
         // Release once we're done.
-        let surf_ptr = unsafe { sdl_cam::SDL_AcquireCameraFrame(self.raw.as_ptr(), &mut ts_ns) };
+        let surf_ptr = unsafe { sdl_cam::SDL_AcquireCameraFrame(raw.as_ptr(), &mut ts_ns) };
         if surf_ptr.is_null() {
             return None;
         }
@@ -422,7 +459,7 @@ impl Camera {
         }
         // SAFETY: surf_ptr was just returned by Acquire; we own the
         // matching Release call.
-        unsafe { sdl_cam::SDL_ReleaseCameraFrame(self.raw.as_ptr(), surf_ptr) };
+        unsafe { sdl_cam::SDL_ReleaseCameraFrame(raw.as_ptr(), surf_ptr) };
         frame
     }
 
@@ -562,8 +599,7 @@ impl Drop for Camera {
             // exactly once, here.
             unsafe { turbojpeg_sys::tjDestroy(handle.as_ptr()) };
         }
-        // SAFETY: raw is non-null and we own it.
-        unsafe { sdl_cam::SDL_CloseCamera(self.raw.as_ptr()) };
+        self.close();
     }
 }
 

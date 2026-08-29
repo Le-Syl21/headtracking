@@ -21,9 +21,8 @@
 namespace freenect2_shim {
 
 // Forward declarations of cxx-generated shared types (defined in lib.rs.h).
-struct DepthFrame;
-struct IrFrame;
-struct RgbFrame;
+struct FrameMeta;
+struct StreamStats;
 struct IrCameraParams;
 struct ColorCameraParams;
 struct ColorPixel;
@@ -37,18 +36,40 @@ class IrDepthSink : public libfreenect2::FrameListener {
 public:
     bool onNewFrame(libfreenect2::Frame::Type type, libfreenect2::Frame *frame) override;
 
-    // Drain the latest depth frame (float millimetres) if a new one arrived.
-    bool poll_depth(uint32_t &width, uint32_t &height, uint32_t &timestamp,
-                    std::vector<float> &data);
+    // Copy the latest depth frame (float millimetres) into `dst` if a new one
+    // arrived. `dst` is caller-owned and reused across frames — the slot is
+    // memcpy'd into it, so a poll costs one copy and no allocation.
+    bool poll_depth_into(uint32_t &width, uint32_t &height, uint32_t &timestamp,
+                         float *dst, size_t capacity);
 
-    // Drain the latest IR frame (float intensity, ~0..65535) if a new one
-    // arrived. Same 512×424 geometry as depth.
-    bool poll_ir(uint32_t &width, uint32_t &height, uint32_t &timestamp,
-                 std::vector<float> &data);
+    // Same for the latest IR frame (float intensity, ~0..65535). Same 512×424
+    // geometry as depth.
+    bool poll_ir_into(uint32_t &width, uint32_t &height, uint32_t &timestamp,
+                      float *dst, size_t capacity);
+
+    // Frames libfreenect2 handed us, and frames it handed us while the
+    // previous one was still unread. The second number is the one that
+    // matters: those frames were dropped by *us*, not by the sensor, and
+    // without the pair a slow consumer is indistinguishable from a slow
+    // Kinect in a field log.
+    uint64_t depth_received() const {
+        return depth_received_.load(std::memory_order_relaxed);
+    }
+    uint64_t depth_dropped() const {
+        return depth_dropped_.load(std::memory_order_relaxed);
+    }
+    uint64_t ir_received() const {
+        return ir_received_.load(std::memory_order_relaxed);
+    }
+    uint64_t ir_dropped() const {
+        return ir_dropped_.load(std::memory_order_relaxed);
+    }
 
 private:
     std::mutex depth_mu_;
     std::atomic<bool> depth_new_{false};
+    std::atomic<uint64_t> depth_received_{0};
+    std::atomic<uint64_t> depth_dropped_{0};
     uint32_t depth_w_ = 0;
     uint32_t depth_h_ = 0;
     uint32_t depth_ts_ = 0;
@@ -56,6 +77,8 @@ private:
 
     std::mutex ir_mu_;
     std::atomic<bool> ir_new_{false};
+    std::atomic<uint64_t> ir_received_{0};
+    std::atomic<uint64_t> ir_dropped_{0};
     uint32_t ir_w_ = 0;
     uint32_t ir_h_ = 0;
     uint32_t ir_ts_ = 0;
@@ -66,12 +89,23 @@ class RgbSink : public libfreenect2::FrameListener {
 public:
     bool onNewFrame(libfreenect2::Frame::Type type, libfreenect2::Frame *frame) override;
 
-    bool poll(uint32_t &width, uint32_t &height, uint32_t &timestamp,
-              std::vector<uint8_t> &data);
+    // Copy the latest colour frame into caller-owned `dst` (see
+    // IrDepthSink::poll_depth_into). 8.3 MB a frame: the buffer is reused.
+    bool poll_into(uint32_t &width, uint32_t &height, uint32_t &timestamp,
+                   uint8_t *dst, size_t capacity);
+
+    uint64_t received() const {
+        return received_.load(std::memory_order_relaxed);
+    }
+    uint64_t dropped() const {
+        return dropped_.load(std::memory_order_relaxed);
+    }
 
 private:
     std::mutex mu_;
     std::atomic<bool> has_new_{false};
+    std::atomic<uint64_t> received_{0};
+    std::atomic<uint64_t> dropped_{0};
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t timestamp_ = 0;
@@ -143,16 +177,22 @@ const char *depth_pipeline(const Freenect2Dev &dev);
 bool start_depth(Freenect2Dev &dev);
 bool start_streams(Freenect2Dev &dev, bool rgb, bool depth);
 bool stop_device(Freenect2Dev &dev);
-bool poll_depth(Freenect2Dev &dev, DepthFrame &out);
-bool poll_ir(Freenect2Dev &dev, IrFrame &out);
-bool poll_rgb(Freenect2Dev &dev, RgbFrame &out);
+bool poll_depth_into(Freenect2Dev &dev, rust::Slice<float> out, FrameMeta &meta);
+bool poll_ir_into(Freenect2Dev &dev, rust::Slice<float> out, FrameMeta &meta);
+bool poll_rgb_into(Freenect2Dev &dev, rust::Slice<uint8_t> out, FrameMeta &meta);
+StreamStats stream_stats(const Freenect2Dev &dev);
 IrCameraParams ir_params(const Freenect2Dev &dev);
 ColorCameraParams color_params(const Freenect2Dev &dev);
 std::unique_ptr<Registration> new_registration(const Freenect2Dev &dev);
+std::unique_ptr<Registration> new_registration_from_params(IrCameraParams ir,
+                                                          ColorCameraParams color);
 ColorPixel map_depth_to_color(const Registration &reg, int32_t dx, int32_t dy,
                               float dz);
 bool register_bigdepth(Registration &reg, rust::Slice<const uint8_t> rgb,
                        rust::Slice<const float> depth,
                        rust::Slice<float> bigdepth);
+bool depth_window_min(Registration &reg, rust::Slice<const float> depth,
+                      int32_t center_x, int32_t center_y, int32_t half,
+                      rust::Slice<float> out);
 
 }  // namespace freenect2_shim
