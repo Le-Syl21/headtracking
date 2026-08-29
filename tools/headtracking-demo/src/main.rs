@@ -2445,6 +2445,10 @@ struct App {
     /// as it would look from square-on. Off by default: it is a check, not a
     /// way to watch yourself.
     flatten_view: bool,
+    /// Where the last flattened frame put the lockbar, in fractions of the
+    /// view. Drives the two vertical guides; `None` whenever the flattened
+    /// view is off or the anchor has not locked.
+    flatten_guides: Option<FlattenGuides>,
     /// egui handle to the parallax scene's offscreen colour texture, set
     /// by [`DemoShell::redraw`] each frame the window is on (the FBO lives
     /// with the GL context in `DemoShell`, not here). `None` when off.
@@ -5127,6 +5131,7 @@ impl App {
             switch_state: SwitchState::Idle,
             parallax_enabled: true,
             flatten_view: false,
+            flatten_guides: None,
             parallax_tex: None,
             // Auto-orbit by default: the parallax illusion shows immediately
             // with no camera and no need to move — switch to Live on the cab.
@@ -5477,9 +5482,22 @@ impl App {
                     (img.width() / 2).max(2) as u32,
                     (img.height() / 2).max(2) as u32,
                 );
-                if let Some(h) = anchor::flatten_homography(geom, &intr, dw, dh) {
-                    img = flatten_image(&img, &h, dw as usize, dh as usize);
+                if let Some(flat) = anchor::flatten_homography(geom, &intr, dw, dh) {
+                    img = flatten_image(&img, &flat.dst_to_src, dw as usize, dh as usize);
+                    let norm = |p: (f32, f32)| (p.0 / dw as f32, p.1 / dh as f32);
+                    self.flatten_guides = Some(FlattenGuides {
+                        left: norm(flat.bar_left),
+                        right: norm(flat.bar_right),
+                        // Same defect the 'square' column reports: out of
+                        // square there is a lean here, by the same amount.
+                        lean_deg: anchor::camera_pose(geom, &intr, self.lockbar_width_mm)
+                            .map_or(0.0, |p| p.rect_angle_deg - 90.0),
+                    });
+                } else {
+                    self.flatten_guides = None;
                 }
+            } else {
+                self.flatten_guides = None;
             }
             upload_texture(egui_ctx, &mut active.rgb_texture, img);
             active.metrics.note_output_frame();
@@ -6727,6 +6745,45 @@ impl App {
         ui.add_space(2.0);
     }
 
+    /// Two verticals raised from the ends of the flattened lockbar, plus the
+    /// baseline joining them.
+    ///
+    /// The lockbar lands horizontal by construction, so the rails are the only
+    /// thing left free to be wrong: against a true vertical, a lean of a
+    /// degree is obvious, where against nothing it is not. The reading is
+    /// printed too, because "it looks a bit off" is not a measurement — it is
+    /// the same number the 'square' column carries, minus 90.
+    fn draw_flatten_guides(&self, ui: &egui::Ui, rect: Rect, g: FlattenGuides) {
+        let at = |p: (f32, f32)| {
+            Pos2::new(
+                rect.min.x + p.0 * rect.width(),
+                rect.min.y + p.1 * rect.height(),
+            )
+        };
+        let (l, r) = (at(g.left), at(g.right));
+        let painter = ui.painter().with_clip_rect(rect);
+        let guide = Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 210, 255, 150));
+        for x in [l.x, r.x] {
+            painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], guide);
+        }
+        painter.line_segment([l, r], guide);
+        let (text, colour) = if g.lean_deg.abs() < 0.5 {
+            ("upright".to_string(), Color32::from_rgb(60, 230, 90))
+        } else {
+            (
+                format!("leaning {:+.1}°", g.lean_deg),
+                Color32::from_rgb(0xe8, 0xa0, 0x30),
+            )
+        };
+        painter.text(
+            Pos2::new(rect.min.x + 6.0, rect.min.y + 6.0),
+            egui::Align2::LEFT_TOP,
+            text,
+            egui::FontId::monospace(13.0),
+            colour,
+        );
+    }
+
     /// Camera feed with the lockbar + head overlays, scaled to fit while
     /// keeping the source aspect ratio.
     fn draw_camera_view(&self, ui: &mut egui::Ui) {
@@ -6762,6 +6819,9 @@ impl App {
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
+                if let Some(g) = self.flatten_guides.filter(|_| self.flatten_view) {
+                    self.draw_flatten_guides(ui, rect, g);
+                }
                 // Overlay (skeleton bones + anchor geometry) — unified across
                 // live/capture/headless via `draw_overlay`. Clipped to the camera
                 // rect: off-frame joints and the sidebar→VP extensions must not
@@ -7758,6 +7818,18 @@ fn gray8_to_rgb888(gray: &[u8]) -> Vec<u8> {
 fn rgb888_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
     debug_assert_eq!(data.len(), (width * height * 3) as usize);
     ColorImage::from_rgb([width as usize, height as usize], data)
+}
+
+/// Ends of the lockbar in the flattened view, as fractions of the view's
+/// width and height — so the guides survive the texture being scaled into
+/// whatever panel it lands in.
+#[derive(Clone, Copy)]
+struct FlattenGuides {
+    left: (f32, f32),
+    right: (f32, f32),
+    /// How far the reconstruction is from square, in degrees. Zero means the
+    /// cabinet should stand perfectly upright between the guides.
+    lean_deg: f32,
 }
 
 /// Resample `src` through `h`, a destination-to-source homography, into a

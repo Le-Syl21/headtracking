@@ -714,6 +714,23 @@ fn mat_invert(m: &M3) -> Option<M3> {
     ])
 }
 
+/// The rectified view: the warp, and where it put the one edge whose true
+/// shape is known.
+///
+/// The lockbar lands horizontal by construction, so two verticals raised from
+/// its ends turn "does the cabinet lean?" from a judgement into a reading —
+/// which is the whole point of the picture.
+pub struct Flattened {
+    /// Row-major 3x3 mapping a **destination pixel to a source pixel**, ready
+    /// for an inverse-mapping resampler. The cabinet is laid out with the
+    /// lockbar across the bottom and the playfield running up, filling
+    /// `dst_w` x `dst_h`.
+    pub dst_to_src: M3,
+    /// Ends of the lockbar's screen edge, in destination pixels.
+    pub bar_left: (f32, f32),
+    pub bar_right: (f32, f32),
+}
+
 /// Homography that shows the cabinet **face-on**: the camera image as it
 /// would look from a viewpoint square to the playfield.
 ///
@@ -729,18 +746,15 @@ fn mat_invert(m: &M3) -> Option<M3> {
 /// player, the backbox — smears, because it is being shown from a viewpoint
 /// it was never seen from. That is expected, not a defect.
 ///
-/// Returns the 3x3 matrix, row-major, mapping a **destination pixel to a
-/// source pixel**, ready for an inverse-mapping resampler. The cabinet is
-/// laid out with the lockbar across the bottom and the playfield running up,
-/// filling `dst_w` x `dst_h`. `None` when the plane is unobservable (rails
-/// parallel in the image) or the geometry is degenerate.
+/// `None` when the plane is unobservable (rails parallel in the image) or the
+/// geometry is degenerate.
 #[must_use]
 pub fn flatten_homography(
     geom: &AnchorGeometry,
     intr: &CameraIntrinsics,
     dst_w: u32,
     dst_h: u32,
-) -> Option<M3> {
+) -> Option<Flattened> {
     if dst_w < 2 || dst_h < 2 {
         return None;
     }
@@ -814,7 +828,17 @@ pub fn flatten_homography(
     let ty = f64::from(dst_h) * 0.88 - scale * flip_y * mid.1;
     let fit = [scale, 0.0, tx, 0.0, scale * flip_y, ty, 0.0, 0.0, 1.0];
 
-    mat_invert(&mat_mul(&fit, &h_rot))
+    let place = |p: (f64, f64)| {
+        (
+            (scale * p.0 + tx) as f32,
+            (scale * flip_y * p.1 + ty) as f32,
+        )
+    };
+    Some(Flattened {
+        dst_to_src: mat_invert(&mat_mul(&fit, &h_rot))?,
+        bar_left: place(a),
+        bar_right: place(b),
+    })
 }
 
 #[inline]

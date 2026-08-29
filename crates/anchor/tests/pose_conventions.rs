@@ -479,7 +479,8 @@ fn flattening_puts_the_cabinet_back_in_a_rectangle() {
         cy: H as f32 * 0.5,
     };
     // Destination -> source; invert it to follow known points forward.
-    let inv = anchor::flatten_homography(&geom, &intr, W, H).expect("homography");
+    let flat = anchor::flatten_homography(&geom, &intr, W, H).expect("homography");
+    let inv = flat.dst_to_src;
     let fwd = {
         // 3x3 inverse, same adjugate as the crate's own.
         let m = inv;
@@ -579,5 +580,44 @@ fn a_wrong_focal_visibly_skews_the_flattened_cabinet() {
     assert!(
         anchor::flatten_homography(&geom, &wrong, W, H).is_some(),
         "the view must still build — the point is to SEE the error"
+    );
+}
+
+/// The guides have to sit on the lockbar the warp actually drew, not on where
+/// the fit was assumed to put it.
+#[test]
+fn the_flattened_lockbar_ends_are_where_the_guides_go() {
+    let c = Cam {
+        yaw_deg: -9.0,
+        pitch_deg: 14.0,
+        ..sloped()
+    };
+    let (sl, sr, lp, ls) = c.lines();
+    let geom = geometry_from_lines(sl, sr, lp, ls, W, H).expect("valid line set");
+    let intr = CameraIntrinsics {
+        fx: FX as f32,
+        fy: FX as f32,
+        cx: W as f32 * 0.5,
+        cy: H as f32 * 0.5,
+    };
+    let flat = anchor::flatten_homography(&geom, &intr, W, H).expect("homography");
+
+    // Round-trip: send each reported end back through the warp and it must
+    // land on the lockbar corner it came from.
+    for (end, corner) in [
+        (flat.bar_left, geom.corners[3]),
+        (flat.bar_right, geom.corners[2]),
+    ] {
+        let back = apply(&flat.dst_to_src, f64::from(end.0), f64::from(end.1));
+        assert!(
+            (back.0 - f64::from(corner.0)).abs() < 1.0
+                && (back.1 - f64::from(corner.1)).abs() < 1.0,
+            "guide {end:?} maps back to {back:?}, expected {corner:?}"
+        );
+    }
+    assert!(flat.bar_left.0 < flat.bar_right.0, "left must stay left");
+    assert!(
+        (flat.bar_left.1 - flat.bar_right.1).abs() < 0.5,
+        "the lockbar must land horizontal"
     );
 }
