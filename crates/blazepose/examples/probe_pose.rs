@@ -58,7 +58,10 @@ fn main() {
     let (w, h) = src.dimensions();
     let mut bp = blazepose::BlazePose::new().expect("load");
     let mut img = src.clone();
-    match bp.detect(src.as_raw(), w, h).expect("detect") {
+    match bp
+        .detect(src.as_raw(), w, h, blazepose::PixelLayout::Rgb888)
+        .expect("detect")
+    {
         None => println!("NO POSE"),
         Some(p) => {
             let conns = [

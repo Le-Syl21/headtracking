@@ -1575,11 +1575,11 @@ fn run_headless_capture(cap: CaptureArgs) -> Result<(), String> {
     );
     let active = open_and_settle(cap.backend, cap.wait_secs)?;
 
-    let (w, h, rgb) = active
+    let (w, h, pixels, layout) = active
         .last_rgb_frame
         .as_ref()
         .ok_or_else(|| format!("no RGB frame received in {:.1}s", cap.wait_secs))?;
-    let (w, h, rgb) = (*w, *h, rgb.clone());
+    let (w, h, rgb) = (*w, *h, Arc::new(frame_to_rgb888(pixels, *layout)));
 
     let slug = backend_slug(active.backend);
     let mut meta = capture_meta(
@@ -1689,11 +1689,11 @@ fn run_headless_contribute(cap: CaptureArgs) -> Result<(), String> {
     let (w, h, raw): (u32, u32, Vec<u8>) = match rgb_v1.as_ref() {
         Some(f) => (f.width, f.height, f.data.clone()),
         None => {
-            let (w, h, raw) = active
+            let (w, h, pixels, layout) = active
                 .last_rgb_frame
                 .as_ref()
                 .ok_or_else(|| format!("no RGB frame received in {:.1}s", cap.wait_secs))?;
-            (*w, *h, raw.as_ref().clone())
+            (*w, *h, frame_to_rgb888(pixels, *layout))
         }
     };
 
@@ -2593,7 +2593,7 @@ struct Active {
     /// Latest RGB888 frame (width, height, bytes) — kept so the "Screenshot" /
     /// "Share a capture" buttons can write it without re-grabbing. `Arc` so
     /// copying it out of the published frame is a refcount bump, not a memcpy.
-    last_rgb_frame: Option<(u32, u32, Arc<Vec<u8>>)>,
+    last_rgb_frame: Option<(u32, u32, Arc<Vec<u8>>, FrameLayout)>,
     /// Latest depth frame (width, height, millimetres) — kept for the "Share a
     /// capture" export. `None` for the webcam backend (no depth). `u16` mm (v1
     /// native; v2's `f32` mm rounded on capture). `Arc` for cheap hand-off.
@@ -2687,7 +2687,7 @@ struct Capture {
     last_head: Option<HeadPixel>,
     last_anchor: Option<anchor::AnchorGeometry>,
     last_lockbar: Option<headtracking::calibration::LockbarQuadRgb>,
-    last_rgb_frame: Option<(u32, u32, Arc<Vec<u8>>)>,
+    last_rgb_frame: Option<(u32, u32, Arc<Vec<u8>>, FrameLayout)>,
     last_depth: Option<Arc<(u32, u32, Vec<u16>)>>,
     last_ir: Option<Arc<(u32, u32, Vec<u16>)>>,
     /// Cumulative depth frames grabbed. Diagnostic only — the depth stream runs
@@ -2744,11 +2744,11 @@ struct Capture {
     /// Latest registration cost (ms) and a one-shot flag so a failing or
     /// missing registration warns once instead of every frame.
     reg_ms: f32,
-    /// Time spent moving one frame out of the driver and into the shape the
-    /// pose model reads: the poll copy plus the colour conversion. Measured
-    /// because it is the largest per-frame cost on a modest CPU and used to
-    /// be invisible — the perf line summed the model and the registration,
-    /// and could not explain the frame rate it printed beside them.
+    /// Time spent getting one frame out of the driver and into the shape the
+    /// pose model reads. Measured because it is the largest per-frame cost on
+    /// a modest CPU and used to be invisible — the perf line summed the model
+    /// and the registration, and could not explain the frame rate it printed
+    /// beside them.
     copy_ms: f32,
     /// Per-stage smoothing cost for the latest head.
     filter_us: FilterUs,
@@ -2839,18 +2839,26 @@ impl Capture {
                         let _ = ack.send(());
                     }
                     let (w, h) = (self.v2_rgb.width, self.v2_rgb.height);
-                    let rgb888 = Arc::new(bgrx_to_rgb888(&self.v2_rgb.data));
+                    // Handed on exactly as libfreenect2 delivered it. Taking
+                    // the buffer leaves the poll target empty, so the next
+                    // poll allocates a fresh one and nothing is copied twice:
+                    // the repack into packed RGB used to read 8.3 MB and
+                    // write 6.2 MB per frame, on this thread, so that two
+                    // models could sample a 256-pixel patch and the display
+                    // could convert it a second time into RGBA.
+                    let pixels = Arc::new(std::mem::take(&mut self.v2_rgb.data));
                     if !track_on_ir {
-                        // Poll copy + colour conversion: the two steps that
-                        // move 8.3 MB and 6.2 MB per frame, and the reason a
-                        // 30 Hz sensor used to arrive at 11 fps. Recorded only
-                        // on the stream that feeds the pose model — while
-                        // tracking on IR this conversion runs at 2.5 Hz for
+                        // What the frame costs before anything looks at it:
+                        // one 8.3 MB copy out of the driver slot, and nothing
+                        // else now that the colour repack is gone. Recorded
+                        // only on the stream that feeds the pose model — while
+                        // tracking on IR the colour path runs at 2.5 Hz for
                         // the preview alone, and charging it to every frame
                         // would libel the IR path.
                         self.copy_ms = t_copy.elapsed().as_secs_f32() * 1000.0;
                         got_rgb = true;
-                        self.blaze_worker.submit(Arc::clone(&rgb888), w, h);
+                        self.blaze_worker
+                            .submit(Arc::clone(&pixels), w, h, FrameLayout::Bgrx8888);
                         self.pose_src = (w, h);
                         let pose_out = self.blaze_worker.snapshot();
                         self.last_pose = pose_out.pose;
@@ -2858,7 +2866,7 @@ impl Capture {
                             self.head_ms = pose_out.ms;
                         }
                     }
-                    self.last_rgb_frame = Some((w, h, rgb888));
+                    self.last_rgb_frame = Some((w, h, pixels, FrameLayout::Bgrx8888));
                 }
                 // IR streams on the same listener as depth. Keep the latest for
                 // the capture export; f32 intensity rounds into u16.
@@ -2879,7 +2887,8 @@ impl Capture {
                         // that actually feeds the model here: poll copy plus
                         // the widening and levelling the model reads.
                         self.copy_ms = t_ir.elapsed().as_secs_f32() * 1000.0;
-                        self.blaze_worker.submit(rgb888, ir.width, ir.height);
+                        self.blaze_worker
+                            .submit(rgb888, ir.width, ir.height, FrameLayout::Rgb888);
                         self.pose_src = (ir.width, ir.height);
                         let pose_out = self.blaze_worker.snapshot();
                         self.last_pose = pose_out.pose;
@@ -3043,8 +3052,12 @@ impl Capture {
                         self.ir_frames += 1;
                         self.last_ir_at = Some(Instant::now());
                         let rgb888 = Arc::new(gray8_to_rgb888(&ir.data));
-                        self.blaze_worker
-                            .submit(Arc::clone(&rgb888), ir.width, ir.height);
+                        self.blaze_worker.submit(
+                            Arc::clone(&rgb888),
+                            ir.width,
+                            ir.height,
+                            FrameLayout::Rgb888,
+                        );
                         self.pose_src = (ir.width, ir.height);
                         let pose_out = self.blaze_worker.snapshot();
                         self.last_pose = pose_out.pose;
@@ -3059,21 +3072,27 @@ impl Capture {
                             ir.height,
                             ir.data.iter().map(|&v| u16::from(v)).collect(),
                         )));
-                        self.last_rgb_frame = Some((ir.width, ir.height, rgb888));
+                        self.last_rgb_frame =
+                            Some((ir.width, ir.height, rgb888, FrameLayout::Rgb888));
                     }
                 } else if let Some(rgb) = device.poll_rgb() {
                     got_rgb = true;
                     self.last_rgb_at = Some(Instant::now());
                     let rgb888 = Arc::new(rgb.data);
-                    self.blaze_worker
-                        .submit(Arc::clone(&rgb888), rgb.width, rgb.height);
+                    self.blaze_worker.submit(
+                        Arc::clone(&rgb888),
+                        rgb.width,
+                        rgb.height,
+                        FrameLayout::Rgb888,
+                    );
                     self.pose_src = (rgb.width, rgb.height);
                     let pose_out = self.blaze_worker.snapshot();
                     self.last_pose = pose_out.pose;
                     if pose_out.ms > 0.0 {
                         self.head_ms = pose_out.ms;
                     }
-                    self.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
+                    self.last_rgb_frame =
+                        Some((rgb.width, rgb.height, rgb888, FrameLayout::Rgb888));
                 }
                 if let Some(depth) = device.poll_depth() {
                     self.depth_frames += 1;
@@ -3113,8 +3132,12 @@ impl Capture {
                     self.convert_ms = rgb.convert_ms;
                     self.last_rgb_at = Some(Instant::now());
                     let rgb888 = Arc::new(rgb.data);
-                    self.blaze_worker
-                        .submit(Arc::clone(&rgb888), rgb.width, rgb.height);
+                    self.blaze_worker.submit(
+                        Arc::clone(&rgb888),
+                        rgb.width,
+                        rgb.height,
+                        FrameLayout::Rgb888,
+                    );
                     self.pose_src = (rgb.width, rgb.height);
                     let pose_out = self.blaze_worker.snapshot();
                     self.last_pose = pose_out.pose;
@@ -3137,18 +3160,19 @@ impl Capture {
                         capture_baseline(&mut self.baseline, smoothed);
                         self.last_head = smoothed;
                     }
-                    self.last_rgb_frame = Some((rgb.width, rgb.height, rgb888));
+                    self.last_rgb_frame =
+                        Some((rgb.width, rgb.height, rgb888, FrameLayout::Rgb888));
                 }
             }
         }
         // Anchor model (RGB): submit the freshest frame until it locks (the
         // worker throttles internally); snapshot the result every call.
         let anchor_frame = self.last_rgb_frame.clone(); // cheap Arc bump
-        if let Some((w, h, buf)) = anchor_frame {
+        if let Some((w, h, buf, layout)) = anchor_frame {
             if got_rgb && !self.anchor_worker.is_locked() {
                 // Arc bump — the warmup window used to full-frame-copy here,
                 // right when the 1280² inference is already at its priciest.
-                self.anchor_worker.submit(Arc::clone(&buf), w, h);
+                self.anchor_worker.submit(Arc::clone(&buf), w, h, layout);
             }
             let a_out = self.anchor_worker.snapshot();
             if let Some(g) = a_out.geom {
@@ -3167,7 +3191,7 @@ impl Capture {
     /// Build an immutable snapshot for the GL thread. Only called right after
     /// `poll_once` returned `true`, so `last_rgb_frame` is `Some`.
     fn snapshot_frame(&self, frame_id: u64, captured: u64) -> LatestFrame {
-        let (w, h, rgb888) = self
+        let (w, h, pixels, layout) = self
             .last_rgb_frame
             .clone()
             .expect("snapshot_frame with no RGB frame");
@@ -3195,7 +3219,8 @@ impl Capture {
             ir_captured: self.ir_frames,
             w,
             h,
-            rgb888,
+            pixels,
+            layout,
             depth: self.last_depth.clone(),
             depth_color: self.depth_color.clone(),
             ir: self.last_ir.clone(),
@@ -3408,7 +3433,11 @@ struct LatestFrame {
     ir_captured: u64,
     w: u32,
     h: u32,
-    rgb888: Arc<Vec<u8>>,
+    /// The frame as the driver produced it — see `layout`. Converting to
+    /// packed RGB on the capture thread bought nothing: the models sample it,
+    /// and the display converts to RGBA anyway.
+    pixels: Arc<Vec<u8>>,
+    layout: FrameLayout,
     depth: Option<Arc<(u32, u32, Vec<u16>)>>,
     /// Kinect v2 only, and only while the depth stream is selected: the depth
     /// map projected into the 1920×1080 colour framing, so the overlay lands on
@@ -3439,8 +3468,8 @@ struct LatestFrame {
     /// Cost of decoding this frame into packed RGB (ms); webcam only.
     convert_ms: f32,
     /// Cost of getting this frame out of the driver and into the shape the
-    /// pose model reads: the poll copy plus the colour conversion (ms).
-    /// Kinect v2 only — the other backends hand over a ready buffer.
+    /// pose model reads (ms). Kinect v2 only — the other backends hand over a
+    /// ready buffer.
     copy_ms: f32,
     /// Sensor-side frame accounting for this instant. Kinect v2 only; zeroed
     /// elsewhere, where the capture counters already are the sensor rate.
@@ -3788,9 +3817,58 @@ fn capture_thread_loop(
 /// frame alive for display, so a submit is a pointer bump instead of a
 /// 6 MB memcpy per frame.
 struct HeadJob {
-    rgb888: Arc<Vec<u8>>,
+    /// The frame exactly as the driver produced it — see `layout`. Not
+    /// repacked into RGB888 on the way here: both models sample a small
+    /// patch, and the repack cost more than everything they do with it.
+    pixels: Arc<Vec<u8>>,
     w: u32,
     h: u32,
+    layout: FrameLayout,
+}
+
+/// Byte layout of a published frame. Mirrors `blazepose::PixelLayout` and
+/// `anchor::PixelLayout`, which are each crate's own input contract; this is
+/// the demo's single value that maps to both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum FrameLayout {
+    /// 3 bytes per pixel, `[R, G, B]`.
+    #[default]
+    Rgb888,
+    /// 4 bytes per pixel, `[B, G, R, X]` — the Kinect v2 colour frame,
+    /// forwarded untouched.
+    Bgrx8888,
+}
+
+impl FrameLayout {
+    const fn pose(self) -> blazepose::PixelLayout {
+        match self {
+            Self::Rgb888 => blazepose::PixelLayout::Rgb888,
+            Self::Bgrx8888 => blazepose::PixelLayout::Bgrx8888,
+        }
+    }
+
+    const fn anchor(self) -> anchor::PixelLayout {
+        match self {
+            Self::Rgb888 => anchor::PixelLayout::Rgb888,
+            Self::Bgrx8888 => anchor::PixelLayout::Bgrx8888,
+        }
+    }
+
+    /// Bytes per pixel.
+    const fn bpp(self) -> usize {
+        match self {
+            Self::Rgb888 => 3,
+            Self::Bgrx8888 => 4,
+        }
+    }
+
+    /// Offsets of R, G and B inside one pixel.
+    const fn channels(self) -> [usize; 3] {
+        match self {
+            Self::Rgb888 => [0, 1, 2],
+            Self::Bgrx8888 => [2, 1, 0],
+        }
+    }
 }
 
 // -------------------------------------------------------------- Pose worker
@@ -3844,8 +3922,13 @@ impl BlazePoseWorker {
         self.interval_ms.store(ms, Ordering::Relaxed);
     }
 
-    fn submit(&self, rgb888: Arc<Vec<u8>>, w: u32, h: u32) {
-        *self.job.0.lock() = Some(HeadJob { rgb888, w, h });
+    fn submit(&self, pixels: Arc<Vec<u8>>, w: u32, h: u32, layout: FrameLayout) {
+        *self.job.0.lock() = Some(HeadJob {
+            pixels,
+            w,
+            h,
+            layout,
+        });
         self.job.1.notify_one();
     }
 
@@ -3897,14 +3980,20 @@ fn blazepose_worker_loop(
             }
             slot.take()
         };
-        let Some(HeadJob { rgb888, w, h }) = job_item else {
+        let Some(HeadJob {
+            pixels,
+            w,
+            h,
+            layout,
+        }) = job_item
+        else {
             continue;
         };
         last_run = Instant::now();
         let t0 = Instant::now();
         // `poll` = MediaPipe detect-once-then-track: skips the detector while a
         // subject is tracked, so a still skeleton no longer trembles.
-        match bp.poll(&rgb888, w, h) {
+        match bp.poll(&pixels, w, h, layout.pose()) {
             Ok(pose) => {
                 let ms = t0.elapsed().as_secs_f32() * 1000.0;
                 let mut o = out.lock();
@@ -3983,8 +4072,13 @@ impl AnchorWorker {
         self.job.1.notify_one();
     }
 
-    fn submit(&self, rgb888: Arc<Vec<u8>>, w: u32, h: u32) {
-        *self.job.0.lock() = Some(HeadJob { rgb888, w, h });
+    fn submit(&self, pixels: Arc<Vec<u8>>, w: u32, h: u32, layout: FrameLayout) {
+        *self.job.0.lock() = Some(HeadJob {
+            pixels,
+            w,
+            h,
+            layout,
+        });
         self.job.1.notify_one();
     }
 
@@ -4056,7 +4150,13 @@ fn anchor_worker_loop(
             }
             slot.take()
         };
-        let Some(HeadJob { rgb888, w, h }) = job_item else {
+        let Some(HeadJob {
+            pixels,
+            w,
+            h,
+            layout,
+        }) = job_item
+        else {
             continue;
         };
         last_run = Instant::now();
@@ -4068,7 +4168,7 @@ fn anchor_worker_loop(
         // for a bounded warmup then FREEZE regardless.
         let start = *warmup_start.get_or_insert_with(Instant::now);
         let t0 = Instant::now();
-        let detn = det.detect(&rgb888, w, h);
+        let detn = det.detect(&pixels, w, h, layout.anchor());
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
         match detn {
             Some(d) => {
@@ -4582,10 +4682,12 @@ struct Metrics {
     /// Surface→RGB decode cost (ms, EWMA); webcam only. A 1080p MJPG frame is
     /// decoded whole here before the pose model takes a 224x224 square of it.
     convert_ms: f32,
-    /// Poll copy + colour conversion (ms, EWMA); Kinect v2 only. Moving an
-    /// 8.3 MB colour frame out of the driver and rewriting it as 6.2 MB of
-    /// packed RGB is the largest per-frame cost on a modest CPU, and it used
-    /// to be the one thing the budget line did not count.
+    /// Cost of getting one frame ready for the model (ms, EWMA); Kinect v2
+    /// only. An 8.3 MB colour frame has to leave the driver's slot before the
+    /// next delivery overwrites it, and that copy is the largest per-frame
+    /// cost left on a modest CPU — it used to be the one thing the budget
+    /// line did not count, on top of a repack into packed RGB that no longer
+    /// happens at all.
     copy_ms: f32,
     /// Per-stage smoothing cost, smoothed like the other per-frame costs.
     median_us: f32,
@@ -4783,8 +4885,9 @@ impl Metrics {
         self.ir_frames += n as u32;
     }
 
-    /// What one frame costs the capture thread *in series*: the driver copy
-    /// and colour conversion, the depth-to-colour alignment, and the filters.
+    /// What one frame costs the capture thread *in series*: getting the frame
+    /// out of the driver, the depth-to-colour alignment, the webcam's own
+    /// decode, and the filters.
     ///
     /// The pose model is deliberately absent. It runs on its own thread and
     /// overlaps the next capture, so charging it to the frame budget both
@@ -5226,8 +5329,8 @@ impl App {
             let (w, h, raw): (u32, u32, Arc<Vec<u8>>) = match rgb_v1.as_ref() {
                 Some(f) => (f.width, f.height, Arc::new(f.data.clone())),
                 None => {
-                    let (w, h, raw) = active.last_rgb_frame.as_ref()?;
-                    (*w, *h, Arc::clone(raw))
+                    let (w, h, pixels, layout) = active.last_rgb_frame.as_ref()?;
+                    (*w, *h, Arc::new(frame_to_rgb888(pixels, *layout)))
                 }
             };
             let det = bake_overlays(
@@ -5363,7 +5466,7 @@ impl App {
             active.baseline = frame.baseline;
             active.last_anchor = frame.anchor;
             active.last_lockbar = frame.lockbar;
-            active.last_rgb_frame = Some((frame.w, frame.h, frame.rgb888.clone()));
+            active.last_rgb_frame = Some((frame.w, frame.h, frame.pixels.clone(), frame.layout));
             active.last_depth = frame.depth.clone();
             active.last_depth_color = frame.depth_color.clone();
             active.last_ir = frame.ir.clone();
@@ -5837,7 +5940,7 @@ impl App {
                 let shot_resp = ui.add_enabled(shot_ready, egui::Button::new("📷 Screenshot"));
                 if shot_resp.clicked()
                     && let Some(active) = self.active.as_ref()
-                    && let Some((w, h, bytes)) = active.last_rgb_frame.as_ref()
+                    && let Some((w, h, pixels, layout)) = active.last_rgb_frame.as_ref()
                 {
                     let slug = backend_slug(active.backend);
                     let meta = capture_meta(
@@ -5856,7 +5959,7 @@ impl App {
                         &slug,
                         *w,
                         *h,
-                        bytes,
+                        &frame_to_rgb888(pixels, *layout),
                         active.last_pose.as_ref(),
                         active.last_anchor.as_ref(),
                         &meta,
@@ -6895,7 +6998,7 @@ impl App {
         if !active.anchor_locked {
             return;
         }
-        let (Some(geom), Some((fw, fh, _))) =
+        let (Some(geom), Some((fw, fh, ..))) =
             (active.last_anchor.as_ref(), active.last_rgb_frame.as_ref())
         else {
             return;
@@ -7468,7 +7571,7 @@ fn stream_color_image(frame: &LatestFrame, want: StreamKind) -> ColorImage {
         // Both colour modes arrive on the same RGB frame; only the size differs.
         StreamKind::Rgb | StreamKind::RgbHigh => {}
     }
-    rgb888_to_color_image(frame.w, frame.h, &frame.rgb888)
+    frame_to_color_image(frame.w, frame.h, &frame.pixels, frame.layout)
 }
 
 /// Google's Turbo colormap, subsampled to 16 control points. Perceptually far
@@ -7538,6 +7641,34 @@ fn gray8_to_rgb888(gray: &[u8]) -> Vec<u8> {
 fn rgb888_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
     debug_assert_eq!(data.len(), (width * height * 3) as usize);
     ColorImage::from_rgb([width as usize, height as usize], data)
+}
+
+/// A published frame as an egui image, reading the driver's layout directly.
+///
+/// The display has to build RGBA either way, so a BGRX frame goes straight to
+/// `Color32` in one pass instead of being repacked to RGB888 first — on the
+/// capture thread, at that — and converted a second time here.
+fn frame_to_color_image(width: u32, height: u32, pixels: &[u8], layout: FrameLayout) -> ColorImage {
+    if layout == FrameLayout::Rgb888 {
+        return rgb888_to_color_image(width, height, pixels);
+    }
+    let (bpp, ch) = (layout.bpp(), layout.channels());
+    let px = (width as usize) * (height as usize);
+    debug_assert_eq!(pixels.len(), px * bpp);
+    let mut out = Vec::with_capacity(px);
+    for p in pixels.chunks_exact(bpp) {
+        out.push(egui::Color32::from_rgb(p[ch[0]], p[ch[1]], p[ch[2]]));
+    }
+    ColorImage::new([width as usize, height as usize], out)
+}
+
+/// Repack a published frame into tightly-packed RGB888 — what the PNG writer
+/// and the overlay baker want. Free of charge when it already is.
+fn frame_to_rgb888(pixels: &[u8], layout: FrameLayout) -> Vec<u8> {
+    match layout {
+        FrameLayout::Rgb888 => pixels.to_vec(),
+        FrameLayout::Bgrx8888 => bgrx_to_rgb888(pixels),
+    }
 }
 
 // ============================================================ Screenshot
@@ -8298,7 +8429,7 @@ fn run_pose_test(
     let (w, h) = img.dimensions();
     let mut bp = blazepose::BlazePose::new().map_err(|e| format!("blazepose: {e}"))?;
     let Some(pose) = bp
-        .detect(img.as_raw(), w, h)
+        .detect(img.as_raw(), w, h, blazepose::PixelLayout::Rgb888)
         .map_err(|e| format!("detect: {e}"))?
     else {
         println!("NO POSE on {raw_path}");
@@ -8362,7 +8493,7 @@ fn run_pose_test(
 
     // --- Anchor model (RGB): cabinet frame → lateral / sidebars→∞ / width ---
     let anchor_geo = match anchor::AnchorDetector::new() {
-        Ok(mut det) => match det.detect(img.as_raw(), w, h) {
+        Ok(mut det) => match det.detect(img.as_raw(), w, h, anchor::PixelLayout::Rgb888) {
             Some(d) => {
                 let geo = d.geometry(w, h);
                 println!(

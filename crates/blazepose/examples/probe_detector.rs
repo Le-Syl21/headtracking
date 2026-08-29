@@ -10,7 +10,10 @@ fn main() {
     let (w, h) = img.dimensions();
     let mut bp = blazepose::BlazePose::new().expect("load models");
     println!("image {w}x{h}");
-    match bp.detect_person(img.as_raw(), w, h, 0.5).expect("run") {
+    match bp
+        .detect_person(img.as_raw(), w, h, blazepose::PixelLayout::Rgb888, 0.5)
+        .expect("run")
+    {
         None => println!("NO PERSON"),
         Some(d) => {
             println!(

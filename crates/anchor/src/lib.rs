@@ -21,7 +21,7 @@
 //! ill-conditioned; the sidebar-to-sidebar width is the reference.
 
 use image::imageops::FilterType;
-use image::{ImageBuffer, Rgb};
+use image::{ImageBuffer, Rgb, Rgba};
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -256,13 +256,20 @@ impl AnchorDetector {
         self.score_threshold = t.clamp(0.0, 1.0);
     }
 
-    /// Run inference on an RGB888 frame. Returns the single best cabinet, or
-    /// `None` if nothing scores above the threshold (or inference fails).
-    pub fn detect(&mut self, rgb888: &[u8], width: u32, height: u32) -> Option<AnchorDetection> {
-        if width == 0 || height == 0 || rgb888.len() != (width as usize) * (height as usize) * 3 {
+    /// Run inference on one camera frame, in whichever layout the driver
+    /// produced it. Returns the single best cabinet, or `None` if nothing
+    /// scores above the threshold (or inference fails).
+    pub fn detect(
+        &mut self,
+        frame: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+    ) -> Option<AnchorDetection> {
+        if width == 0 || height == 0 || frame.len() != layout.byte_len(width, height) {
             return None;
         }
-        let (input, lb) = letterbox_to_chw(rgb888, width, height);
+        let (input, lb) = letterbox_to_chw(frame, width, height, layout);
         let val = Tensor::from_array((vec![1usize, 3, MODEL_SIDE, MODEL_SIDE], input)).ok()?;
         let outputs = match self.model.run(ort::inputs![val]) {
             Ok(o) => o,
@@ -541,30 +548,66 @@ pub fn intersect(a1: Point, a2: Point, b1: Point, b2: Point) -> Option<Point> {
     Some((px, py))
 }
 
-/// Letterbox-resize the RGB image to `MODEL_SIDE²`, return the CHW float32 tensor
+/// How a frame's bytes are laid out.
+///
+/// The model reads a 1280² letterbox, so repacking a 1080p frame into
+/// tightly-packed RGB just to feed it costs more than reading the driver's
+/// own layout. Callers hand over whatever their camera produced.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PixelLayout {
+    /// 3 bytes per pixel, `[R, G, B]`.
+    #[default]
+    Rgb888,
+    /// 4 bytes per pixel, `[B, G, R, X]` — the Kinect v2's native colour frame.
+    Bgrx8888,
+}
+
+impl PixelLayout {
+    /// Expected buffer length for a `width`×`height` frame.
+    #[must_use]
+    pub const fn byte_len(self, width: u32, height: u32) -> usize {
+        let bpp = match self {
+            Self::Rgb888 => 3,
+            Self::Bgrx8888 => 4,
+        };
+        (width as usize) * (height as usize) * bpp
+    }
+}
+
+/// Letterbox-resize the frame to `MODEL_SIDE²`, return the CHW float32 tensor
 /// (0..1, grey-114 padding, Ultralytics default) plus the transform to undo it.
-fn letterbox_to_chw(rgb888: &[u8], width: u32, height: u32) -> (Vec<f32>, Letterbox) {
+fn letterbox_to_chw(
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+) -> (Vec<f32>, Letterbox) {
     let scale = (MODEL_SIDE as f32 / width as f32).min(MODEL_SIDE as f32 / height as f32);
     let new_w = ((width as f32) * scale).round() as u32;
     let new_h = ((height as f32) * scale).round() as u32;
     let pad_x = ((MODEL_SIDE as u32 - new_w) / 2) as f32;
     let pad_y = ((MODEL_SIDE as u32 - new_h) / 2) as f32;
 
-    let buf: ImageBuffer<Rgb<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(width, height, rgb888.to_vec()).expect("size validated by caller");
-    let resized = image::imageops::resize(&buf, new_w, new_h, FilterType::Triangle);
-
     const PAD: f32 = 114.0 / 255.0;
     let plane = MODEL_SIDE * MODEL_SIDE;
     let mut chw = vec![PAD; 3 * plane];
     let (pad_x_i, pad_y_i) = (pad_x as u32, pad_y as u32);
-    for y in 0..new_h {
-        for x in 0..new_w {
-            let p = resized.get_pixel(x, y);
-            let dst = ((y + pad_y_i) as usize) * MODEL_SIDE + (x + pad_x_i) as usize;
-            chw[dst] = f32::from(p[0]) / 255.0;
-            chw[plane + dst] = f32::from(p[1]) / 255.0;
-            chw[2 * plane + dst] = f32::from(p[2]) / 255.0;
+    // The source is *borrowed*: `ImageBuffer` takes any `Deref<Target = [u8]>`
+    // container, and the `to_vec()` this used to do is 6.2 MB of memcpy per
+    // 1080p frame. BGRX rides through as if it were RGBA — resizing is
+    // per-channel, so only the read-out order differs and X is dropped there.
+    match layout {
+        PixelLayout::Rgb888 => {
+            let buf = ImageBuffer::<Rgb<u8>, &[u8]>::from_raw(width, height, frame)
+                .expect("size validated by caller");
+            let resized = image::imageops::resize(&buf, new_w, new_h, FilterType::Triangle);
+            fill_chw(&mut chw, &resized, plane, pad_x_i, pad_y_i, [0, 1, 2]);
+        }
+        PixelLayout::Bgrx8888 => {
+            let buf = ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(width, height, frame)
+                .expect("size validated by caller");
+            let resized = image::imageops::resize(&buf, new_w, new_h, FilterType::Triangle);
+            fill_chw(&mut chw, &resized, plane, pad_x_i, pad_y_i, [2, 1, 0]);
         }
     }
     (
@@ -575,4 +618,76 @@ fn letterbox_to_chw(rgb888: &[u8], width: u32, height: u32) -> (Vec<f32>, Letter
             pad_y,
         },
     )
+}
+
+/// Write the resized frame into the padded CHW planes, normalised to `0..1`,
+/// picking channels in `order`.
+fn fill_chw<P>(
+    chw: &mut [f32],
+    resized: &ImageBuffer<P, Vec<u8>>,
+    plane: usize,
+    pad_x: u32,
+    pad_y: u32,
+    order: [usize; 3],
+) where
+    P: image::Pixel<Subpixel = u8>,
+{
+    for y in 0..resized.height() {
+        for x in 0..resized.width() {
+            let p = resized.get_pixel(x, y).channels();
+            let dst = ((y + pad_y) as usize) * MODEL_SIDE + (x + pad_x) as usize;
+            for (c, &src) in order.iter().enumerate() {
+                chw[c * plane + dst] = f32::from(p[src]) / 255.0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn pair(w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        let mut bgrx = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x * 7 + y * 3) % 256) as u8;
+                let g = ((x * 3 + y * 11) % 256) as u8;
+                let b = ((x * 13 + y * 5) % 256) as u8;
+                rgb.extend_from_slice(&[r, g, b]);
+                // The X byte is deliberately noise: nothing may read it.
+                bgrx.extend_from_slice(&[b, g, r, ((x + y) % 256) as u8]);
+            }
+        }
+        (rgb, bgrx)
+    }
+
+    /// Feeding the driver's own BGRX must produce exactly the tensor the
+    /// repacked RGB888 produced.
+    #[test]
+    fn letterbox_is_layout_independent() {
+        let (w, h) = (160u32, 90u32);
+        let (rgb, bgrx) = pair(w, h);
+        let (from_rgb, lb_rgb) = letterbox_to_chw(&rgb, w, h, PixelLayout::Rgb888);
+        let (from_bgrx, lb_bgrx) = letterbox_to_chw(&bgrx, w, h, PixelLayout::Bgrx8888);
+        assert!(
+            from_rgb
+                .iter()
+                .zip(&from_bgrx)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "letterbox differs between RGB888 and BGRX"
+        );
+        assert_eq!(lb_rgb.scale, lb_bgrx.scale);
+        // Not vacuous: something other than the grey padding got written.
+        assert!(from_rgb.iter().any(|v| (*v - 114.0 / 255.0).abs() > 1e-6));
+    }
+
+    /// A buffer whose length does not match the declared layout is refused
+    /// rather than read past — the check that used to hardcode `* 3`.
+    #[test]
+    fn wrong_length_for_layout_is_rejected() {
+        assert_eq!(PixelLayout::Rgb888.byte_len(4, 4), 48);
+        assert_eq!(PixelLayout::Bgrx8888.byte_len(4, 4), 64);
+    }
 }

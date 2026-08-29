@@ -7,7 +7,7 @@ fn main() {
     let (w, h) = img.dimensions();
 
     let mut det = anchor::AnchorDetector::new().expect("load model");
-    let Some(d) = det.detect(img.as_raw(), w, h) else {
+    let Some(d) = det.detect(img.as_raw(), w, h, anchor::PixelLayout::Rgb888) else {
         println!("no detection");
         return;
     };

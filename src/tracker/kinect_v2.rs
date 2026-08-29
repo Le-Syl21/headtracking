@@ -167,7 +167,10 @@ impl KinectV2Backend {
                     let gray = autolevel_gray8_raw(&raw, false);
                     let rgb888 = gray8_to_rgb888(&gray);
                     let (w, h) = (self.ir_buf.width, self.ir_buf.height);
-                    match self.blaze.poll(&rgb888, w, h) {
+                    match self
+                        .blaze
+                        .poll(&rgb888, w, h, blazepose::PixelLayout::Rgb888)
+                    {
                         Ok(pose) => {
                             if pose.is_some() {
                                 self.pose_src = (w, h);
@@ -180,9 +183,16 @@ impl KinectV2Backend {
             }
             TrackingStream::Rgb => {
                 if self.device.poll_rgb_into(&mut self.rgb_buf) {
-                    let rgb888 = bgrx_to_rgb888(&self.rgb_buf.data);
+                    // Straight to the model in the sensor's own layout: the
+                    // repack into packed RGB moved 8.3 MB in and 6.2 MB out
+                    // per frame so that a 256x256 patch could be sampled.
                     let (w, h) = (self.rgb_buf.width, self.rgb_buf.height);
-                    match self.blaze.poll(&rgb888, w, h) {
+                    match self.blaze.poll(
+                        &self.rgb_buf.data,
+                        w,
+                        h,
+                        blazepose::PixelLayout::Bgrx8888,
+                    ) {
                         Ok(pose) => {
                             if pose.is_some() {
                                 self.pose_src = (w, h);

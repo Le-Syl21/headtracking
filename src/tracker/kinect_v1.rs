@@ -93,7 +93,12 @@ impl KinectV1Backend {
                     // v1 IR is native 8-bit — no levelling needed, just the
                     // 3-channel expansion BlazePose expects.
                     let rgb888 = gray8_to_rgb888(&ir.data);
-                    match self.blaze.poll(&rgb888, ir.width, ir.height) {
+                    match self.blaze.poll(
+                        &rgb888,
+                        ir.width,
+                        ir.height,
+                        blazepose::PixelLayout::Rgb888,
+                    ) {
                         Ok(pose) => {
                             if pose.is_some() {
                                 self.pose_src = (ir.width, ir.height);
@@ -107,7 +112,12 @@ impl KinectV1Backend {
             TrackingStream::Rgb => {
                 if let Some(rgb) = self.device.poll_rgb() {
                     // libfreenect's colour stream is already RGB888.
-                    match self.blaze.poll(&rgb.data, rgb.width, rgb.height) {
+                    match self.blaze.poll(
+                        &rgb.data,
+                        rgb.width,
+                        rgb.height,
+                        blazepose::PixelLayout::Rgb888,
+                    ) {
                         Ok(pose) => {
                             if pose.is_some() {
                                 self.pose_src = (rgb.width, rgb.height);

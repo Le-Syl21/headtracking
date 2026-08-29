@@ -466,7 +466,12 @@ impl WebcamBackend {
     /// distance from the shoulder width, glabella deprojected through the
     /// configured (or nominal) focal.
     fn frame_to_pose(&mut self, frame: &RgbFrame) -> Option<Pose> {
-        let pose = match self.blaze.poll(&frame.data, frame.width, frame.height) {
+        let pose = match self.blaze.poll(
+            &frame.data,
+            frame.width,
+            frame.height,
+            blazepose::PixelLayout::Rgb888,
+        ) {
             Ok(p) => p?,
             Err(e) => {
                 warn!("webcam: blazepose failed: {e}");

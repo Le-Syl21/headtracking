@@ -93,7 +93,39 @@ pub mod idx {
 }
 
 /// Bilinear sample of an RGB888 frame; out-of-bounds → black.
-fn sample_bilinear(rgb: &[u8], w: u32, h: u32, x: f32, y: f32) -> [u8; 3] {
+/// How a frame's bytes are laid out.
+///
+/// The model reads a 224² or 256² patch, so repacking a 1080p frame into
+/// tightly-packed RGB just to feed it costs far more than reading the
+/// driver's own layout with a stride. Callers hand over whatever their
+/// camera produced.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PixelLayout {
+    /// 3 bytes per pixel, `[R, G, B]`.
+    #[default]
+    Rgb888,
+    /// 4 bytes per pixel, `[B, G, R, X]` — the Kinect v2's native colour
+    /// frame, and what most Windows capture APIs hand out.
+    Bgrx8888,
+}
+
+impl PixelLayout {
+    /// Bytes per pixel, and where R, G and B sit inside one.
+    const fn stride(self) -> (usize, [usize; 3]) {
+        match self {
+            Self::Rgb888 => (3, [0, 1, 2]),
+            Self::Bgrx8888 => (4, [2, 1, 0]),
+        }
+    }
+
+    /// Expected buffer length for a `w`×`h` frame.
+    #[must_use]
+    pub const fn byte_len(self, w: u32, h: u32) -> usize {
+        (w as usize) * (h as usize) * self.stride().0
+    }
+}
+
+fn sample_bilinear(frame: &[u8], w: u32, h: u32, x: f32, y: f32, layout: PixelLayout) -> [u8; 3] {
     if x < 0.0 || y < 0.0 || x > (w - 1) as f32 || y > (h - 1) as f32 {
         return [0, 0, 0];
     }
@@ -103,7 +135,10 @@ fn sample_bilinear(rgb: &[u8], w: u32, h: u32, x: f32, y: f32) -> [u8; 3] {
     let y1 = (y0 + 1).min(h - 1);
     let fx = x - x0 as f32;
     let fy = y - y0 as f32;
-    let px = |xx: u32, yy: u32, c: usize| f32::from(rgb[((yy * w + xx) * 3) as usize + c]);
+    let (bpp, ch) = layout.stride();
+    let px = |xx: u32, yy: u32, c: usize| {
+        f32::from(frame[(yy as usize * w as usize + xx as usize) * bpp + ch[c]])
+    };
     let mut out = [0u8; 3];
     for (c, o) in out.iter_mut().enumerate() {
         let top = px(x0, y0, c) * (1.0 - fx) + px(x1, y0, c) * fx;
@@ -186,12 +221,25 @@ type TrackedPose = (Pose, [f32; 2], [f32; 2]);
 /// ROI (centre, square size, rotation) from two alignment points — the exact
 /// MediaPipe pose `AlignmentPointsRects` math: centre = `c`, box = 2·|c→a|·1.25,
 /// rotate so `c→a` points "up" (90°). Shared by the detector path and tracking.
-fn roi_from_points(c: [f32; 2], a: [f32; 2]) -> ([f32; 2], f32, f32) {
+/// The rotated region of interest the landmark model runs in. The three
+/// values are computed together and always travel together.
+#[derive(Clone, Copy)]
+struct Roi {
+    center: [f32; 2],
+    box_size: f32,
+    angle: f32,
+}
+
+fn roi_from_points(c: [f32; 2], a: [f32; 2]) -> Roi {
     let (dx, dy) = (a[0] - c[0], a[1] - c[1]);
     let dist = (dx * dx + dy * dy).sqrt();
     let box_size = 2.0 * dist * 1.25;
     let angle = std::f32::consts::FRAC_PI_2 - (-dy).atan2(dx);
-    (c, box_size, angle)
+    Roi {
+        center: c,
+        box_size,
+        angle,
+    }
 }
 
 // NOTE on smoothing: an earlier landmark-smoothing port was removed because
@@ -303,13 +351,14 @@ impl BlazePose {
     /// NMS-suppressed), with coordinates in the original frame's pixel space.
     pub fn detect_person(
         &mut self,
-        rgb: &[u8],
+        frame: &[u8],
         w: u32,
         h: u32,
+        layout: PixelLayout,
         score_threshold: f32,
     ) -> Result<Option<Detection>, Error> {
         let side = DETECTOR_SIDE as f32;
-        let input = letterbox_nhwc(rgb, w, h, DETECTOR_SIDE);
+        let input = letterbox_nhwc(frame, w, h, DETECTOR_SIDE, layout);
         let val = Tensor::from_array((
             vec![1usize, DETECTOR_SIDE as usize, DETECTOR_SIDE as usize, 3],
             input,
@@ -369,8 +418,14 @@ impl BlazePose {
     /// model, return the 33 body landmarks in **frame pixels** (`None` if no
     /// person). Re-detects on every call — use [`BlazePose::poll`] for a live
     /// stream (it tracks and only re-detects when the subject is lost).
-    pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Option<Pose>, Error> {
-        match self.detect_full(rgb, w, h)? {
+    pub fn detect(
+        &mut self,
+        frame: &[u8],
+        w: u32,
+        h: u32,
+        layout: PixelLayout,
+    ) -> Result<Option<Pose>, Error> {
+        match self.detect_full(frame, w, h, layout)? {
             Some((pose, a0, a1)) => {
                 // One-shot = a fresh acquisition: restart the smoothing
                 // banks (their first sample passes through unchanged).
@@ -391,12 +446,16 @@ impl BlazePose {
     /// still skeleton tremble) and seed the ROI from the previous frame's
     /// auxiliary landmarks; the detector re-runs only when tracking is lost.
     /// Also faster than [`BlazePose::detect`] (no detector while tracking).
-    pub fn poll(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Option<Pose>, Error> {
+    pub fn poll(
+        &mut self,
+        frame: &[u8],
+        w: u32,
+        h: u32,
+        layout: PixelLayout,
+    ) -> Result<Option<Pose>, Error> {
         if let Some((a0, a1)) = self.last_aux {
-            let (center, box_size, angle) = roi_from_points(a0, a1);
-            if let Some((pose, na0, na1)) =
-                self.run_landmarks(rgb, w, h, center, box_size, angle)?
-            {
+            let roi = roi_from_points(a0, a1);
+            if let Some((pose, na0, na1)) = self.run_landmarks(frame, w, h, layout, roi)? {
                 if pose.presence >= TRACK_MIN_PRESENCE {
                     let (pose, na0, na1) = self.smooth_tracked(pose, na0, na1);
                     self.last_aux = Some((na0, na1));
@@ -406,7 +465,7 @@ impl BlazePose {
         }
         // No track yet, or tracking lost → re-acquire with the detector,
         // restarting the smoothing banks on the fresh subject.
-        match self.detect_full(rgb, w, h)? {
+        match self.detect_full(frame, w, h, layout)? {
             Some((pose, a0, a1)) => {
                 self.reset_smoothing();
                 let (pose, a0, a1) = self.smooth_tracked(pose, a0, a1);
@@ -422,14 +481,20 @@ impl BlazePose {
 
     /// Detector → ROI → landmark model. Returns the pose plus the two auxiliary
     /// ROI points (landmarks 33 & 34, frame px) that seed the next frame's ROI.
-    fn detect_full(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Option<TrackedPose>, Error> {
-        let Some(det) = self.detect_person(rgb, w, h, 0.5)? else {
+    fn detect_full(
+        &mut self,
+        frame: &[u8],
+        w: u32,
+        h: u32,
+        layout: PixelLayout,
+    ) -> Result<Option<TrackedPose>, Error> {
+        let Some(det) = self.detect_person(frame, w, h, layout, 0.5)? else {
             return Ok(None);
         };
         // ROI from the detector keypoints (MediaPipe AlignmentPointsRects for
         // pose): centre = kp0 (mid-hip), kp0→kp1 defines scale + rotation.
-        let (center, box_size, angle) = roi_from_points(det.keypoints[0], det.keypoints[1]);
-        self.run_landmarks(rgb, w, h, center, box_size, angle)
+        let roi = roi_from_points(det.keypoints[0], det.keypoints[1]);
+        self.run_landmarks(frame, w, h, layout, roi)
     }
 
     /// Warp the rotated ROI, run the landmark model, decode the 33 body
@@ -438,13 +503,17 @@ impl BlazePose {
     /// model output is too small to hold them.
     fn run_landmarks(
         &mut self,
-        rgb: &[u8],
+        frame: &[u8],
         w: u32,
         h: u32,
-        center: [f32; 2],
-        box_size: f32,
-        angle: f32,
+        layout: PixelLayout,
+        roi: Roi,
     ) -> Result<Option<TrackedPose>, Error> {
+        let Roi {
+            center,
+            box_size,
+            angle,
+        } = roi;
         let (cos, sin) = (angle.cos(), angle.sin());
         let side = LANDMARK_SIDE as f32;
 
@@ -459,7 +528,7 @@ impl BlazePose {
                 let ry = ny * box_size;
                 let fx = center[0] + rx * cos - ry * sin;
                 let fy = center[1] + rx * sin + ry * cos;
-                let [r, g, b] = sample_bilinear(rgb, w, h, fx, fy);
+                let [r, g, b] = sample_bilinear(frame, w, h, fx, fy, layout);
                 input[idx] = f32::from(r) / 127.5 - 1.0;
                 input[idx + 1] = f32::from(g) / 127.5 - 1.0;
                 input[idx + 2] = f32::from(b) / 127.5 - 1.0;
@@ -541,42 +610,13 @@ impl BlazePose {
         }
         Ok(info)
     }
-
-    /// Run the detector on a frame and return every output tensor's
-    /// name/shape/range — a scaffolding probe to pin down the decode target
-    /// (output order, whether scores need a sigmoid, anchor count).
-    pub fn debug_detector(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<RawOutput>, Error> {
-        let input = letterbox_nhwc(rgb, w, h, DETECTOR_SIDE);
-        let val = Tensor::from_array((
-            vec![1usize, DETECTOR_SIDE as usize, DETECTOR_SIDE as usize, 3],
-            input,
-        ))?;
-        let outputs = self.detector.run(ort::inputs![val])?;
-        let mut info = Vec::new();
-        for (name, value) in outputs.iter() {
-            let (shape, data) = value.try_extract_tensor::<f32>()?;
-            let min = data.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let positive = data.iter().filter(|&&x| x > 0.0).count();
-            info.push(RawOutput {
-                name: name.to_string(),
-                shape: shape.to_vec(),
-                min,
-                max,
-                positive,
-            });
-        }
-        Ok(info)
-    }
 }
 
 /// Letterbox `rgb` (w×h, RGB888) into a `side`×`side` NHWC f32 buffer,
 /// normalised to `[-1, 1]`. Pads the shorter side with black to keep aspect
 /// (MediaPipe pads to the longer side, then resizes). Returns row-major
 /// `[side*side*3]`.
-fn letterbox_nhwc(rgb: &[u8], w: u32, h: u32, side: u32) -> Vec<f32> {
-    let img =
-        image::RgbImage::from_raw(w, h, rgb.to_vec()).expect("rgb buffer length must be w*h*3");
+fn letterbox_nhwc(frame: &[u8], w: u32, h: u32, side: u32, layout: PixelLayout) -> Vec<f32> {
     // Fit the frame into `side` preserving aspect, then centre-pad to a square.
     // Same geometry as padding to `long²` first (the decoder undoes it with
     // `long`), but WITHOUT allocating/overlaying/resizing that huge square —
@@ -585,20 +625,113 @@ fn letterbox_nhwc(rgb: &[u8], w: u32, h: u32, side: u32) -> Vec<f32> {
     let scale = side as f32 / long;
     let nw = ((w as f32 * scale).round() as u32).clamp(1, side);
     let nh = ((h as f32 * scale).round() as u32).clamp(1, side);
-    let small = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
     // Black padding (Rgb 0) normalises to -1.0.
     let mut out = vec![-1.0f32; (side * side * 3) as usize];
     let ox = (side - nw) / 2;
     let oy = (side - nh) / 2;
-    for y in 0..nh {
-        let row = ((oy + y) * side + ox) as usize * 3;
-        for x in 0..nw {
-            let p = small.get_pixel(x, y).0;
-            let di = row + x as usize * 3;
-            out[di] = f32::from(p[0]) / 127.5 - 1.0;
-            out[di + 1] = f32::from(p[1]) / 127.5 - 1.0;
-            out[di + 2] = f32::from(p[2]) / 127.5 - 1.0;
+    // The source buffer is *borrowed*, not copied: `ImageBuffer` accepts any
+    // `Deref<Target = [u8]>` container. It used to be `to_vec()`d, which for a
+    // 1080p frame is 6.2 MB of memcpy per call, per model.
+    match layout {
+        PixelLayout::Rgb888 => {
+            let img = image::ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(w, h, frame)
+                .expect("rgb buffer length must be w*h*3");
+            let small =
+                image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+            fill_nhwc(&mut out, &small, side, ox, oy, [0, 1, 2]);
+        }
+        // Resizing is per-channel and channel-agnostic, so BGRX rides through
+        // as if it were RGBA; only the read-out order differs, and X is dropped
+        // there. One wasted channel through the filter buys a whole repack.
+        PixelLayout::Bgrx8888 => {
+            let img = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(w, h, frame)
+                .expect("bgrx buffer length must be w*h*4");
+            let small =
+                image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+            fill_nhwc(&mut out, &small, side, ox, oy, [2, 1, 0]);
         }
     }
     out
+}
+
+/// Write the resized frame into the centre of the padded NHWC buffer,
+/// normalised to `[-1, 1]`, picking channels in `order`.
+fn fill_nhwc<P>(
+    out: &mut [f32],
+    small: &image::ImageBuffer<P, Vec<u8>>,
+    side: u32,
+    ox: u32,
+    oy: u32,
+    order: [usize; 3],
+) where
+    P: image::Pixel<Subpixel = u8>,
+{
+    for y in 0..small.height() {
+        let row = ((oy + y) * side + ox) as usize * 3;
+        for x in 0..small.width() {
+            let p = small.get_pixel(x, y).channels();
+            let di = row + x as usize * 3;
+            for (c, &src) in order.iter().enumerate() {
+                out[di + c] = f32::from(p[src]) / 127.5 - 1.0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// A frame with structure in every channel, in both layouts.
+    fn pair(w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        let mut bgrx = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x * 7 + y * 3) % 256) as u8;
+                let g = ((x * 3 + y * 11) % 256) as u8;
+                let b = ((x * 13 + y * 5) % 256) as u8;
+                rgb.extend_from_slice(&[r, g, b]);
+                // The X byte is deliberately noise: nothing may read it.
+                bgrx.extend_from_slice(&[b, g, r, ((x + y) % 256) as u8]);
+            }
+        }
+        (rgb, bgrx)
+    }
+
+    /// Feeding the driver's own BGRX must produce exactly the tensor the
+    /// repacked RGB888 produced — otherwise skipping the repack would quietly
+    /// change what the model sees.
+    #[test]
+    fn letterbox_is_layout_independent() {
+        let (w, h) = (160u32, 90u32);
+        let (rgb, bgrx) = pair(w, h);
+        let from_rgb = letterbox_nhwc(&rgb, w, h, DETECTOR_SIDE, PixelLayout::Rgb888);
+        let from_bgrx = letterbox_nhwc(&bgrx, w, h, DETECTOR_SIDE, PixelLayout::Bgrx8888);
+        assert_eq!(from_rgb.len(), from_bgrx.len());
+        // Bit-for-bit: the resize is per-channel, so relabelling the channels
+        // cannot move a value.
+        assert!(
+            from_rgb
+                .iter()
+                .zip(&from_bgrx)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "letterbox differs between RGB888 and BGRX"
+        );
+        // Guard against a degenerate all-padding tensor passing vacuously.
+        assert!(from_rgb.iter().any(|v| *v > -1.0));
+    }
+
+    #[test]
+    fn bilinear_sampling_is_layout_independent() {
+        let (w, h) = (64u32, 48u32);
+        let (rgb, bgrx) = pair(w, h);
+        for (x, y) in [(0.0, 0.0), (10.4, 7.6), (31.5, 23.5), (62.9, 46.9)] {
+            assert_eq!(
+                sample_bilinear(&rgb, w, h, x, y, PixelLayout::Rgb888),
+                sample_bilinear(&bgrx, w, h, x, y, PixelLayout::Bgrx8888),
+                "sample differs at ({x}, {y})"
+            );
+        }
+    }
 }

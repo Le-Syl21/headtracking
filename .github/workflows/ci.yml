@@ -1,8 +1,8 @@
 name: CI
 
-# Les gates (fmt/clippy/tests) tournent sur PR et à la demande. Les builds
-# par commit sur `main` vivent dans `release.yml` (job `build` seul, artefacts
-# non signés sur le run Actions) — c'est le canal « dev builds » des testeurs.
+# The gates (fmt/clippy/tests) run on pull requests and on demand. Per-commit
+# builds of `main` live in `release.yml` (the `build` job alone, unsigned
+# artefacts on the Actions run) — that is the testers' "dev builds" channel.
 on:
   pull_request:
   workflow_dispatch:
@@ -25,8 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Actions tierces épinglées au SHA du commit, pas au tag (même raison que
-      # dans `release.yml` : un tag est mutable, un SHA non).
+      # Third-party actions are pinned to a commit SHA, not a tag (same
+      # reason as in `release.yml`: a tag is mutable, a SHA is not).
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           toolchain: stable

@@ -83,7 +83,10 @@ fn run_anchor_calibration(
             thread::sleep(Duration::from_millis(10));
             continue;
         };
-        if let Some(d) = det.detect(&rgb, w, h) {
+        // `poll_calibration_frame` hands over packed RGB whatever the sensor
+        // is: this path is throttled to `ANCHOR_INTERVAL` and only runs while
+        // calibrating, so the repack it costs is not worth a layout to carry.
+        if let Some(d) = det.detect(&rgb, w, h, anchor::PixelLayout::Rgb888) {
             first_hit.get_or_insert_with(Instant::now);
             if best.as_ref().is_none_or(|(s, ..)| d.score > *s) {
                 best = Some((d.score, d, w, h));

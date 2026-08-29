@@ -182,25 +182,26 @@ jobs:
         with:
           submodules: recursive
 
-      # Actions tierces épinglées au SHA du commit, pas au tag : en mars 2026,
-      # 76 des 77 tags de version d'`aquasecurity/trivy-action` ont été
-      # force-pushés vers du code malveillant. Un tag est mutable, un SHA non.
-      # Le commentaire garde la version lisible pour les mises à jour.
+      # Third-party actions are pinned to a commit SHA, not a tag: in March
+      # 2026, 76 of `aquasecurity/trivy-action`'s 77 version tags were
+      # force-pushed to malicious code. A tag is mutable, a SHA is not. The
+      # trailing comment keeps the version readable when bumping.
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      # Garde-fou tag ↔ Cargo.toml. Un tag `vX.Y.Z` doit correspondre à la
-      # version du crate : deux releases voisines sont déjà parties avec un
-      # Cargo.toml en retard d'une version, run au vert et personne pour le
-      # voir. On échoue ici, dans le premier job du tag, donc avant toute
-      # signature et avant la publication de la release. Le suffixe de
-      # pré-release est retiré : `v1.2.3-rc1` vaut Cargo.toml `1.2.3`.
+      # Tag/Cargo.toml guard. A `vX.Y.Z` tag must match the crate version:
+      # two neighbouring releases already shipped with a Cargo.toml one
+      # version behind, green run and nobody to notice. Failing here — the
+      # first job of the tag — means it happens before any signing and before
+      # the release is published. The pre-release suffix is stripped:
+      # `v1.2.3-rc1` matches Cargo.toml `1.2.3`.
       #
-      # La racine est un workspace : on sélectionne explicitement le paquet
-      # `headtracking` (celui que le build ci-dessous produit avec
-      # `-p headtracking`), pas le premier venu de `cargo metadata`.
+      # The root is a workspace, so the `headtracking` package is selected
+      # explicitly (the one the build below produces with `-p headtracking`)
+      # rather than whichever `cargo metadata` lists first. Every package
+      # inherits that version, so this covers the demo too.
       - name: Check tag matches Cargo.toml version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -353,11 +354,11 @@ jobs:
 
       # ---------- Stage + archive ----------
 
-      # Les binaires produits ici ne sont PAS signés : la signature Apple
-      # (comme la signature Windows) se fait plus bas, dans des jobs dédiés
-      # derrière l'environnement `signing`. Les secrets de signature n'étant
-      # lisibles que par un job qui déclare cet environnement, ce job de build
-      # ne peut plus — et ne doit plus — y toucher.
+      # The binaries produced here are NOT signed: Apple signing (like
+      # Windows signing) happens further down, in dedicated jobs behind the
+      # `signing` environment. Signing secrets are only readable by a job that
+      # declares that environment, so this build job can no longer — and must
+      # no longer — touch them.
 
       # On Windows we ship a `setup/` folder with a one-click setup
       # script (downloads UsbDk on demand, blocks PnP for Kinect
@@ -423,11 +424,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Signature + notarisation Apple. Derrière `signing` au même titre que
-  # Windows : une signature Developer ID engage l'identité (et donc la
-  # réputation) du propriétaire, elle ne doit jamais partir sans approbation
-  # explicite. Les secrets APPLE_* vivent dans cet environnement, donc seul un
-  # job qui le déclare peut les lire — d'où ce job séparé du build.
+  # Apple signing + notarisation. Behind `signing` for the same reason as
+  # Windows: a Developer ID signature commits the owner's identity — and so
+  # their reputation — and must never go out without explicit approval. The
+  # APPLE_* secrets live in that environment, so only a job declaring it can
+  # read them, which is why this is separate from the build.
   sign-apple:
     name: Sign macOS binaries
     needs: build
@@ -435,14 +436,13 @@ jobs:
     runs-on: macos-latest
     environment: signing
     steps:
-      # Les noms d'artefacts portent la version du tag ; la matrice n'existe
-      # plus ici, on résout donc le suffixe macOS explicitement. (Un seul :
-      # Apple Silicon. Si macOS Intel revient dans la matrice, ajouter un
-      # second download/upload par NOM — surtout pas un `pattern:` :
-      # `download-artifact` n'ajoute le sous-dossier par artefact que
-      # lorsque le pattern matche PLUSIEURS artefacts, un match unique
-      # s'extrait à la racine du `path` et casse toutes les hypothèses de
-      # chemins. C'est exactement le bug qui a fait échouer le premier run.)
+      # Artifact names carry the tag version; the matrix does not exist here,
+      # so the macOS suffix is resolved explicitly. (Just one: Apple Silicon.
+      # If macOS Intel comes back to the matrix, add a second download/upload
+      # BY NAME — never a `pattern:`. `download-artifact` only adds the
+      # per-artifact subfolder when the pattern matches SEVERAL artifacts; a
+      # single match extracts at the root of `path` and breaks every path
+      # assumption below. That is exactly the bug that failed the first run.)
       - name: Resolve artifact names
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -460,8 +460,8 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
-          # Trousseau éphémère, mot de passe aléatoire : créé ici, utilisé par
-          # codesign, détruit avec le runner. Rien d'autre ne le voit.
+          # Ephemeral keychain with a random password: created here, used by
+          # codesign, destroyed with the runner. Nothing else ever sees it.
           KEYCHAIN_PWD=$(uuidgen)
           KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
 
@@ -481,7 +481,7 @@ jobs:
               -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" >/dev/null
           rm "$P12"
 
-          # Résout l'identité (CN du certificat importé) pour les étapes suivantes.
+          # Resolve the identity (CN of the imported certificate) for the steps below.
           IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
               | grep "Developer ID Application" | head -n1 \
               | sed -E 's/^.*"([^"]+)".*$/\1/')
@@ -492,23 +492,21 @@ jobs:
           echo "Found signing identity: $IDENTITY"
           echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
 
-      # Signe le dylib + le binaire de démo avec l'identité Developer ID
-      # Application. Le runtime durci est obligatoire pour la notarisation
-      # (Apple refuse les soumissions sans). `--timestamp` fige un horodatage
-      # sûr, la signature reste donc valide au-delà de l'expiration du
-      # certificat.
+      # Sign the dylib and the demo binary with the Developer ID Application
+      # identity. The hardened runtime is mandatory for notarisation (Apple
+      # rejects submissions without it). `--timestamp` pins a trusted
+      # timestamp, so the signature stays valid past the certificate's
+      # expiry.
       #
-      # Aucun fichier d'entitlements : les accès caméra + USB de la démo
-      # passent par des API publiques standard qui n'exigent pas de
-      # provisioning profile, et TCC demandera l'autorisation caméra une
-      # fois au premier lancement (puis mémorisera le choix).
+      # No entitlements file: the demo's camera and USB access go through
+      # standard public APIs that need no provisioning profile, and TCC will
+      # ask for camera permission once on first launch (and remember it).
       #
-      # Notarisation : on ditto-zippe les deux binaires ENSEMBLE et on soumet
-      # une seule requête par architecture. Le stapling n'est volontairement
-      # pas fait — `xcrun stapler staple` ne gère que les bundles .app / .pkg
-      # / .dmg, pas les Mach-O bruts. Sans stapling, Gatekeeper interroge
-      # Apple en ligne au premier lancement (sans souci si l'utilisateur a
-      # du réseau).
+      # Notarisation: both binaries are ditto-zipped TOGETHER and submitted as
+      # a single request per architecture. Stapling is deliberately skipped —
+      # `xcrun stapler staple` only handles .app / .pkg / .dmg bundles, not
+      # bare Mach-O files. Without stapling, Gatekeeper asks Apple online on
+      # first launch (fine as long as the user has a network).
       - name: Sign & notarize the macOS binaries
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -517,7 +515,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Soumission + attente, avec timeout et jusqu'à 3 tentatives (5/15/45 min).
+          # Submit and wait, with a timeout and up to 3 attempts (5/15/45 min).
           notarize_once() {
             local zip="$1" timeout="$2"
             local output
@@ -529,8 +527,8 @@ jobs:
             echo "$output"
             local sub_id
             sub_id=$(echo "$output" | awk '/id:/{print $2; exit}')
-            [ -n "$sub_id" ] || { echo "échec: pas d'ID de soumission"; return 1; }
-            echo "soumis (id: $sub_id)"
+            [ -n "$sub_id" ] || { echo "failed: no submission id"; return 1; }
+            echo "submitted (id: $sub_id)"
 
             local deadline=$((SECONDS + timeout))
             while [ $SECONDS -lt $deadline ]; do
@@ -539,10 +537,10 @@ jobs:
               info=$(xcrun notarytool info "$sub_id" \
                 --apple-id "$APPLE_ID" \
                 --password "$APPLE_ID_PASSWORD" \
-                --team-id "$APPLE_TEAM_ID" 2>&1) || { echo "erreur réseau, on repoll…"; continue; }
+                --team-id "$APPLE_TEAM_ID" 2>&1) || { echo "network error, polling again"; continue; }
               local status
               status=$(echo "$info" | awk '/status:/{print $2; exit}')
-              echo "statut: $status"
+              echo "status: $status"
               case "$status" in
                 Accepted) return 0 ;;
                 Invalid|Rejected)
@@ -553,7 +551,7 @@ jobs:
                   return 1 ;;
               esac
             done
-            echo "timeout après $((timeout / 60)) min"
+            echo "timed out after $((timeout / 60)) min"
             return 2
           }
 
@@ -561,10 +559,10 @@ jobs:
             local zip="$1"
             local backoffs=(300 900 2700)
             for i in 0 1 2; do
-              echo "notarisation: tentative $((i + 1))/3"
+              echo "notarisation: attempt $((i + 1))/3"
               notarize_once "$zip" "${backoffs[$i]}" && return 0
               local rc=$?
-              [ $rc -eq 2 ] || return $rc   # ne réessaie que sur timeout
+              [ $rc -eq 2 ] || return $rc   # only a timeout is worth retrying
             done
             return 1
           }
@@ -574,9 +572,9 @@ jobs:
             work="dl/headtracking-macos-aarch64"
 
             # `upload-artifact` round-trips through a zip blob, which doesn't
-            # preserve POSIX executable bits: les fichiers reviennent en 0644.
-            # On les restaure avant de signer, pour que ce qui est notarisé
-            # soit exactement ce qui sera lancé.
+            # preserve POSIX executable bits: files come back as 0644. Restore
+            # them before signing, so what gets notarised is exactly what will
+            # be launched.
             chmod +x "$work/libheadtracking.dylib" "$work/headtracking-demo"
 
             codesign --force --options runtime --timestamp \
@@ -588,27 +586,27 @@ jobs:
             codesign --verify --deep --strict --verbose=2 "$work/libheadtracking.dylib"
             codesign --verify --deep --strict --verbose=2 "$work/headtracking-demo"
 
-            # Une seule soumission par architecture : le zip contient les deux
-            # binaires (plus le reste du dossier staged, qu'Apple ignore).
+            # One submission per architecture: the zip holds both binaries
+            # (plus the rest of the staged folder, which Apple ignores).
             NOTARIZE_ZIP="$RUNNER_TEMP/notarize-$art.zip"
             /usr/bin/ditto -c -k --keepParent "$work" "$NOTARIZE_ZIP"
-            # Échec bloquant. Le soft-fail d'origine se justifiait par
-            # l'instabilité de la notary Apple, mais il n'y avait alors aucune
-            # reprise : le premier 401 fantôme suffisait à publier des binaires
-            # non notarisés, sans que rien ne devienne rouge. Les 3 tentatives
-            # avec backoff (5/15/45 min) couvrent désormais ces cas, et un CI
-            # vert doit vouloir dire « notarisé » — sinon on ne l'apprend que
-            # par un utilisateur bloqué par Gatekeeper.
+            # Hard failure. The original soft-fail was justified by how
+            # flaky Apple's notary service is, but there was no retry then: a
+            # single phantom 401 was enough to publish un-notarised binaries
+            # with nothing turning red. The 3 attempts with backoff
+            # (5/15/45 min) cover that now, and a green CI has to mean
+            # "notarised" — otherwise we only find out from a user stopped by
+            # Gatekeeper.
             if ! notarize "$NOTARIZE_ZIP"; then
-              echo "::error::$art : notarisation échouée après 3 tentatives — release interrompue plutôt que de publier des binaires que Gatekeeper refusera."
+              echo "::error::$art: notarisation failed after 3 attempts — stopping the release rather than publishing binaries Gatekeeper will refuse."
               exit 1
             fi
             rm -f "$NOTARIZE_ZIP"
             echo "::endgroup::"
           done
 
-      # Ré-upload sous le nom d'origine, avec le contenu du dossier tel quel
-      # (mêmes fichiers, même disposition) — seuls les deux Mach-O ont changé.
+      # Re-upload under the original name with the folder contents as-is
+      # (same files, same layout) — only the two Mach-O files changed.
       - name: Re-upload the signed macOS arm64 artifact
         uses: actions/upload-artifact@v7
         with:
@@ -694,25 +692,25 @@ jobs:
           # osslsigncode's provider path, not a newer engine.
           sudo apt-get update -qq
           sudo apt-get install -y osslsigncode libengine-pkcs11-openssl
-          # Vérifie les faits, pas la présence d'une phrase. « Calculated message
-          # digest » apparaît AUSSI quand le digest ne correspond pas, et ne dit
-          # rien de l'horodatage : ce contrôle laissait donc passer une signature
-          # que Windows aurait rejetée, et des binaires non horodatés — donc
-          # invalides dès l'expiration du certificat.
+          # Check the facts, not the presence of a phrase. "Calculated message
+          # digest" appears EVEN WHEN the digest does not match, and says
+          # nothing about the timestamp: the old check therefore passed a
+          # signature Windows would have rejected, and un-timestamped binaries
+          # — invalid the moment the certificate expires.
           verify_signature() {
             local out
             out=$(osslsigncode verify "$1" 2>&1) || true
             echo "$out"
             if echo "$out" | grep -q "MISMATCH"; then
-              echo "::error::$1 : digest Authenticode invalide (Windows le verrait comme falsifié)"
+              echo "::error::$1: invalid Authenticode digest (Windows would see it as tampered with)"
               return 1
             fi
             if echo "$out" | grep -q "Timestamp is not available"; then
-              echo "::error::$1 : signature non horodatée (invalide dès l'expiration du certificat)"
+              echo "::error::$1: signature is not timestamped (invalid as soon as the certificate expires)"
               return 1
             fi
             if ! echo "$out" | grep -q "Signature verification: ok"; then
-              echo "::error::$1 : vérification de signature échouée"
+              echo "::error::$1: signature verification failed"
               return 1
             fi
           }

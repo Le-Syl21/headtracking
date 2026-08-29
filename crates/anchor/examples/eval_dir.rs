@@ -48,7 +48,7 @@ fn main() {
         let (w, h) = img.dimensions();
         let entry = per_backend.entry(backend).or_default();
         entry.1 += 1;
-        match det.detect(img.as_raw(), w, h) {
+        match det.detect(img.as_raw(), w, h, anchor::PixelLayout::Rgb888) {
             Some(d) => {
                 entry.0 += 1;
                 entry.2 += d.score;
