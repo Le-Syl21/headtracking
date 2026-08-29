@@ -6986,15 +6986,18 @@ impl App {
             .color(color),
         )
         .on_hover_text(hover);
-        self.camera_pose_line(ui, active);
+        self.camera_pose_table(ui, active);
     }
 
-    /// One-line camera-pose read-out under the VPX delta: where the camera
-    /// sits relative to the cab, computed by the validated `anchor::camera_pose`
-    /// port from the **locked** anchor geometry + the colour intrinsics + the
-    /// lockbar-width slider. The webcam has no factory focal (nominal guess
-    /// until autocalib), so its line is flagged with "≈".
-    fn camera_pose_line(&self, ui: &mut egui::Ui, active: &Active) {
+    /// Camera-pose read-out under the VPX delta: what the anchor decided,
+    /// beside the two numbers it was given to decide it with.
+    ///
+    /// A table rather than a sentence because the point is a glance: a player
+    /// who knows their camera sits a hand's width left of centre can confirm
+    /// it in one look. Every header carries what its number means and which
+    /// way its sign points — those come from `anchor::PoseField`, next to the
+    /// code that defines them and pinned by `tests/pose_conventions.rs`.
+    fn camera_pose_table(&self, ui: &mut egui::Ui, active: &Active) {
         if !active.anchor_locked {
             return;
         }
@@ -7013,22 +7016,78 @@ impl App {
         let Some(pose) = anchor::camera_pose(geom, &intr, self.lockbar_width_mm) else {
             return;
         };
-        let approx = if matches!(active.backend, Backend::Webcam(_)) {
-            "≈ " // nominal focal — estimate, not a measurement
-        } else {
-            ""
-        };
-        let metres = format!("{:.2}", pose.distance_mm / 1000.0);
+        // A webcam has no factory intrinsics, so its focal is a nominal guess.
+        // Marked on the number itself rather than on the whole line: it is the
+        // one input that is an estimate, and the reader should know which.
+        let nominal_focal = matches!(active.backend, Backend::Webcam(_));
+
+        // Inputs first, then what the anchor made of them. Getting a wrong
+        // answer out of a right method is nearly always one of these two.
+        let mut cells: Vec<(&str, String, &str)> = vec![
+            (
+                "lockbar",
+                format!("{:.0} cm", self.lockbar_width_mm / 10.0),
+                "INPUT. Width across the cabinet rails, and the only thing \
+                 that gives the reconstruction a scale. Wrong here and every \
+                 distance below is wrong by the same ratio. VPX supplies it \
+                 per cabinet; the slider sets it here.",
+            ),
+            (
+                "incline",
+                format!("{:.0}\u{00b0}", self.table_incl_deg),
+                "INPUT. Playfield angle against horizontal, as VPX reports it \
+                 for the table. It does not enter the pose below — it tilts \
+                 how head movement is turned into a point of view.",
+            ),
+            (
+                "focal",
+                format!("{}{fx:.0} px", if nominal_focal { "\u{2248}" } else { "" }),
+                "INPUT. Focal length in pixels. Measured from the sensor on a \
+                 Kinect; on a webcam it is a nominal guess (shown with \u{2248}), \
+                 so read the distances as approximate. 'square' is the check \
+                 on it.",
+            ),
+        ];
+        let report = pose.report();
+        cells.extend(report.iter().map(|f| (f.label, f.value.clone(), f.help)));
+
+        // Out-of-square is the one cell worth interrupting for: it means an
+        // input is wrong, so every number beside it is suspect.
+        let out_of_square = (pose.rect_angle_deg - 90.0).abs() > 3.0;
+        egui::Grid::new("anchor_pose_table")
+            .striped(true)
+            .spacing([12.0, 2.0])
+            .show(ui, |ui| {
+                for (label, _, help) in &cells {
+                    ui.label(RichText::new(*label).small().strong())
+                        .on_hover_text(*help);
+                }
+                ui.end_row();
+                for (label, value, help) in &cells {
+                    let mut t = RichText::new(value).monospace();
+                    if *label == "square" && out_of_square {
+                        t = t.color(Color32::from_rgb(0xc0, 0x39, 0x2b)).strong();
+                    }
+                    ui.label(t).on_hover_text(*help);
+                }
+                ui.end_row();
+            });
+        // The same reading in words, so nobody has to remember which way a
+        // sign points. This is the exact sentence the plugin shows at startup.
         ui.label(
-            RichText::new(format!(
-                "{approx}Camera: {metres} m from the lockbar · {:.0} cm above · offset {:+.0} cm · tilted {:.0}°",
-                pose.height_mm / 10.0,
-                pose.lateral_mm / 10.0,
-                pose.pitch_deg,
-            ))
-            .monospace()
-            .color(Color32::GRAY),
+            RichText::new(pose.describe())
+                .monospace()
+                .color(Color32::GRAY),
         );
+        if out_of_square {
+            ui.label(
+                RichText::new(
+                    "Cabinet does not rebuild square — check the lockbar width \
+                     above, and that the detected outline follows the real rails.",
+                )
+                .color(Color32::from_rgb(0xc0, 0x39, 0x2b)),
+            );
+        }
     }
 }
 

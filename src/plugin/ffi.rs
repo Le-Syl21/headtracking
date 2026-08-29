@@ -482,7 +482,13 @@ fn apply_pose_to_view() {
         && let Some(calib) = game.tracker.calibration()
     {
         game.calib_notified = true;
-        if let Some(note) = camera_pose_note(game.tracker.backend_name(), &calib)
+        // Read the host's own numbers back so the notification can show what
+        // the pose was computed from, not just what came out of it.
+        let mut view = VPXViewSetupDef::default();
+        // SAFETY: getter follows the FFI contract; we own `view`.
+        unsafe { getter(&raw mut view) };
+        if let Some(note) =
+            camera_pose_note(game.tracker.backend_name(), &calib, view.screenInclination)
             && let Some(notify) = vpx.PushNotification
         {
             // SAFETY: NUL-terminated CString kept alive across the call.
@@ -641,6 +647,7 @@ fn startup_note(device: &str, _backend: &str, _cfg: &config::Config) -> Option<s
 fn camera_pose_note(
     backend: &str,
     calib: &crate::tracker::session::CameraCalibration,
+    screen_incl_deg: f32,
 ) -> Option<std::ffi::CString> {
     let cfg = config::current();
     let pref_path = STATE.lock().as_ref()?.pref_path.clone();
@@ -673,23 +680,46 @@ fn camera_pose_note(
         crate::calibration::LOCKBAR_WIDTH_MM
     };
     let pose = anchor::camera_pose(&calib.geometry, &intr, lockbar)?;
-    let approx = if backend.starts_with("webcam") {
-        "~"
-    } else {
-        ""
-    };
+    // The log gets every field with its own name, so a support thread can
+    // read the pose without the reader having to know the struct.
+    let fields = pose
+        .report()
+        .into_iter()
+        .map(|f| format!("{}={}", f.label, f.value))
+        .collect::<Vec<_>>()
+        .join(" ");
     info!(
-        ?pose,
+        %fields,
+        lockbar_mm = lockbar,
+        screen_incl_deg,
+        fx,
         score = calib.score,
         "live anchor calibration: camera pose"
     );
-    let text = format!(
-        "Head tracking: camera {approx}{:.2} m from the lockbar, {:.0} cm above, offset {:+.0} cm, tilted {:.0}\u{b0}",
-        pose.distance_mm / 1000.0,
-        pose.height_mm / 10.0,
-        pose.lateral_mm / 10.0,
-        pose.pitch_deg,
+    // Same sentence the demo prints under its table — one wording, one place
+    // to be wrong. A webcam's focal is a nominal guess, so its distances are
+    // marked approximate.
+    let approx = if backend.starts_with("webcam") {
+        "approx. "
+    } else {
+        ""
+    };
+    let mut text = format!(
+        "Head tracking: {approx}{}\nFrom VPX: lockbar {:.1} cm, playfield incline {:.1}\u{b0}",
+        pose.describe(),
+        lockbar / 10.0,
+        screen_incl_deg,
     );
+    // Out of square means an input is wrong — most often the lockbar width —
+    // and every distance above is then wrong with it. Worth interrupting for,
+    // because nothing else in the game will ever say so.
+    if (pose.rect_angle_deg - 90.0).abs() > 3.0 {
+        text.push_str(&format!(
+            "\nCheck the lockbar width: the cabinet rebuilds at {:.0}\u{b0} instead of 90\u{b0}, \
+             so these distances are off.",
+            pose.rect_angle_deg,
+        ));
+    }
     std::ffi::CString::new(text).ok()
 }
 
@@ -697,6 +727,7 @@ fn camera_pose_note(
 fn camera_pose_note(
     _backend: &str,
     _calib: &crate::tracker::session::CameraCalibration,
+    _screen_incl_deg: f32,
 ) -> Option<std::ffi::CString> {
     None
 }

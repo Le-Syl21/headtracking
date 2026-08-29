@@ -372,6 +372,112 @@ pub struct CameraPose {
     pub rect_angle_deg: f32,
 }
 
+/// One field of a [`CameraPose`] ready to put in front of a player: a short
+/// header, the formatted value, and what the number means — including which
+/// way its sign points.
+///
+/// The wording lives here, beside the code that defines the signs, because a
+/// sign convention explained somewhere else is a sign convention that drifts.
+/// Every claim below is pinned by `tests/pose_conventions.rs`, which places a
+/// camera at a known pose in a synthetic cabinet and checks what comes back.
+pub struct PoseField {
+    /// Column header. Short enough for a table.
+    pub label: &'static str,
+    /// The value, units included.
+    pub value: String,
+    /// What it means, and which way the sign points.
+    pub help: &'static str,
+}
+
+impl CameraPose {
+    /// The pose as labelled fields, in reading order: where the camera is,
+    /// then where it looks, then the self-test.
+    #[must_use]
+    pub fn report(&self) -> Vec<PoseField> {
+        vec![
+            PoseField {
+                label: "distance",
+                value: format!("{:.2} m", self.distance_mm / 1000.0),
+                help: "How far the lockbar is along the direction the camera \
+                       points. Tilting the camera down lengthens it without \
+                       moving the camera, so it is not a distance across the \
+                       floor.",
+            },
+            PoseField {
+                label: "height",
+                value: format!("{:.0} cm", self.height_mm / 10.0),
+                help: "How high the camera sits above the plane of the \
+                       playfield.",
+            },
+            PoseField {
+                label: "lateral",
+                value: format!("{:+.1} cm", self.lateral_mm / 10.0),
+                help: "Sideways offset of the camera from the middle of the \
+                       cabinet, as the camera sees it. Negative is to the \
+                       left: -3.0 cm means the camera sits 3 cm left of \
+                       centre.",
+            },
+            PoseField {
+                label: "pitch",
+                value: format!("{:.0}\u{00b0}", self.pitch_deg),
+                help: "How far the camera looks down at the playfield. 0 = \
+                       looking flat along it, 90 = straight down onto it.",
+            },
+            PoseField {
+                label: "yaw",
+                value: format!("{:+.0}\u{00b0}", self.yaw_deg),
+                help: "How far the camera is aimed off the cabinet's axis. \
+                       Positive is aimed to its own left. A camera parked to \
+                       one side and aimed back at the cabinet shows lateral \
+                       and yaw with opposite signs — that is normal.",
+            },
+            PoseField {
+                label: "roll",
+                value: format!("{:+.0}\u{00b0}", self.roll_deg),
+                help: "How far the camera is rotated about its own axis. \
+                       Positive means the left end of the lockbar looks \
+                       higher in the picture; 0 means it runs level.",
+            },
+            PoseField {
+                label: "square",
+                value: format!("{:.0}\u{00b0}", self.rect_angle_deg),
+                help: "Self-test: rebuilt in 3D, the rails and the lockbar \
+                       should meet at 90\u{00b0}. Far from 90 means the focal \
+                       length or the detected lines are wrong. It says \
+                       nothing when the camera faces the cabinet head-on — \
+                       the check needs some angle to work with.",
+            },
+        ]
+    }
+
+    /// The same reading as one plain sentence, for a place with no room for a
+    /// table — a log line, or the host's startup notification.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let offset = if self.lateral_mm.abs() < 10.0 {
+            "on the centreline".to_string()
+        } else if self.lateral_mm < 0.0 {
+            format!("{:.0} cm left of centre", -self.lateral_mm / 10.0)
+        } else {
+            format!("{:.0} cm right of centre", self.lateral_mm / 10.0)
+        };
+        let aim = if self.yaw_deg.abs() < 1.0 {
+            "straight down the cabinet".to_string()
+        } else if self.yaw_deg > 0.0 {
+            format!("{:.0}\u{00b0} to its left", self.yaw_deg)
+        } else {
+            format!("{:.0}\u{00b0} to its right", -self.yaw_deg)
+        };
+        format!(
+            "camera {offset}, {:.0} cm above the playfield, {:.2} m from the lockbar, \
+             aimed {aim}, looking {:.0}\u{00b0} down",
+            self.height_mm / 10.0,
+            self.distance_mm / 1000.0,
+            self.pitch_deg,
+        )
+    }
+}
+
 // f64 helpers for the pose math — the pixel inputs are f32 but the VP
 // intersections amplify noise, so the intermediate algebra stays in f64
 // (mirrors the Python harness, which is all-f64).
