@@ -710,13 +710,25 @@ fn camera_pose_note(
         lockbar / 10.0,
         screen_incl_deg,
     );
-    // Out of square means an input is wrong — most often the lockbar width —
-    // and every distance above is then wrong with it. Worth interrupting for,
-    // because nothing else in the game will ever say so.
+    // Out of square means the rails and the lockbar did not come back
+    // perpendicular, which only two things can cause: a focal length that does
+    // not belong to the frame the outline was found in, or an outline that
+    // does not follow the real cabinet. Explicitly NOT the lockbar width —
+    // that scales the distances and cannot bend the shape. Worth interrupting
+    // for, because nothing else in the game will ever say so.
     if (pose.rect_angle_deg - 90.0).abs() > 3.0 {
+        // A Kinect reports its own focal, so on those there is only one
+        // suspect left. A webcam's is a nominal guess and stays one.
+        let suspects = if calib.calibration_intrinsics.is_some() {
+            "the outline it found does not follow the real rails"
+        } else {
+            "either the outline it found does not follow the real rails, or \
+             this camera's focal length is not the assumed one"
+        };
         text.push_str(&format!(
-            "\nCheck the lockbar width: the cabinet rebuilds at {:.0}\u{b0} instead of 90\u{b0}, \
-             so these distances are off.",
+            "\nThe cabinet rebuilds at {:.0}\u{b0} instead of 90\u{b0}, so these figures are \
+             off: {suspects}. Recalibrating, or sharing a capture from the demo, is what \
+             fixes it — the lockbar width is not the cause.",
             pose.rect_angle_deg,
         ));
     }

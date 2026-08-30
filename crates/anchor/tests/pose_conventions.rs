@@ -621,3 +621,54 @@ fn the_flattened_lockbar_ends_are_where_the_guides_go() {
         "the lockbar must land horizontal"
     );
 }
+
+/// The lockbar width scales the distances and leaves the shape alone.
+///
+/// Pinned because the plugin's own out-of-square notification once told people
+/// to go and check that setting, which cannot be the cause: `rect_angle_deg`
+/// is the angle between two reconstructed directions, and `lockbar_mm` never
+/// enters it. It only sets how many millimetres a pixel is worth. Sending a
+/// reader to adjust the one input that cannot help is worse than saying
+/// nothing.
+#[test]
+fn the_lockbar_width_scales_distances_without_bending_the_shape() {
+    let c = Cam {
+        yaw_deg: -9.0,
+        pitch_deg: 14.0,
+        pos: (250.0, 760.0, -1270.0),
+        ..sloped()
+    };
+    let (sl, sr, lp, ls) = c.lines();
+    let geom = geometry_from_lines(sl, sr, lp, ls, W, H).expect("valid line set");
+    let intr = CameraIntrinsics {
+        fx: FX as f32,
+        fy: FX as f32,
+        cx: W as f32 * 0.5,
+        cy: H as f32 * 0.5,
+    };
+
+    let truth = camera_pose(&geom, &intr, LOCKBAR_MM).expect("pose");
+    // A cabinet declared 15 % wider than it is: every length grows by 15 %,
+    // and not one angle moves.
+    let wide = camera_pose(&geom, &intr, LOCKBAR_MM * 1.15).expect("pose");
+
+    for (name, a, b) in [
+        ("pitch", truth.pitch_deg, wide.pitch_deg),
+        ("yaw", truth.yaw_deg, wide.yaw_deg),
+        ("roll", truth.roll_deg, wide.roll_deg),
+        ("square", truth.rect_angle_deg, wide.rect_angle_deg),
+    ] {
+        assert!((a - b).abs() < 0.001, "{name} moved: {a} -> {b}");
+    }
+
+    for (name, a, b) in [
+        ("distance", truth.distance_mm, wide.distance_mm),
+        ("height", truth.height_mm, wide.height_mm),
+        ("lateral", truth.lateral_mm, wide.lateral_mm),
+    ] {
+        assert!(
+            (b / a - 1.15).abs() < 0.001,
+            "{name} should scale with the declared width: {a} -> {b}"
+        );
+    }
+}

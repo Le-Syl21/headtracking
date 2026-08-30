@@ -7198,10 +7198,18 @@ impl App {
             );
         }
         if out_of_square {
+            // Only two things bend the shape: a focal that does not belong to
+            // the frame the outline was found in, or an outline that does not
+            // follow the cabinet. The lockbar width is not one of them — it
+            // scales the distances and leaves the angles alone — and saying so
+            // here saves the reader from adjusting the one setting that cannot
+            // help.
             ui.label(
                 RichText::new(
-                    "Cabinet does not rebuild square — check the lockbar width \
-                     above, and that the detected outline follows the real rails.",
+                    "Cabinet does not rebuild square: the outline does not follow the real \
+                     rails, or the focal above is not this camera's. Not the lockbar width \
+                     — that scales the distances without bending the shape. Turn on Flatten \
+                     to see it.",
                 )
                 .color(Color32::from_rgb(0xc0, 0x39, 0x2b)),
             );
