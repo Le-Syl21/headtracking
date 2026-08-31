@@ -41,6 +41,7 @@ use egui::{
 use egui_glow::glow;
 use egui_rotate::{Rotation, RotationPlugin, SoftwareCursor};
 use egui_winit::winit;
+use headtracking::plugin::logging::DEFAULT_LOG_FILTER;
 use nalgebra::Matrix4;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -1823,7 +1824,7 @@ struct BackendEntry {
 /// Windows:
 ///   * set `FREENECT_LOG_LEVEL=spew` (or `flood`) before launching to
 ///     make libfreenect itself emit its full USB transcript;
-///   * set `HEADTRACKING_LOG=libfreenect=debug,info` so the demo
+///   * set `HEADTRACKING_LOG=libfreenect=debug,info,ort::logging=warn` so the demo
 ///     surfaces those lines (they'll appear with the `libfreenect:`
 ///     prefix in both the stderr stream and the in-app log panel).
 fn detect_backends() -> Vec<BackendEntry> {
@@ -8840,7 +8841,7 @@ fn pose_delta_to_view_delta_vpu(dx_mm: f32, dy_mm: f32, dz_mm: f32) -> (f32, f32
 
 fn init_tracing(sink: Arc<Mutex<VecDeque<String>>>) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_env("HEADTRACKING_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
 
     // Console layer — only when stderr is actually a terminal. On a fresh
     // Windows release build (windows_subsystem = "windows") stderr is not

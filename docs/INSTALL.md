@@ -296,7 +296,7 @@ If it doesn't:
   PowerShell window shows the `[FAIL]` lines; copy them when
   reporting the issue.
 * Set `FREENECT_LOG_LEVEL=spew` and
-  `HEADTRACKING_LOG=libfreenect=debug,info` before launching the demo
+  `HEADTRACKING_LOG=libfreenect=debug,info,ort::logging=warn` before launching the demo
   to surface libfreenect's full USB transcript via `tracing`.
 
 ##### Option 2 — Manual Zadig fallback
@@ -677,7 +677,7 @@ Si pas le cas :
   élevée affiche les lignes `[FAIL]`, les copier pour le rapport
   d'incident.
 * Mettre `FREENECT_LOG_LEVEL=spew` et
-  `HEADTRACKING_LOG=libfreenect=debug,info` dans l'environnement
+  `HEADTRACKING_LOG=libfreenect=debug,info,ort::logging=warn` dans l'environnement
   avant de lancer le demo pour avoir le transcript USB complet de
   libfreenect via `tracing`.
 

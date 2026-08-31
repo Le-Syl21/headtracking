@@ -22,6 +22,19 @@
 //! — but that would gate every log call behind a deferred call and is
 //! a heavy hammer for a debug aid.
 
+/// Default `tracing` filter, shared by the plugin and `headtracking-demo`.
+///
+/// `info` everywhere, except onnxruntime's own chatter: at `info` it prints one
+/// line per dropped initializer and per arena growth, which drowns everything
+/// else — on a real contributed log it was 1508 lines out of 2097, i.e. 72% of
+/// the 256 KiB tail the demo uploads. A session that runs a bit longer would
+/// ship nothing *but* that: no version, no backend, no perf line. In VPX the
+/// same flood goes to `vpinball.log`.
+///
+/// `HEADTRACKING_LOG=info` (or `HEADTRACKING_LOG=info,ort::logging=info`)
+/// brings it back when model loading itself is what we are chasing.
+pub const DEFAULT_LOG_FILTER: &str = "info,ort::logging=warn";
+
 use std::ffi::{CStr, CString};
 use std::fmt::Write;
 use std::ptr;
@@ -188,4 +201,34 @@ pub unsafe fn resolve_and_install(
     // pattern (LPI_IMPLEMENT_CPP) does it, but the id is cheap and
     // releasing it doesn't unsubscribe the host endpoint, so it's
     // optional. Skip for code-size simplicity.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_LOG_FILTER;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// The default filter must keep our own INFO lines and drop
+    /// onnxruntime's. A contributed 256 KiB log tail was 72% `ort::logging`
+    /// noise; if this directive ever regresses, the logs we ask users to send
+    /// stop being readable.
+    #[test]
+    fn default_filter_silences_onnxruntime_info() {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                !tracing::event_enabled!(target: "ort::logging", tracing::Level::INFO),
+                "onnxruntime INFO should be filtered out"
+            );
+            assert!(
+                tracing::event_enabled!(target: "ort::logging", tracing::Level::WARN),
+                "onnxruntime WARN must still reach the log"
+            );
+            assert!(
+                tracing::event_enabled!(target: "headtracking", tracing::Level::INFO),
+                "our own INFO lines must still reach the log"
+            );
+        });
+    }
 }

@@ -760,7 +760,9 @@ fn init_tracing_once() {
         // Order doesn't matter: each layer decides independently whether
         // to emit. The env filter applies globally.
         let filter = tracing_subscriber::EnvFilter::try_from_env("HEADTRACKING_LOG")
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            .unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(super::logging::DEFAULT_LOG_FILTER)
+            });
         let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
         let _ = tracing_subscriber::registry()
             .with(filter)
