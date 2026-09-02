@@ -825,9 +825,9 @@ dependencies = [
 
 [[package]]
 name = "egui-rotate"
-version = "3.1.1"
+version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33f8a327fa1a7f25b874738765506b04ddcc63ad2a943bcc991a6c9b890d2b93"
+checksum = "c891f1c3093b2006c7acbda7df8c59316c6a2e60b3eb8fd956d4eb72e5af0756"
 dependencies = [
  "egui",
  "egui_inspection",
