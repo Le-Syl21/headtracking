@@ -227,7 +227,7 @@ jobs:
       # target dir so fingerprint and library can't drift apart again
       # (per-OS locations of ort-sys' `dirs` cache dir; missing paths
       # are skipped).
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           prefix-key: v1-rust
           key: ${{ matrix.target }}
@@ -827,7 +827,7 @@ jobs:
           esac
 
       - name: Create release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
         with:
           files: |
             release-assets/*.tar.gz
