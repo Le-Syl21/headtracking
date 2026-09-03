@@ -7298,30 +7298,29 @@ impl App {
                     }
                 }
                 ui.separator();
-                let (controllers, devices) = usb_check::counts(&self.usb_tree);
+                let (buses, devices) = usb_check::counts(&self.usb_tree);
                 ui.label(
                     RichText::new(format!(
-                        "This machine reports {controllers} USB controller(s) and \
-                         {devices} device(s)."
+                        "This machine reports {buses} USB bus(es) and {devices} device(s)."
                     ))
                     .strong(),
                 );
-                if controllers <= 1 {
-                    ui.label(
-                        RichText::new(
-                            "One controller is normal, and not a fault you can fix: plenty of \
-                             recent boards — USB 3.2, DDR5, the lot — put every socket on the \
-                             back panel behind a single xHCI controller. It means dedicating \
-                             a controller to the Kinect is simply not possible here, and that \
-                             is fine.",
-                        )
-                        .color(Color32::GRAY),
-                    );
-                }
+                ui.label(
+                    RichText::new(
+                        "Buses, not controllers: one controller presents two of them, a \
+                         USB 2.0 bus and a SuperSpeed bus, because they run on separate \
+                         wires with separate schedules. So the count above is roughly twice \
+                         the number of chips on your board — and plenty of recent boards \
+                         (USB 3.2, DDR5, the lot) have exactly one, with every socket on \
+                         the back panel behind it. Dedicating a controller to the Kinect is \
+                         then simply not possible, and that is fine.",
+                    )
+                    .color(Color32::GRAY),
+                );
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(
-                        "Everything below one heading shares that controller's budget — but \
+                        "Everything below one heading shares that bus's reserved budget — but \
                          only while it streams. A camera reserves its bandwidth up front, \
                          for as long as it is running, and hands it back when it stops; a \
                          keyboard, a mouse or a cabinet I/O board reserve almost nothing at \
@@ -7334,7 +7333,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "Two cameras on one controller is the combination to avoid, and it \
+                        "Two cameras on one bus is the combination to avoid, and it \
                          does not show up as lag: if both reservations do not fit, the \
                          second one is refused and that camera simply never starts. If a \
                          webcam and the Kinect are under the same heading below, that is \

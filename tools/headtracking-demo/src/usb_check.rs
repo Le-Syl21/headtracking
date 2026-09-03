@@ -116,7 +116,7 @@ pub fn check(sensor: Sensor) -> Option<UsbReport> {
 
     let want = match sensor {
         Sensor::KinectV1 => "USB 2.0 (High Speed)".to_string(),
-        Sensor::KinectV2 => "USB 3.0 (SuperSpeed), sole device on its controller".to_string(),
+        Sensor::KinectV2 => "USB 3.0 (SuperSpeed), no other camera on its bus".to_string(),
     };
 
     let Some(first) = ours.first() else {
@@ -158,8 +158,8 @@ pub fn check(sensor: Sensor) -> Option<UsbReport> {
         }
     }
 
-    // Company on the controller. Only meaningful for the v2, whose depth
-    // stream reserves isochronous bandwidth for the whole controller.
+    // Company on the bus. Only meaningful for the v2, whose depth stream
+    // reserves isochronous bandwidth out of that bus's budget.
     if sensor == Sensor::KinectV2 {
         let bus = first.bus_id().to_string();
         let ours_addrs: Vec<u8> = ours.iter().map(|d| d.device_address()).collect();
@@ -413,7 +413,7 @@ fn render_tree(rows: &[Row]) -> Vec<BusNode> {
             out.push(BusNode {
                 depth: 0,
                 generation: String::new(),
-                label: format!("Controller {}", row.bus),
+                label: format!("Bus {}", row.bus),
                 is_sensor: false,
                 sensor_underspeed: false,
             });
@@ -432,16 +432,23 @@ fn render_tree(rows: &[Row]) -> Vec<BusNode> {
     out
 }
 
-/// How many controllers and devices the tree holds.
+/// How many buses and devices the tree holds.
 ///
-/// Worth stating outright, because "only one controller?" on a brand-new
-/// USB 3.2 board reads as a broken enumeration rather than as the normal
-/// thing it is — it cost an afternoon of doubt on a real machine before
-/// anyone thought to check whether the count was even wrong.
+/// **Buses, not controllers**, and the distinction is not pedantry. One xHCI
+/// controller presents two root hubs — a USB 2.0 one and a SuperSpeed one —
+/// because the two run on separate wire pairs with separate schedules. This
+/// dev machine shows four buses from two PCI controllers. Calling a bus a
+/// controller would inflate the count and, worse, would tell someone their
+/// board has controllers to spare when it has one.
+///
+/// The bus is nevertheless the right unit for the question this window
+/// answers: reserved isochronous bandwidth is budgeted per bus, so a USB 2.0
+/// webcam genuinely does not eat a SuperSpeed Kinect's reservation even when
+/// both are in the same physical socket.
 #[must_use]
 pub fn counts(tree: &[BusNode]) -> (usize, usize) {
-    let controllers = tree.iter().filter(|n| n.depth == 0).count();
-    (controllers, tree.len() - controllers)
+    let buses = tree.iter().filter(|n| n.depth == 0).count();
+    (buses, tree.len() - buses)
 }
 
 #[cfg(test)]
@@ -484,8 +491,8 @@ mod topology_tests {
                 (1, false), // the webcam
             ]
         );
-        assert!(tree[0].label.starts_with("Controller usb1"));
-        assert!(tree[4].label.starts_with("Controller usb2"));
+        assert!(tree[0].label.starts_with("Bus usb1"));
+        assert!(tree[4].label.starts_with("Bus usb2"));
     }
 
     /// Two cameras on one controller is the only combination worth acting on,
