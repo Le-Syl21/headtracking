@@ -2446,6 +2446,13 @@ struct App {
     /// but not free, and the UI repaints far faster than a cable gets moved,
     /// so it is refreshed on a timer rather than per frame.
     usb_cache: Option<(Instant, usb_check::Sensor, usb_check::UsbReport)>,
+    /// The USB window, opened from the toolbar badge. A plain window, never a
+    /// modal: someone reading their bus tree usually wants to unplug something
+    /// and watch the list change, which a modal makes impossible.
+    usb_window_open: bool,
+    /// Bus tree for that window, refreshed on open and on demand. Enumerating
+    /// costs a syscall per device, so it does not belong in a per-frame path.
+    usb_tree: Vec<usb_check::BusNode>,
     /// What the freshly opened device can deliver, shown once. `None` when
     /// there is nothing to say or the user has dismissed it.
     brief: Option<DeviceBrief>,
@@ -5426,6 +5433,8 @@ impl App {
         Self {
             selected: Backend::None,
             usb_cache: None,
+            usb_window_open: false,
+            usb_tree: Vec::new(),
             brief: None,
             available,
             active: None,
@@ -6193,18 +6202,23 @@ impl App {
                     _ => None,
                 } && let Some(report) = self.usb_report(sensor)
                 {
-                    let resp = ui.label(
-                        RichText::new(report.level.glyph())
-                            .color(report.level.colour())
-                            .monospace()
-                            .strong(),
-                    );
-                    resp.on_hover_text(format!(
-                        "USB\nwants: {}\nhas:   {}\n\n{}",
-                        report.want,
-                        report.got,
-                        report.notes.join("\n")
-                    ));
+                    let colour = report.level.colour();
+                    let glyph = report.level.glyph().to_owned();
+                    if ui
+                        .button(
+                            RichText::new(format!("USB {glyph}"))
+                                .color(colour)
+                                .monospace(),
+                        )
+                        .on_hover_text(
+                            "What USB gives this sensor, and everything plugged into every \
+                             controller. Click to open.",
+                        )
+                        .clicked()
+                    {
+                        self.usb_window_open = true;
+                        self.usb_tree = usb_check::topology(sensor);
+                    }
                 }
                 let selected_label = self.label_for(self.selected);
                 // Size the combo to the widest label currently on offer so no
@@ -6499,18 +6513,6 @@ impl App {
                     for line in &brief.streams {
                         ui.label(RichText::new(format!("- {line}")).monospace());
                     }
-                    if let Some(sensor) = match self.selected {
-                        Backend::KinectV1 => Some(usb_check::Sensor::KinectV1),
-                        Backend::KinectV2 => Some(usb_check::Sensor::KinectV2),
-                        _ => None,
-                    } && let Some(r) = usb_check::check(sensor)
-                    {
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(format!("USB: {} (wants {})", r.got, r.want))
-                                .color(r.level.colour()),
-                        );
-                    }
                     ui.add_space(8.0);
                     for n in &brief.notes {
                         ui.label(n);
@@ -6727,6 +6729,7 @@ impl App {
         });
         let ctx = ui.ctx().clone();
         self.contribute_window(&ctx);
+        self.usb_window(&ctx);
     }
 
     /// Lockbar-width field — the metric ruler for the monocular (webcam)
@@ -7251,6 +7254,137 @@ impl App {
         ui.add_space(2.0);
         self.what_the_plugin_uses(ui);
         self.color_exposure_bar(ui);
+    }
+
+    /// The USB window: what this sensor has, what actually matters about it,
+    /// and the whole bus tree.
+    ///
+    /// Opened from the toolbar badge, never on its own. The automatic version
+    /// of this was an amber warning whenever anything else shared the sensor's
+    /// controller — which on a motherboard with a single controller is always,
+    /// and is fine: the v2 peaks near 2 Gbit/s of the 5 that controller
+    /// carries. It told an owner his hardware was wrong when it was not, and
+    /// sent him looking for a second controller his board does not have.
+    ///
+    /// A plain window rather than a modal, because the useful thing to do
+    /// while reading it is unplug something and watch the list change.
+    fn usb_window(&mut self, ctx: &egui::Context) {
+        if !self.usb_window_open {
+            return;
+        }
+        let sensor = match self.selected {
+            Backend::KinectV1 => Some(usb_check::Sensor::KinectV1),
+            Backend::KinectV2 => Some(usb_check::Sensor::KinectV2),
+            _ => None,
+        };
+        let report = sensor.and_then(|s| self.usb_report(s).cloned());
+        let mut open = self.usb_window_open;
+        let mut refresh = false;
+        egui::Window::new("USB")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                if let Some(r) = &report {
+                    ui.label(RichText::new(format!("wants: {}", r.want)).monospace());
+                    ui.label(
+                        RichText::new(format!("has:   {}", r.got))
+                            .monospace()
+                            .color(r.level.colour()),
+                    );
+                    ui.add_space(6.0);
+                    for note in &r.notes {
+                        ui.label(RichText::new(note).color(Color32::GRAY));
+                        ui.add_space(3.0);
+                    }
+                }
+                ui.separator();
+                let (controllers, devices) = usb_check::counts(&self.usb_tree);
+                ui.label(
+                    RichText::new(format!(
+                        "This machine reports {controllers} USB controller(s) and \
+                         {devices} device(s)."
+                    ))
+                    .strong(),
+                );
+                if controllers <= 1 {
+                    ui.label(
+                        RichText::new(
+                            "One controller is normal, and not a fault you can fix: plenty of \
+                             recent boards — USB 3.2, DDR5, the lot — put every socket on the \
+                             back panel behind a single xHCI controller. It means dedicating \
+                             a controller to the Kinect is simply not possible here, and that \
+                             is fine.",
+                        )
+                        .color(Color32::GRAY),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "A USB controller is shared: everything below one heading competes \
+                         for the same bandwidth. The Kinect v2 needs about 2 Gbit/s of the \
+                         5 a USB 3.0 controller carries, so a keyboard, a mouse or a \
+                         cabinet I/O board beside it costs nothing. Two cameras on one \
+                         controller is the combination to avoid — that is what this tree \
+                         is for.",
+                    )
+                    .color(Color32::GRAY),
+                );
+                ui.add_space(6.0);
+                if self.usb_tree.iter().any(|n| n.sensor_underspeed) {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "⚠ This sensor is connected below the speed it needs — the red \
+                             line below. Move it to a rear USB 3.0 port straight on the \
+                             motherboard; front panels and hubs often fall back.",
+                        )
+                        .color(COLOR_BAD)
+                        .strong(),
+                    );
+                }
+                ui.add_space(6.0);
+                if ui.button("↻ Rescan the bus").clicked() {
+                    refresh = true;
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::both().max_height(320.0).show(ui, |ui| {
+                    if self.usb_tree.is_empty() {
+                        ui.label(
+                            RichText::new("The bus could not be enumerated on this system.")
+                                .color(Color32::GRAY),
+                        );
+                    }
+                    for node in &self.usb_tree {
+                        if node.depth == 0 {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(&node.label).monospace().strong());
+                            continue;
+                        }
+                        // Generation first and padded, so the column reads
+                        // straight down: someone here because the Kinect lags
+                        // is looking for one word. Two spaces per level for
+                        // the nesting, rather than box glyphs the embedded
+                        // font subsets do not all carry.
+                        let indent = "  ".repeat(node.depth);
+                        let line = format!("{indent}{:<8} {}", node.generation, node.label);
+                        let text = RichText::new(line).monospace();
+                        let text = if node.sensor_underspeed {
+                            // The one line worth shouting about.
+                            text.color(COLOR_BAD).strong()
+                        } else if node.is_sensor {
+                            text.color(COLOR_OK).strong()
+                        } else {
+                            text.color(Color32::GRAY)
+                        };
+                        ui.label(text);
+                    }
+                });
+            });
+        if refresh && let Some(s) = sensor {
+            self.usb_tree = usb_check::topology(s);
+        }
+        self.usb_window_open = open;
     }
 
     /// What the VPX plugin actually reads, said once and plainly.
