@@ -169,7 +169,10 @@ public:
 void install_logger(uint32_t level);
 std::unique_ptr<Freenect2Ctx> new_context();
 int32_t enumerate(Freenect2Ctx &ctx);
-std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx);
+/// Open the first Kinect v2. `allow_gpu` false forces the CPU depth
+/// pipeline even on an OpenCL build — the escape hatch for a machine
+/// where the GPU path misbehaves.
+std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx, bool allow_gpu);
 
 /// Name of the depth pipeline in use: "OpenCL" or "CPU".
 const char *depth_pipeline(const Freenect2Dev &dev);

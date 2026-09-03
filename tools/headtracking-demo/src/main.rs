@@ -7887,6 +7887,26 @@ fn new_capture(backend: Backend, intrinsics: Intrinsics, inner: Inner) -> Captur
     }
 }
 
+/// `HT_DEPTH_PIPELINE=cpu` forces the Kinect v2's CPU depth pipeline.
+///
+/// The GPU pipeline is the right default — it is what took a Windows tester
+/// from 5 fps of depth to 30 — but a default nobody can override is a
+/// hypothesis nobody can test. A tester whose preview freezes after a few
+/// seconds (2026-09-03, RTX 5080 on OpenCL, working on 0.0.30 which predates
+/// the GPU pipeline shipping) can now answer the question in one run instead
+/// of waiting for us to guess.
+///
+/// Anything other than `cpu` keeps the default, so a typo cannot silently
+/// downgrade someone.
+fn gpu_depth_allowed() -> bool {
+    gpu_depth_allowed_from(std::env::var("HT_DEPTH_PIPELINE").ok().as_deref())
+}
+
+/// The decision itself, away from the process environment so it can be tested.
+fn gpu_depth_allowed_from(value: Option<&str>) -> bool {
+    !matches!(value, Some(v) if v.trim().eq_ignore_ascii_case("cpu"))
+}
+
 fn open_kinect_v2() -> Result<Capture, String> {
     let ctx = freenect2::Context::new().map_err(|e| format!("freenect2 Context::new: {e}"))?;
     // Drain any stale libfreenect2 error from a previous call before we
@@ -7904,15 +7924,21 @@ fn open_kinect_v2() -> Result<Capture, String> {
         }
         return Err("no Kinect v2 found on USB".to_string());
     }
+    let allow_gpu = gpu_depth_allowed();
     let device = ctx
-        .open_default()
+        .open_with_gpu(allow_gpu)
         .map_err(|e| format!("freenect2 open_default: {e}"))?;
     // First thing in the log, before anything else can go wrong: which depth
     // pipeline actually opened. On the CPU one the v2 drops USB depth packets
     // and delivers ~5 fps instead of 30, and every downstream number inherits
     // it — so a report that starts with "CPU" needs no further diagnosis.
     let pipeline = device.depth_pipeline();
-    if pipeline == "CPU" {
+    if !allow_gpu {
+        info!(
+            pipeline,
+            "Kinect v2 depth pipeline: forced by HT_DEPTH_PIPELINE"
+        );
+    } else if pipeline == "CPU" {
         warn!(
             "Kinect v2 depth pipeline: CPU — expect dropped USB packets and \
              ~5 fps of depth. No OpenCL device available (missing driver ICD?)."
@@ -9490,6 +9516,18 @@ mod tests {
             half.contains("2 of 3") && half.contains("WinUSB"),
             "a half-bound sensor must name the count: {half}"
         );
+    }
+
+    /// Only `cpu` downgrades. A typo must not silently put someone on the
+    /// slow pipeline and leave them wondering why depth crawls.
+    #[test]
+    fn only_cpu_turns_the_gpu_depth_pipeline_off() {
+        assert!(!gpu_depth_allowed_from(Some("cpu")));
+        assert!(!gpu_depth_allowed_from(Some("  CPU  ")));
+        assert!(gpu_depth_allowed_from(None));
+        assert!(gpu_depth_allowed_from(Some("opencl")));
+        assert!(gpu_depth_allowed_from(Some("")));
+        assert!(gpu_depth_allowed_from(Some("cpuu")));
     }
 
     /// A backend whose driver cannot count must stay silent rather than

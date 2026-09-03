@@ -224,7 +224,7 @@ mod ffi {
 
         /// Open the first Kinect v2 with the CPU packet pipeline. Returns a
         /// null `UniquePtr` if no device is available or opening fails.
-        fn open_default(ctx: Pin<&mut Freenect2Ctx>) -> UniquePtr<Freenect2Dev>;
+        fn open_default(ctx: Pin<&mut Freenect2Ctx>, allow_gpu: bool) -> UniquePtr<Freenect2Dev>;
 
         /// Start the depth stream (RGB stays off — the head-tracker path).
         /// `"OpenCL"` or `"CPU"` — which depth pipeline the device opened

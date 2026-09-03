@@ -178,12 +178,26 @@ impl Context {
         sys::enumerate(guard.pin_mut())
     }
 
-    /// Open the first detected Kinect v2 with the CPU packet pipeline.
+    /// Open the first detected Kinect v2, preferring the GPU depth pipeline
+    /// when this build has one.
+    ///
     /// Returns `Err(Error::NoDevice)` if none are present, or
     /// `Err(Error::OpenFailed)` if libfreenect2 declines to open it.
     pub fn open_default(&self) -> Result<Device, Error> {
+        self.open_with_gpu(true)
+    }
+
+    /// Same, but `allow_gpu = false` forces the CPU depth pipeline.
+    ///
+    /// The GPU path is the better default — it is what took a Windows tester
+    /// from 5 fps of depth to 30 — but "better on average" is not "better
+    /// here", and a pipeline nobody can turn off is a hypothesis nobody can
+    /// test. A field report of a v2 preview freezing after a few seconds on an
+    /// OpenCL build (2026-09-03, RTX 5080) is exactly the case this exists
+    /// for: one run on CPU says whether the pipeline is the culprit.
+    pub fn open_with_gpu(&self, allow_gpu: bool) -> Result<Device, Error> {
         let mut guard = self.inner.lock();
-        let dev = sys::open_default(guard.pin_mut());
+        let dev = sys::open_default(guard.pin_mut(), allow_gpu);
         if dev.is_null() {
             return Err(Error::OpenFailed);
         }

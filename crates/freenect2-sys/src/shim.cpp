@@ -185,8 +185,9 @@ int32_t enumerate(Freenect2Ctx &ctx) {
     return ctx.inner.enumerateDevices();
 }
 
-std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx) {
+std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx, bool allow_gpu) {
     auto holder = std::make_unique<Freenect2Dev>();
+    (void)allow_gpu; // unused on a build without OpenCL support
 #ifdef LIBFREENECT2_WITH_OPENCL_SUPPORT
     // Prefer the OpenCL depth pipeline. The Kinect v2 phase-unwrap +
     // bilateral/edge-aware filtering is what pins the CPU pipeline at
@@ -195,7 +196,11 @@ std::unique_ptr<Freenect2Dev> open_default(Freenect2Ctx &ctx) {
     // the pipeline even on failure, so a null return means the GPU path
     // is already freed and we can safely retry with the CPU pipeline
     // (missing ICD, no usable device, etc.).
-    {
+    //
+    // `allow_gpu` false skips it entirely: the GPU path is not always the
+    // better one, and until a tester can turn it off we cannot tell a bad
+    // driver from a bad pipeline.
+    if (allow_gpu) {
         libfreenect2::PacketPipeline *gpu = new libfreenect2::OpenCLPacketPipeline();
         holder->dev = ctx.inner.openDefaultDevice(gpu);
         if (holder->dev) {

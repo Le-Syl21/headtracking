@@ -298,6 +298,13 @@ If it doesn't:
 * Set `FREENECT_LOG_LEVEL=spew` and
   `HEADTRACKING_LOG=libfreenect=debug,info,ort::logging=warn` before launching the demo
   to surface libfreenect's full USB transcript via `tracing`.
+* **Kinect v2 preview freezes after a few seconds while the rest of the
+  window keeps responding**: the depth pipeline is the first thing to rule
+  out. Launch with `HT_DEPTH_PIPELINE=cpu` to force the CPU one — if the
+  freeze goes away, it is the GPU path on your machine, and the log line
+  `Kinect v2 depth pipeline: forced by HT_DEPTH_PIPELINE` proves which one
+  you ran. Expect lower depth rates on CPU; this is a diagnosis, not a
+  setting to leave on. Please send us both logs.
 
 ##### Option 2 — Manual Zadig fallback
 
@@ -680,6 +687,13 @@ Si pas le cas :
   `HEADTRACKING_LOG=libfreenect=debug,info,ort::logging=warn` dans l'environnement
   avant de lancer le demo pour avoir le transcript USB complet de
   libfreenect via `tracing`.
+* **L'image de la Kinect v2 se fige au bout de quelques secondes alors que
+  le reste de la fenêtre répond encore** : le pipeline de profondeur est la
+  première chose à écarter. Lancer avec `HT_DEPTH_PIPELINE=cpu` pour forcer
+  celui du CPU — si le gel disparaît, c'est le chemin GPU sur cette machine,
+  et la ligne de log `Kinect v2 depth pipeline: forced by HT_DEPTH_PIPELINE`
+  atteste lequel a tourné. La profondeur sera plus lente sur CPU : c'est un
+  diagnostic, pas un réglage à laisser en place. Nous envoyer les deux logs.
 
 ##### Option 2 — Zadig manuel (fallback)
 
