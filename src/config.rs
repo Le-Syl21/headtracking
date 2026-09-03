@@ -101,27 +101,6 @@ impl SmoothingPreset {
     }
 }
 
-/// Which sensor stream feeds the pose model on Kinects. `Auto` = IR: the
-/// active illumination holds 30 fps in a dark game room where auto-exposed
-/// colour drops to 15. Webcams have no IR and ignore this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamPref {
-    Auto,
-    Rgb,
-}
-
-impl StreamPref {
-    fn from_i32(v: i32) -> Self {
-        if v == 1 { Self::Rgb } else { Self::Auto }
-    }
-    fn to_i32(self) -> i32 {
-        match self {
-            Self::Auto => 0,
-            Self::Rgb => 1,
-        }
-    }
-}
-
 /// All plugin settings, mirrored from VPX into the process. Reads happen
 /// from the tracker thread (per-loop snapshot — live retuning works) and
 /// the OnPrepareFrame callback (gain + trims, cheap RwLock read).
@@ -147,7 +126,6 @@ pub struct Config {
     /// Median spike-gate window in frames (odd, 1 = off); see
     /// `filter::MedianGate` for the latency trade-off.
     pub median_window: i32,
-    pub tracking_stream: StreamPref,
     pub invert_x: bool,
     pub invert_y: bool,
     pub invert_z: bool,
@@ -234,7 +212,6 @@ impl Default for Config {
             smoothing_responsiveness: 1.0,
             smoothing_catch_up: 0.01,
             median_window: 3,
-            tracking_stream: StreamPref::Auto,
             invert_x: false,
             invert_y: false,
             invert_z: false,
@@ -257,7 +234,6 @@ static CONFIG: RwLock<Config> = RwLock::new(Config {
     smoothing_responsiveness: 1.0,
     smoothing_catch_up: 0.01,
     median_window: 3,
-    tracking_stream: StreamPref::Auto,
     invert_x: false,
     invert_y: false,
     invert_z: false,
@@ -347,13 +323,6 @@ unsafe extern "C" fn set_smoothing(v: c_int) {
     rw!().smoothing = SmoothingPreset::from_i32(v);
 }
 
-unsafe extern "C" fn get_stream() -> c_int {
-    current().tracking_stream.to_i32()
-}
-unsafe extern "C" fn set_stream(v: c_int) {
-    rw!().tracking_stream = StreamPref::from_i32(v);
-}
-
 unsafe extern "C" fn get_invert_x() -> c_int {
     c_int::from(current().invert_x)
 }
@@ -433,12 +402,6 @@ static SMOOTHING_VALUES: EnumValues<5> = EnumValues([
     c"Normal".as_ptr(),
     c"Reactive".as_ptr(),
     c"Custom".as_ptr(),
-    std::ptr::null(),
-]);
-
-static STREAM_VALUES: EnumValues<3> = EnumValues([
-    c"Auto (IR on Kinect)".as_ptr(),
-    c"Color".as_ptr(),
     std::ptr::null(),
 ]);
 
@@ -675,17 +638,6 @@ pub unsafe fn register_settings(api: &MsgPluginAPI, endpoint_id: u32, webcam_nam
             std::ptr::null_mut(),
             get_median_window,
             set_median_window,
-        ),
-        make_int_setting(
-            c"TrackingStream",
-            c"Tracking Stream",
-            c"Auto tracks on the Kinect's infrared stream (works in a dark room at full rate); Color uses the RGB stream. Webcams always use color.",
-            0,
-            1,
-            StreamPref::Auto.to_i32(),
-            STREAM_VALUES.0.as_ptr().cast_mut(),
-            get_stream,
-            set_stream,
         ),
         make_bool_setting(
             c"InvertX",

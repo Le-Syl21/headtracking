@@ -74,7 +74,6 @@ VPX scans `plugins/<id>/plugin.cfg` to discover plugins.
    Gain            = 1.0   ; multiplier on the head-motion delta (0.5 is a good cab start)
    Smoothing       = 0     ; 0=Stable (field-tested default), 1=Normal, 2=Reactive
    MedianWindow    = 3     ; frames of spike-killing median pre-filter (1 = off)
-   TrackingStream  = 0     ; 0=Auto (IR on Kinects — tracks in a dark room), 1=Color
    InvertX         = 0     ; flip left/right for mirrored / unusual mountings
    InvertY         = 0
    InvertZ         = 0
@@ -456,7 +455,6 @@ dossier — VPX scanne `plugins/<id>/plugin.cfg` pour découvrir les plugins.
    Gain            = 1.0   ; multiplicateur sur le delta tête (0.5 = bon départ sur cab)
    Smoothing       = 0     ; 0=Stable (défaut éprouvé), 1=Normal, 2=Reactive
    MedianWindow    = 3     ; frames de médiane anti-pics avant le filtre (1 = off)
-   TrackingStream  = 0     ; 0=Auto (IR sur Kinect — tracke dans le noir), 1=Color
    InvertX         = 0     ; inverse gauche/droite (montage caméra atypique)
    InvertY         = 0
    InvertZ         = 0

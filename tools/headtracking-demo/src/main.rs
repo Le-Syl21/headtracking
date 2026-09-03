@@ -7257,11 +7257,11 @@ impl App {
     ///
     /// The demo shows colour first because it is the stream a human can judge,
     /// and testers reasonably conclude that colour is what the tracking runs
-    /// on — then spend their effort lighting a room for a camera the plugin is
-    /// not, by default, looking at. On a Kinect the plugin's `Tracking Stream`
-    /// setting defaults to Auto, which finds the head in the INFRARED matrix;
-    /// the DEPTH matrix gives its distance in either case. Colour tracking
-    /// exists, but only if that VPX setting is switched to Color.
+    /// on — then spend their effort lighting a room for a camera the plugin
+    /// does not look at. On a Kinect the head is found in the INFRARED matrix
+    /// and its distance read from the DEPTH matrix, with no setting to change
+    /// that: the sensor carries its own illuminator, so it uses it. A webcam
+    /// tracks on colour because colour is all it has.
     fn what_the_plugin_uses(&self, ui: &mut egui::Ui) {
         let Some(active) = self.active.as_ref() else {
             return;
@@ -7275,8 +7275,9 @@ impl App {
             ui.label(
                 RichText::new(
                     "On a Kinect, the VPX plugin finds the head in the INFRARED image and \
-                     reads its distance from the DEPTH image. Colour is preview and \
-                     capture material — unless you set VPX's 'Tracking Stream' to Color.",
+                     reads its distance from the DEPTH image — always, with no setting to \
+                     change it. Colour is preview and capture material. A webcam has no \
+                     infrared, so it tracks on colour because that is all it has.",
                 )
                 .color(Color32::GRAY),
             );

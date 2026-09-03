@@ -112,7 +112,6 @@ Level 1 (what most users may touch):
   parameter sets (raw values not exposed; BAM lesson: one knob).
 
 Level 2 (advanced):
-- `TrackingStream`: auto / rgb (auto = IR on Kinects).
 - `InvertX/Y/Z`: bools, default false (defaults field-validated).
 - `WebcamFocalPx`: 0 = auto (playfield-rectangle homography when it
   lands; measured value persisted via `SaveSetting`), else manual.

@@ -140,12 +140,11 @@ impl TrackerSession {
     /// fails fast if the device isn't available.
     pub fn spawn(cfg: &Config) -> Result<Self, SpawnError> {
         let device_index = cfg.device_index.max(0) as usize;
-        let ir = cfg.tracking_stream == crate::config::StreamPref::Auto;
         let backend: Box<dyn HeadTracker> = match cfg.backend {
-            BackendKind::KinectV2 => open_kinect_v2(device_index, ir)?,
-            BackendKind::KinectV1 => open_kinect_v1(device_index, ir)?,
+            BackendKind::KinectV2 => open_kinect_v2(device_index)?,
+            BackendKind::KinectV1 => open_kinect_v1(device_index)?,
             BackendKind::Webcam => open_webcam(device_index)?,
-            BackendKind::Auto => open_auto(device_index, ir)?,
+            BackendKind::Auto => open_auto(device_index)?,
         };
         Self::spawn_with(backend, cfg)
     }
@@ -277,17 +276,11 @@ impl Drop for TrackerSession {
 // ============================================================ Backend openers
 
 #[cfg(feature = "kinect-v2")]
-fn open_kinect_v2(_device_index: usize, ir: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
+fn open_kinect_v2(_device_index: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
     // libfreenect2 only exposes `open_default()` today; multi-Kinect-v2
     // selection would need a cxx bridge change. Falling back to the first
     // device is fine for the pincab use-case.
-    use crate::tracker::pipeline::TrackingStream;
-    let stream = if ir {
-        TrackingStream::Ir
-    } else {
-        TrackingStream::Rgb
-    };
-    let b = KinectV2Backend::open(stream).map_err(SpawnError::OpenKinectV2)?;
+    let b = KinectV2Backend::open().map_err(SpawnError::OpenKinectV2)?;
     Ok(Box::new(b))
 }
 #[cfg(not(feature = "kinect-v2"))]
@@ -296,14 +289,14 @@ fn open_kinect_v2(_: usize, _: bool) -> Result<Box<dyn HeadTracker>, SpawnError>
 }
 
 #[cfg(feature = "kinect-v1")]
-fn open_kinect_v1(_device_index: usize, ir: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
+fn open_kinect_v1(_device_index: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
     // TODO: thread `_device_index` through KinectV1Backend::open once we
     // need to support multi-v1 setups. libfreenect itself supports it.
-    let b = KinectV1Backend::open(ir).map_err(SpawnError::OpenKinectV1)?;
+    let b = KinectV1Backend::open().map_err(SpawnError::OpenKinectV1)?;
     Ok(Box::new(b))
 }
 #[cfg(not(feature = "kinect-v1"))]
-fn open_kinect_v1(_: usize, _: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
+fn open_kinect_v1(_: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
     Err(SpawnError::BackendNotCompiled("kinect-v1"))
 }
 
@@ -320,13 +313,13 @@ fn open_webcam(_: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
 /// Walk the v2 → v1 → webcam fallback chain. Each failure is logged so
 /// the user can tell from the VPX log why a particular backend was
 /// skipped (no device, USB error, model load, …).
-fn open_auto(device_index: usize, ir: bool) -> Result<Box<dyn HeadTracker>, SpawnError> {
-    if let Ok(b) = open_kinect_v2(device_index, ir).inspect_err(|e| {
+fn open_auto(device_index: usize) -> Result<Box<dyn HeadTracker>, SpawnError> {
+    if let Ok(b) = open_kinect_v2(device_index).inspect_err(|e| {
         warn!(?e, "auto: kinect-v2 unavailable, trying next");
     }) {
         return Ok(b);
     }
-    if let Ok(b) = open_kinect_v1(device_index, ir).inspect_err(|e| {
+    if let Ok(b) = open_kinect_v1(device_index).inspect_err(|e| {
         warn!(?e, "auto: kinect-v1 unavailable, trying next");
     }) {
         return Ok(b);

@@ -42,7 +42,11 @@ pub struct KinectV1Backend {
 }
 
 impl KinectV1Backend {
-    pub fn open(ir: bool) -> Result<Self, Error> {
+    /// Opens on colour — the anchor phase needs it — and switches to IR in
+    /// [`HeadTracker::begin_tracking`]. There is no colour *option*: this
+    /// sensor has an illuminator and uses it. The colour arm below survives
+    /// only as the fallback for a switch that fails.
+    pub fn open() -> Result<Self, Error> {
         // Cross-process exclusivity (demo, cron capture, second VPX): fail
         // fast with a readable message instead of a USB-level fight.
         let hwlock = crate::hwlock::HwLock::acquire("kinect-v1").map_err(Error::Busy)?;
@@ -55,11 +59,7 @@ impl KinectV1Backend {
         // Colour first, whatever the target: the anchor-calibration phase
         // needs RGB frames; `begin_tracking` switches to IR afterwards.
         device.start_streams(true, true)?;
-        let stream = if ir {
-            TrackingStream::Ir
-        } else {
-            TrackingStream::Rgb
-        };
+        let stream = TrackingStream::Ir;
         let blaze = blazepose::BlazePose::new()?;
         info!(
             n_devices = count,

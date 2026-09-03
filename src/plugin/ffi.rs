@@ -356,7 +356,6 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
             gain = cfg.gain,
             gain_trim = ?[cfg.gain_x, cfg.gain_y, cfg.gain_z],
             smoothing = ?cfg.smoothing,
-            stream = ?cfg.tracking_stream,
             "spawning tracker session with current config"
         );
         match TrackerSession::spawn(&cfg) {

@@ -4,12 +4,19 @@
 //! that feeds BlazePose. The demo remains the lab bench; this module is the
 //! production copy consumed by the plugin backends.
 
-/// Which sensor stream feeds BlazePose on a Kinect.
+/// Which image the pose model is currently reading on a Kinect.
+///
+/// Not a user setting: a Kinect uses its infrared stream because it carries
+/// its own illuminator, and a webcam uses colour because it has nothing else.
+/// This exists because the v1 must physically switch its single video
+/// endpoint after the anchor phase, and can fail to — [`Self::Rgb`] is what
+/// that failure degrades to, never something anyone chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackingStream {
-    /// Track on the actively-illuminated IR stream (default — night-proof).
+    /// The actively-illuminated IR stream — night-proof, and what a Kinect
+    /// always uses.
     Ir,
-    /// Track on the colour stream.
+    /// Colour. Reached only when the v1 fails to switch its video endpoint.
     Rgb,
 }
 

@@ -1,41 +1,42 @@
 //! Kinect v2 head tracker backend (libfreenect2 via the `freenect2` crate).
 //!
-//! The demo-validated pipeline:
+//! The demo-validated pipeline, and the only one: only the depth pipeline
+//! streams (`start_streams(false, true)`) — IR rides the same listener. The
+//! IR frame is auto-levelled and fed to BlazePose; the head point then samples
+//! the depth grid **directly**, because IR and depth are the same sensor on
+//! the same 512×424 grid and no registration is involved. Actively illuminated
+//! IR holds 30 fps in a dark game room where auto-exposed colour drops to 15.
 //!
-//! * **IR-first** (default): only the depth pipeline streams
-//!   (`start_streams(false, true)`) — IR rides the same listener. The IR
-//!   frame is auto-levelled and fed to BlazePose; the head point then
-//!   samples the depth grid **directly** (IR and depth share the sensor and
-//!   the 512×424 grid — no registration involved). Actively illuminated IR
-//!   holds 30 fps in a dark game room where auto-exposed colour drops to 15.
-//! * **Colour fallback**: BlazePose runs on the 1920×1080 BGRX stream and
-//!   depth is sampled through libfreenect2's factory registration
-//!   (`bigdepth`, depth expressed in colour pixels), deprojected with the
-//!   **colour** intrinsics.
+//! There used to be a colour path behind a VPX setting, running BlazePose on
+//! the 1920×1080 BGRX stream and sampling depth through libfreenect2's factory
+//! registration. It is gone. A sensor that carries its own illuminator should
+//! use it; offering the worse stream as a choice only invited someone to pick
+//! it, and it kept a whole second geometry — colour intrinsics, a registration
+//! object, an 8.3 MB frame buffer, a windowed depth projection — alive to
+//! serve that choice. Webcams have no IR and use colour because they have
+//! nothing else, which is a capability, not a preference.
 //!
-//! Either way the v2 frame is mirrored vs the v1 — X is negated so
-//! left/right POV travel matches across backends.
+//! The v2 frame is mirrored vs the v1 — X is negated so left/right POV travel
+//! matches across backends.
 //!
-//! **Anchor calibration follows the tracking stream**, so in IR mode the
-//! cabinet is located in the IR frame and the geometry lands in the depth
-//! camera's own coordinates — the same lens again, so the per-head depth
-//! lookup needs no registration. It also means colour never starts: the
-//! session opens on IR/depth and stays there, with no stop/restart in the
-//! middle. Before this, calibration asked for colour frames while `open()`
-//! called `Device::start()` — which is `start_streams(false, true)` and does
-//! not start colour — so the anchor phase on a v2 waited out its timeout on
-//! a stream that was never running, every time.
+//! **Anchor calibration runs on the same IR frame**, so the cabinet is located
+//! in the IR image and the geometry lands in the depth camera's own
+//! coordinates — the same lens again. Colour never starts at all: the session
+//! opens on IR/depth and stays there. Before this, calibration asked for
+//! colour frames while `open()` called `Device::start()` — which is
+//! `start_streams(false, true)` and does not start colour — so the anchor
+//! phase on a v2 waited out its timeout on a stream that was never running,
+//! every time.
 
 use std::time::Instant;
 
 use tracing::{info, warn};
 
-use freenect2::{Context, DepthFrame, Device, IrFrame, Registration, RgbFrame};
+use freenect2::{Context, DepthFrame, Device, IrFrame};
 
 use super::pipeline::{
-    DEPTH_MIN_SAMPLES, HEAD_WINDOW_HALF, HeadPixel, Intrinsics, TrackingStream,
-    autolevel_gray8_raw, bgrx_to_rgb888, gray8_to_rgb888, head_center_xy,
-    head_pixel_from_pose_depth, head_pixel_from_window,
+    DEPTH_MIN_SAMPLES, HeadPixel, Intrinsics, autolevel_gray8_raw, gray8_to_rgb888,
+    head_pixel_from_pose_depth,
 };
 use super::{HeadTracker, Pose};
 
@@ -44,12 +45,9 @@ pub struct KinectV2Backend {
     // libfreenect2's Freenect2Device shutdown still has a live Freenect2.
     // Rust drops struct fields in declaration order, so list `device` first.
     device: Device,
-    registration: Option<Registration>,
     _ctx: Context,
     blaze: blazepose::BlazePose,
-    stream: TrackingStream,
     ir_intr: Intrinsics,
-    color_intr: Intrinsics,
     /// Latest BlazePose fix + the dimensions of the frame it was found in.
     last_pose: Option<blazepose::Pose>,
     pose_src: (u32, u32),
@@ -57,19 +55,14 @@ pub struct KinectV2Backend {
     /// 868 KB each: allocating them per poll cost more than the copy.
     depth_buf: DepthFrame,
     ir_buf: IrFrame,
-    rgb_buf: RgbFrame,
-    /// Colour-space depth around the head only (colour mode) — see
-    /// [`Registration::depth_window`].
-    head_window: Vec<f32>,
     started_at: Instant,
     /// Declared last: released only after the device handle above closes.
     _hwlock: crate::hwlock::HwLock,
 }
 
 impl KinectV2Backend {
-    /// Open the first Kinect v2 found on USB and start the streams the
-    /// selected tracking mode needs.
-    pub fn open(stream: TrackingStream) -> Result<Self, Error> {
+    /// Open the first Kinect v2 found on USB and start IR + depth.
+    pub fn open() -> Result<Self, Error> {
         // Cross-process exclusivity (demo, cron capture, second VPX): fail
         // fast with a readable message instead of a USB-level fight.
         let hwlock = crate::hwlock::HwLock::acquire("kinect-v2").map_err(Error::Busy)?;
@@ -94,20 +87,14 @@ impl KinectV2Backend {
         } else {
             info!(pipeline, "kinect-v2: depth pipeline");
         }
-        // Start exactly the streams this mode needs, and keep them for the
-        // whole session. In IR mode the anchor phase reads the IR frame, so
-        // colour never has to flow at all: half the USB load, no 8 MB BGRX
-        // conversion per frame, and no stop/restart between calibration and
-        // tracking. It also puts the cabinet geometry in the depth camera's
-        // own frame -- IR and depth share the lens on this sensor -- so the
-        // per-head depth lookup needs no colour-to-depth registration.
-        //
-        // Note `Device::start()` is `start_streams(false, true)`: it does NOT
-        // start colour. Anchor calibration in RGB mode has to ask for it.
-        match stream {
-            TrackingStream::Ir => device.start()?,
-            TrackingStream::Rgb => device.start_streams(true, true)?,
-        }
+        // IR + depth for the whole session, colour never. Half the USB load,
+        // no 8 MB BGRX conversion per frame, no stop/restart between
+        // calibration and tracking, and the cabinet geometry lands in the
+        // depth camera's own frame -- IR and depth share the lens on this
+        // sensor -- so the per-head depth lookup needs no colour-to-depth
+        // registration. `Device::start()` is exactly `start_streams(false,
+        // true)`.
+        device.start()?;
         let ir = device.ir_params();
         let ir_intr = Intrinsics {
             fx: ir.fx,
@@ -115,93 +102,46 @@ impl KinectV2Backend {
             cx: ir.cx,
             cy: ir.cy,
         };
-        let color = device.color_params();
-        let color_intr = Intrinsics {
-            fx: color.fx,
-            fy: color.fy,
-            cx: color.cx,
-            cy: color.cy,
-        };
-        let registration = match stream {
-            TrackingStream::Rgb => Some(device.registration()),
-            TrackingStream::Ir => None,
-        };
         let blaze = blazepose::BlazePose::new()?;
         info!(
             n_devices = count,
-            ?stream,
             ir_fx = ir_intr.fx,
-            color_fx = color_intr.fx,
-            "kinect-v2: device opened"
+            "kinect-v2: device opened (IR + depth)"
         );
         Ok(Self {
             device,
-            registration,
             _ctx: ctx,
             blaze,
-            stream,
             ir_intr,
-            color_intr,
             last_pose: None,
             pose_src: (0, 0),
             depth_buf: DepthFrame::default(),
             ir_buf: IrFrame::default(),
-            rgb_buf: RgbFrame::default(),
-            head_window: vec![
-                f32::INFINITY;
-                ((2 * HEAD_WINDOW_HALF + 1) * (2 * HEAD_WINDOW_HALF + 1)) as usize
-            ],
             started_at: Instant::now(),
             _hwlock: hwlock,
         })
     }
 
-    /// Feed the newest video frame (IR or colour per mode) to BlazePose.
+    /// Feed the newest IR frame to BlazePose.
     fn refresh_pose(&mut self) {
-        match self.stream {
-            TrackingStream::Ir => {
-                if self.device.poll_ir_into(&mut self.ir_buf) {
-                    // v2 IR is a wide-range f32 intensity; round to u16 and
-                    // auto-level, or the untouched high byte is nearly black.
-                    let raw: Vec<u16> = self.ir_buf.data.iter().map(|&v| v as u16).collect();
-                    let gray = autolevel_gray8_raw(&raw, false);
-                    let rgb888 = gray8_to_rgb888(&gray);
-                    let (w, h) = (self.ir_buf.width, self.ir_buf.height);
-                    match self
-                        .blaze
-                        .poll(&rgb888, w, h, blazepose::PixelLayout::Rgb888)
-                    {
-                        Ok(pose) => {
-                            if pose.is_some() {
-                                self.pose_src = (w, h);
-                            }
-                            self.last_pose = pose;
-                        }
-                        Err(e) => warn!("kinect-v2: blazepose failed on IR: {e}"),
+        if self.device.poll_ir_into(&mut self.ir_buf) {
+            // v2 IR is a wide-range f32 intensity; round to u16 and
+            // auto-level, or the untouched high byte is nearly black.
+            let raw: Vec<u16> = self.ir_buf.data.iter().map(|&v| v as u16).collect();
+            let gray = autolevel_gray8_raw(&raw, false);
+            let rgb888 = gray8_to_rgb888(&gray);
+            let (w, h) = (self.ir_buf.width, self.ir_buf.height);
+            match self
+                .blaze
+                .poll(&rgb888, w, h, blazepose::PixelLayout::Rgb888)
+            {
+                Ok(pose) => {
+                    if pose.is_some() {
+                        self.pose_src = (w, h);
                     }
+                    self.last_pose = pose;
                 }
-            }
-            TrackingStream::Rgb => {
-                if self.device.poll_rgb_into(&mut self.rgb_buf) {
-                    // Straight to the model in the sensor's own layout: the
-                    // repack into packed RGB moved 8.3 MB in and 6.2 MB out
-                    // per frame so that a 256x256 patch could be sampled.
-                    let (w, h) = (self.rgb_buf.width, self.rgb_buf.height);
-                    match self.blaze.poll(
-                        &self.rgb_buf.data,
-                        w,
-                        h,
-                        blazepose::PixelLayout::Bgrx8888,
-                    ) {
-                        Ok(pose) => {
-                            if pose.is_some() {
-                                self.pose_src = (w, h);
-                            }
-                            self.last_pose = pose;
-                        }
-                        Err(e) => warn!("kinect-v2: blazepose failed on colour: {e}"),
-                    }
-                }
+                Err(e) => warn!("kinect-v2: blazepose failed on IR: {e}"),
             }
         }
     }
@@ -209,50 +149,17 @@ impl KinectV2Backend {
     fn head_from_depth(&mut self) -> Option<HeadPixel> {
         let pose = self.last_pose.as_ref()?;
         let depth = &self.depth_buf;
-        let head = match self.stream {
-            // Pose already lives in the depth camera's own grid (IR and
-            // depth are the same sensor, pixel aligned) — exact sampling.
-            TrackingStream::Ir => head_pixel_from_pose_depth(
-                pose,
-                self.pose_src,
-                &depth.data,
-                (depth.width, depth.height),
-                &self.ir_intr,
-                DEPTH_MIN_SAMPLES,
-            ),
-            TrackingStream::Rgb => {
-                // Only the neighbourhood of the head is projected into colour
-                // space — the whole-frame `bigdepth` answered the same
-                // question for two million pixels nobody read.
-                let (hx, hy) = head_center_xy(pose);
-                let center = (hx as i32, hy as i32);
-                let window = &mut self.head_window;
-                let reg_ok = self.registration.as_mut().is_some_and(|reg| {
-                    reg.depth_window(&depth.data, center, HEAD_WINDOW_HALF, window)
-                });
-                if reg_ok {
-                    head_pixel_from_window(
-                        pose,
-                        &self.head_window,
-                        HEAD_WINDOW_HALF,
-                        &self.color_intr,
-                        DEPTH_MIN_SAMPLES,
-                    )
-                } else {
-                    // Registration unavailable: linear rescale into the raw
-                    // depth grid — cross-sensor parallax uncorrected, still
-                    // better than nothing.
-                    head_pixel_from_pose_depth(
-                        pose,
-                        self.pose_src,
-                        &depth.data,
-                        (depth.width, depth.height),
-                        &self.ir_intr,
-                        DEPTH_MIN_SAMPLES,
-                    )
-                }
-            }
-        };
+        // The pose already lives in the depth camera's own grid — IR and
+        // depth are the same sensor, pixel aligned — so this is an exact
+        // sampling with no registration in the way.
+        let head = head_pixel_from_pose_depth(
+            pose,
+            self.pose_src,
+            &depth.data,
+            (depth.width, depth.height),
+            &self.ir_intr,
+            DEPTH_MIN_SAMPLES,
+        );
         // v2 frames are mirrored → negate X so left/right POV travel
         // matches the v1 (bigdepth inherits the colour framing, the IR grid
         // shares the depth sensor — the correction applies to all paths).
@@ -285,47 +192,27 @@ impl HeadTracker for KinectV2Backend {
     }
 
     fn device_label(&self) -> String {
-        match self.stream {
-            TrackingStream::Ir => "Kinect v2 (IR stream)".to_string(),
-            TrackingStream::Rgb => "Kinect v2 (color stream)".to_string(),
-        }
+        "Kinect v2 (IR stream)".to_string()
     }
 
     fn poll_calibration_frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
-        match self.stream {
-            // Same auto-levelling that produced the `_irview` frames the
-            // anchor model was trained on, so it sees the distribution it
-            // learned rather than the near-black native IR.
-            TrackingStream::Ir => {
-                if !self.device.poll_ir_into(&mut self.ir_buf) {
-                    return None;
-                }
-                let raw: Vec<u16> = self.ir_buf.data.iter().map(|&v| v as u16).collect();
-                let gray = autolevel_gray8_raw(&raw, false);
-                Some((
-                    self.ir_buf.width,
-                    self.ir_buf.height,
-                    gray8_to_rgb888(&gray),
-                ))
-            }
-            TrackingStream::Rgb => {
-                if !self.device.poll_rgb_into(&mut self.rgb_buf) {
-                    return None;
-                }
-                Some((
-                    self.rgb_buf.width,
-                    self.rgb_buf.height,
-                    bgrx_to_rgb888(&self.rgb_buf.data),
-                ))
-            }
+        // Same auto-levelling that produced the `_irview` frames the anchor
+        // model was trained on, so it sees the distribution it learned rather
+        // than the near-black native IR.
+        if !self.device.poll_ir_into(&mut self.ir_buf) {
+            return None;
         }
+        let raw: Vec<u16> = self.ir_buf.data.iter().map(|&v| v as u16).collect();
+        let gray = autolevel_gray8_raw(&raw, false);
+        Some((
+            self.ir_buf.width,
+            self.ir_buf.height,
+            gray8_to_rgb888(&gray),
+        ))
     }
 
     fn calibration_intrinsics(&self) -> Option<[f32; 4]> {
-        let c = match self.stream {
-            TrackingStream::Ir => &self.ir_intr,
-            TrackingStream::Rgb => &self.color_intr,
-        };
+        let c = &self.ir_intr;
         Some([c.fx, c.fy, c.cx, c.cy])
     }
 
