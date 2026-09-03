@@ -76,9 +76,11 @@ const CONTRIB_TERMS: &[(&str, &str)] = &[
         "What is sent",
         "one image per stream your sensor has -- colour, infrared, depth -- plus a \
          diagnostics log: the app version, your OS, the sensor model, its USB speed \
-         and how many devices share its controller (a count, never their names), and \
-         the frame-rate measurements. No file names, no paths, nothing about the rest \
-         of your machine. The log is what lets a capture that tracks badly be told \
+         and how many devices share its controller (a count, never their names), the \
+         frame-rate measurements, and -- so that one cabinet can be followed from one \
+         release to the next -- your Windows account name, your computer name, and a \
+         random id we generate for this install. Nothing else about your machine, and \
+         no file contents. The log is what lets a capture that tracks badly be told \
          apart from one that was merely starved by USB.",
     ),
     (
@@ -148,6 +150,15 @@ fn main() {
         os_version = %host.version(),
         arch = host.architecture().unwrap_or("unknown"),
         "headtracking-demo starting"
+    );
+    // Right under the banner, so following one cabinet across releases is a
+    // grep rather than an inference from capture paths.
+    let (user, machine) = host_identity();
+    info!(
+        user,
+        machine,
+        install = install_id(),
+        "host identity — for following one cabinet across releases"
     );
     // Bus context right under the banner: speed and contention explain most
     // of what the perf numbers below will show, and deducing them after the
@@ -9304,6 +9315,91 @@ fn init_tracing(sink: Arc<Mutex<VecDeque<String>>>) {
         .init();
 }
 
+/// Who and which machine this session ran on, for following one cabinet
+/// across releases.
+///
+/// Three fields because no single one does the job:
+///
+/// * `user` — the account name, which is what was asked for. It already
+///   leaked into the logs incidentally, through capture paths like
+///   `C:\Users\<name>\Downloads`, so naming it explicitly hides nothing new.
+/// * `machine` — the host name. A tester with two cabinets has one account
+///   and two machines; the account cannot tell them apart.
+/// * `install` — a random id minted once beside the log and never sent
+///   anywhere else. It is the only one that always exists: five of the first
+///   twelve contributed logs carried **no** user name at all, because that
+///   cabinet installs into `C:\Visual Pinball\` rather than a user folder,
+///   and those were exactly the logs we could not attribute. It also survives
+///   a rename, and it is the field to lean on when the other two are blank.
+///
+/// Every part is best effort; an unknown one is reported as `?` rather than
+/// failing a startup over it.
+fn host_identity() -> (String, String) {
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "?".to_owned());
+    let machine = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "?".to_owned());
+    (user, machine)
+}
+
+/// A stable per-installation id, minted on first run beside the log.
+///
+/// Not derived from anything about the machine: a hash of the host name or
+/// the MAC would be a fingerprint dressed as an id, and it would change the
+/// moment either does. This is eight random-ish hex characters, kept in a
+/// file, meaning nothing outside our own drop folder.
+fn install_id() -> String {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(std::path::Path::to_path_buf))
+    else {
+        return "?".to_owned();
+    };
+    let path = dir.join("headtracking-install-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let id = existing.trim().to_owned();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    // No `rand` dependency for eight characters: the clock in nanoseconds
+    // mixed with the pid is distinct enough for an id whose only job is to
+    // differ between installs.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let id = mint_install_id(nanos, std::process::id());
+    // A read-only install directory just means we mint a fresh one each run;
+    // the field is still better than nothing, and nothing here is worth
+    // failing over.
+    let _ = std::fs::write(&path, &id);
+    id
+}
+
+/// The eight characters themselves, away from the clock and the filesystem so
+/// they can be tested.
+fn mint_install_id(nanos: u128, pid: u32) -> String {
+    // The pid has to reach the low half: shifting it up and then keeping the
+    // bottom eight hex characters threw it away entirely, and two installs
+    // minted in the same nanosecond would have collided. Multiply by the
+    // 64-bit golden ratio so both inputs touch every kept bit.
+    let mixed = (nanos as u64)
+        .rotate_left(17)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ u64::from(pid).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    format!("{mixed:016x}")[8..].to_owned()
+}
+
 /// Rigid session delimiter, written straight to the log file rather than
 /// through `tracing`.
 ///
@@ -9574,6 +9670,17 @@ mod tests {
             half.contains("2 of 3") && half.contains("WinUSB"),
             "a half-bound sensor must name the count: {half}"
         );
+    }
+
+    /// Eight hex characters, and actually varying — an id that collides
+    /// across installs would tell us two cabinets are one.
+    #[test]
+    fn an_install_id_is_eight_hex_characters_and_varies() {
+        let a = mint_install_id(1_700_000_000_123_456_789, 4242);
+        assert_eq!(a.len(), 8, "{a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, mint_install_id(1_700_000_000_123_456_790, 4242));
+        assert_ne!(a, mint_install_id(1_700_000_000_123_456_789, 4243));
     }
 
     /// A session runs from its start marker to the next one, or to the end of
