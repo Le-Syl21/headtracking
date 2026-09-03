@@ -104,6 +104,12 @@ struct Baseline {
 
 static GAME: Mutex<Option<GameSession>> = Mutex::new(None);
 
+/// A fault to put on screen at the next frame, when there is no
+/// [`GameSession`] to hang it on — the tracker never started, or has just been
+/// torn down. Without this a player whose camera is unplugged sees a table
+/// that simply never responds, and nothing anywhere says why.
+static PENDING_FAULT: Mutex<Option<TrackingFault>> = Mutex::new(None);
+
 /// `dlsym` target invoked by VPX after loading the cdylib.
 ///
 /// # Safety
@@ -391,6 +397,10 @@ extern "C" fn on_game_start(_msg_id: u32, _context: *mut c_void, _data: *mut c_v
             }
             Err(err) => {
                 warn!(?err, "tracker session failed to start; running passthrough");
+                // Passthrough is the right behaviour, but a silent one: the
+                // table plays with a fixed view and nothing tells the player
+                // the camera is the reason.
+                *PENDING_FAULT.lock() = Some(TrackingFault::NoCamera);
             }
         }
     }));
@@ -401,6 +411,10 @@ extern "C" fn on_game_end(_msg_id: u32, _context: *mut c_void, _data: *mut c_voi
         info!("VPX event: OnGameEnd");
         // Drop joins the tracker thread and tears the device down.
         GAME.lock().take();
+        // A fault raised in the last frames of a game has no one left to show
+        // it to; carrying it over would surface it on the next table, about a
+        // session that is already gone.
+        PENDING_FAULT.lock().take();
     }));
 }
 
@@ -451,10 +465,37 @@ fn apply_pose_to_view() {
     // 2. Hold the GAME lock for the rest. The tracker pose lookup is lock-free
     //    (ArcSwap), and OnPrepareFrame is single-threaded by VPX, so there is
     //    no contention.
+    // Faults first, and before the GameSession check: the two cases that
+    // matter most — no camera at all, and a tracker that died on startup —
+    // are exactly the ones with no session to hang a message on.
+    if let Some(fault) = PENDING_FAULT.lock().take() {
+        // SAFETY: API pointer valid for the plugin session.
+        let vpx = unsafe { &*vpx_api_ptr };
+        if let Some(note) = fault_note(fault)
+            && let Some(notify) = vpx.PushNotification
+        {
+            // SAFETY: NUL-terminated CString kept alive across the call.
+            unsafe { notify(note.as_ptr(), STARTUP_NOTE_MS) };
+        }
+    }
+
     let mut game_guard = GAME.lock();
     let Some(game) = game_guard.as_mut() else {
         return;
     };
+
+    // The tracker thread gave up. Tear the session down rather than keep a
+    // dead one standing: its pose will never move again, and the static
+    // prerendering we disabled for it stays off for the rest of the table.
+    // The message goes through PENDING_FAULT so it lands next frame, once
+    // this session is gone.
+    if let Some(fault) = game.tracker.take_fault() {
+        *PENDING_FAULT.lock() = Some(fault);
+        *game_guard = None;
+        drop(game_guard);
+        restore_static_prerendering(vpx_api_ptr);
+        return;
+    }
 
     // SAFETY: vpx_api_ptr was set non-null at load time and the host keeps
     // the API live through the plugin session.
@@ -469,18 +510,6 @@ fn apply_pose_to_view() {
     // One-shot startup notification (built at game start). Long enough to
     // read the setup reminders without pausing the game.
     if let Some(note) = game.pending_note.take()
-        && let Some(notify) = vpx.PushNotification
-    {
-        // SAFETY: NUL-terminated CString kept alive across the call.
-        unsafe { notify(note.as_ptr(), STARTUP_NOTE_MS) };
-    }
-
-    // The tracker thread gave up. Say it on screen: a session that cannot
-    // reach its tracking stream used to degrade to something that half worked,
-    // which reached us months later as a tracking bug rather than as the busy
-    // device it was. Taken, so it fires once.
-    if let Some(fault) = game.tracker.take_fault()
-        && let Some(note) = fault_note(fault)
         && let Some(notify) = vpx.PushNotification
     {
         // SAFETY: NUL-terminated CString kept alive across the call.
@@ -642,6 +671,22 @@ fn window_player_rotation(view: &VPXViewSetupDef) -> f32 {
 /// Build the one-shot startup notification: the camera the plugin tracks
 /// on and the VPX settings the head-tracking experience depends on. The
 /// camera-pose line arrives later, once the live anchor calibration lands.
+/// Hand VPX back its static prerendering.
+///
+/// We disable it when a session starts, because a continuously moving camera
+/// invalidates the pass. A session that has died moves nothing, so leaving it
+/// off would cost the rest of the table its optimisation for no benefit.
+fn restore_static_prerendering(vpx_ptr: *mut VPXPluginAPI) {
+    if vpx_ptr.is_null() {
+        return;
+    }
+    // SAFETY: API pointer valid for the plugin session.
+    if let Some(disable) = unsafe { (*vpx_ptr).DisableStaticPrerendering } {
+        // SAFETY: plain int argument per the FFI contract.
+        unsafe { disable(0) };
+    }
+}
+
 /// The player-facing wording for a [`TrackingFault`].
 ///
 /// Every sentence a player reads is built in this module, not in the backend
@@ -650,6 +695,11 @@ fn window_player_rotation(view: &VPXViewSetupDef) -> f32 {
 /// one `match` per language rather than prose scattered across the trackers.
 fn fault_note(fault: TrackingFault) -> Option<std::ffi::CString> {
     let text = match fault {
+        TrackingFault::NoCamera => {
+            "Head tracking off: no camera was found. Check that the Kinect or webcam is \
+             plugged in and powered, that nothing else is using it, and that its driver \
+             is installed — then restart the table."
+        }
         TrackingFault::IrStreamBusy => {
             "Head tracking off: the Kinect's infrared stream cannot be opened because its \
              camera stream is already in use. Close whatever else is holding the Kinect \
@@ -818,11 +868,9 @@ mod tests {
     /// notification reads as "nothing happened" rather than "tracking is off".
     #[test]
     fn every_tracking_fault_has_something_to_say() {
-        // One variant today. The loop is the point: it is the list a new
-        // `TrackingFault` has to join, and the assertion below is what stops
-        // it shipping without wording.
-        #[allow(clippy::single_element_loop, reason = "grows with the enum")]
-        for fault in [TrackingFault::IrStreamBusy] {
+        // The list a new `TrackingFault` has to join; the assertions below are
+        // what stop it shipping without wording a player can act on.
+        for fault in [TrackingFault::IrStreamBusy, TrackingFault::NoCamera] {
             let note = fault_note(fault).unwrap_or_else(|| panic!("no wording for {fault:?}"));
             let text = note.to_str().expect("utf-8");
             assert!(text.len() > 40, "{fault:?}: {text:?}");

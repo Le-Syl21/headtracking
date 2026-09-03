@@ -55,6 +55,10 @@ pub enum TrackingFault {
     /// has exactly one, shared between colour and IR, so this means something
     /// else on the machine is holding the camera.
     IrStreamBusy,
+    /// No camera opened at all — every backend in the chain declined. Head
+    /// tracking cannot start, and the player should be told rather than left
+    /// to wonder why the view never moves.
+    NoCamera,
 }
 
 pub trait HeadTracker: Send {
