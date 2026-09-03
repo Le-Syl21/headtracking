@@ -1,33 +1,30 @@
 name: Release
 
-# Triggered when a `vX.Y.Z` (or `vX.Y.Z-suffix`) tag is pushed, and on
-# every push to `main` (dev builds). Each matrix target builds the cdylib
-# (`headtracking`) + the standalone demo (`headtracking-demo`), bundles
-# them with `plugin.cfg` and `LICENSE`, uploads as a workflow artifact.
+# The only workflow in this repository. A push builds nothing: work lands on
+# `main` continuously and a build per commit would burn four runners to tell
+# us what `cargo test` already said locally.
 #
-# On a tag, the artifacts are additionally signed (Windows/macOS, gated
-# behind the `signing` environment) and published as a GitHub Release.
-# On a `main` push, only the build matrix runs: the artifacts stay on the
-# workflow run (Actions tab, GitHub login required to download), UNSIGNED
-# — Windows SmartScreen / macOS Gatekeeper will warn. They're meant for
-# testers who want the freshest plugin+demo without waiting for a tag.
+# One chain, in this order, and each link gates the next:
 #
-# Targets that don't build cleanly yet (e.g. cross-compiled aarch64
-# Linux, Windows MSVC w/ vendored cmake projects) are marked
-# `continue-on-error: true` so a partial matrix still produces a
-# release with the working architectures. Fix per-target as they
-# stabilise.
+#   check   cargo fmt --check, clippy -D warnings, the test suite. Fails
+#           here and nothing is built.
+#   build   the matrix — cdylib (`headtracking`) + demo, bundled with
+#           `plugin.cfg` and `LICENSE`, uploaded as a workflow artifact.
+#   sign    Windows/macOS, behind the `signing` environment. Tag only.
+#   release published from the artifacts already built. Nothing is
+#           recompiled to publish it. Tag only.
+#
+# `workflow_dispatch` runs check + build and stops there: the dry run that
+# says whether a tag would succeed, and the way to hand a tester an
+# (unsigned) build without cutting a release.
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*.*.*'
       - 'v*.*.*-*'
-  # Manual dry-run: builds the whole matrix without publishing a release.
-  # Use this to validate that every target builds before pushing the
-  # actual tag.
+  # Manual dry-run: checks and builds the whole matrix without publishing.
+  # Use this to validate every target before pushing the actual tag.
   workflow_dispatch:
 
 permissions:
@@ -50,6 +47,66 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
+  # Everything that can fail without a compiler for four platforms. It runs
+  # first and `build` waits on it, so a tag that does not pass its own tests
+  # never reaches a runner, let alone a release page.
+  #
+  # Moved here from a `ci.yml` that only triggered on `pull_request` — and
+  # this repository does not use pull requests, so in practice it never ran
+  # on its own. A gate nothing triggers is not a gate.
+  check:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      # Third-party actions are pinned to a commit SHA, not a tag: a tag is
+      # mutable, a SHA is not.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      # Same ort-download-cache pairing as the build job: the target dir's
+      # ort-sys fingerprint replays a link-search into this dir, so both must
+      # live and die together in the cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          cache-directories: ~/.cache/ort.pyke.io
+
+      # Formatting first: it needs no dependencies, so a badly formatted tree
+      # fails in seconds instead of after a full dependency build.
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          # Full SDL3 build-deps list (per
+          # https://wiki.libsdl.org/SDL3/README-linux) plus libusb / libudev
+          # for libfreenect[2]. Even though our plugin doesn't actually use
+          # SDL3 (dlsym at runtime), the workspace's `headtracking-demo`
+          # binary does — and `cargo clippy --workspace` builds every member.
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev pkg-config ninja-build \
+            opencl-headers ocl-icd-opencl-dev \
+            libusb-1.0-0-dev libudev-dev \
+            libasound2-dev libpulse-dev libjack-jackd2-dev \
+            libsndio-dev libpipewire-0.3-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxfixes-dev libxi-dev libxinerama-dev libxss-dev \
+            libxtst-dev libxkbcommon-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libdrm-dev libgbm-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libdbus-1-dev libibus-1.0-dev
+
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --release --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --release --all-features
+
   # The ONNX models are platform-agnostic: fetch them ONCE here and fan
   # them out to the whole matrix as a workflow artifact, instead of four
   # parallel fresh checkouts each hitting Hugging Face (2 files × 4
@@ -107,7 +164,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.suffix }}
-    needs: fetch-models
+    needs: [check, fetch-models]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
