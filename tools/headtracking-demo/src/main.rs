@@ -3608,7 +3608,7 @@ enum Startup {
 /// "a new frame was published, consume it" branch — capture rate, sensor rate
 /// and drop share alike. So the instrument went dark at exactly the moment it
 /// was needed: a field log (2026-09-03) held thirteen minutes of
-/// `cam 0.0 fps | ir+depth 0.0 fps` with the ` of N sensor` suffix gone, and
+/// `cam 0.0 fps | ir 0.0 fps` with the ` of N sensor` suffix gone, and
 /// that line cannot tell "the sensor delivered nothing" apart from "we stopped
 /// reading it" — the two produce identical output. Exported captures from the
 /// same session proved frames were still flowing. Reading these atomics
@@ -3634,7 +3634,7 @@ struct CaptureVitals {
     depth_delivered: AtomicU64,
     depth_dropped: AtomicU64,
     /// The colour camera's own auto-exposure, as `f32` bits. This is what
-    /// explains a `cam` rate that sits at half the `ir+depth` one: the v2
+    /// explains a `cam` rate that sits at half the `ir` one: the v2
     /// auto-exposes and halves to 15 Hz in a dim room, while IR and depth hold
     /// ~30 Hz off their own illuminator. Without it, reading `cam 14.9` left
     /// the reader to guess whether the room was dark or we were struggling —
@@ -4932,7 +4932,18 @@ struct Metrics {
     /// The colour camera's auto-exposure read-out and the sensor's own frame
     /// step, when the backend can give them.
     exposure: Option<(f32, f32, u32)>,
-    /// Depth / IR capture rates. Diagnostic only — neither is a display rate.
+    /// Depth and IR capture rates, reported separately.
+    ///
+    /// They used to share one number printed as `ir+depth`, which was wrong
+    /// twice over: the value was the IR stream alone, never a sum, and the
+    /// label invited exactly the question it should have answered — whether
+    /// the IR camera follows the colour one down in a dim room. It does not.
+    /// The v2's depth and IR come off a time-of-flight sensor with its own
+    /// 860 nm illuminator at a fixed 30 Hz; only the auto-exposed colour
+    /// camera halves to 15. Two names, two numbers, and a divergence between
+    /// them becomes visible instead of hidden.
+    ///
+    /// Diagnostic only — neither is a display rate.
     /// The Kinect streams them from its **own IR illuminator**, so they hold
     /// ~30 Hz in the dark while the auto-exposed colour stream halves to 15:
     /// `ir` staying at 30 while `in` sits at 15 is the proof the ceiling is the
@@ -5246,7 +5257,7 @@ impl Metrics {
                 // ASCII only: a `->` and not an arrow glyph, because Windows
                 // tools open this file as ANSI and turn UTF-8 arrows into
                 // mojibake.
-                "perf IN(cam {:.1} fps{} | ir+depth {:.1} fps{}),{} \
+                "perf IN(cam {:.1} fps{} | ir {:.1} fps{} | depth {:.1} fps),{} \
                  COPY(frame {:.1} ms), \
                  MAP(align {}), \
                  AI(anchor {} | head {:.1} ms, own thread), \
@@ -5258,6 +5269,7 @@ impl Metrics {
                 Self::sensor_note(self.sensor_in_fps, self.in_drop_pct),
                 self.ir_fps,
                 Self::sensor_note(self.sensor_ir_fps, self.ir_drop_pct),
+                self.depth_fps,
                 self.light_note(),
                 self.copy_ms,
                 if self.reg_ms > 0.0 {
@@ -5302,7 +5314,7 @@ impl Metrics {
             s.push_str(&format!(" of {sensor:.0}, {drop:.0}% dropped"));
         }
         if self.ir_fps > 0.0 {
-            s.push_str(&format!(" | ir+depth {:.0}", self.ir_fps));
+            s.push_str(&format!(" | ir {:.0}", self.ir_fps));
         }
         if self.copy_ms > 0.0 {
             s.push_str(&format!(" · copy {:.0}ms", self.copy_ms));
