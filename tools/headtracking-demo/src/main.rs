@@ -4937,11 +4937,26 @@ struct Metrics {
     /// They used to share one number printed as `ir+depth`, which was wrong
     /// twice over: the value was the IR stream alone, never a sum, and the
     /// label invited exactly the question it should have answered — whether
-    /// the IR camera follows the colour one down in a dim room. It does not.
-    /// The v2's depth and IR come off a time-of-flight sensor with its own
-    /// 860 nm illuminator at a fixed 30 Hz; only the auto-exposed colour
-    /// camera halves to 15. Two names, two numbers, and a divergence between
-    /// them becomes visible instead of hidden.
+    /// the IR camera follows the colour one down in a dim room.
+    ///
+    /// It does not, and libfreenect2's own API says why. Exposure control
+    /// exists for the colour camera only (`setColorAutoExposure`,
+    /// `setColorSemiAutoExposure`, `setColorManualExposure`) with nothing
+    /// equivalent for IR or depth, whose hardware settings the firmware
+    /// handles by itself. `Frame::exposure`/`gain`/`gamma` are likewise
+    /// written solely by the RGB packet processors, from the RGB packet
+    /// footer — an IR or depth frame carries none of them.
+    ///
+    /// The colour halving has a mechanism, not just a habit: manual
+    /// integration time runs to 66 ms (`setColorManualExposure`, range
+    /// `(0.0, 66.0]`), which is one whole frame period at 15 Hz. Once
+    /// auto-exposure needs more than ~33 ms of light, 30 Hz is arithmetically
+    /// out of reach. The depth/IR side integrates under its own active
+    /// illuminator and holds ~30 Hz across every session we have collected.
+    ///
+    /// So the ratio is the colour half falling, not the IR half rising. Two
+    /// names, two numbers, and a divergence between them becomes visible
+    /// instead of hidden.
     ///
     /// Diagnostic only — neither is a display rate.
     /// The Kinect streams them from its **own IR illuminator**, so they hold
