@@ -154,14 +154,32 @@ fn main() {
     // fact took an hour on the first Windows report.
     usb_check::log_startup();
 
-    // Hidden `--upload-test`: exercise the contribution upload path (ureq /
-    // rustls / auth / write-only drop) end to end without the GUI, then exit.
+    // `--upload-test`: exercise the contribution upload path (ureq / rustls /
+    // auth / write-only drop) end to end without the GUI, then exit. This is
+    // what we ask a contributor to run when their captures never arrive: it
+    // separates "this machine cannot reach the server" from "the server said
+    // no", in one line each, without them having to capture anything.
     if std::env::args().any(|a| a == "--upload-test") {
-        let uploader = contribute::Uploader::spawn();
+        let reach = contribute::probe();
+        println!("upload-test: reachability — {}", reach.explain());
+        if !reach.is_up() {
+            eprintln!(
+                "upload-test: FAILED before sending anything.\n\
+                 Captures can still be saved locally and handed over here: {}",
+                contribute::DISCORD_INVITE
+            );
+            std::process::exit(1);
+        }
+        // A test file has no business landing in the contributor's rescue
+        // folder if it fails — it is not a capture worth keeping.
+        let uploader = contribute::Uploader::spawn(std::env::temp_dir());
         let name = format!("{}_uploadtest.txt", contribution_stem(Backend::None));
         println!("upload-test: PUT {name}");
         uploader.submit(name.clone(), b"headtracking-demo upload test\n".to_vec());
-        for _ in 0..100 {
+        // Wait on the same budget a real file gets, so a slow-but-working link
+        // reports OK instead of a misleading timeout.
+        let deadline = Instant::now() + contribute::batch_budget(1);
+        while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
             let st = uploader.status();
             if st.pending == 0 {
@@ -1744,19 +1762,43 @@ fn run_headless_contribute(cap: CaptureArgs) -> Result<(), String> {
     if let Some(dir) = &cap.local_copy {
         probe_writable(dir).map_err(|e| format!("--local-copy {}: {e}", dir.display()))?;
     }
-    let uploader = contribute::Uploader::spawn();
+    // Ask whether the drop is reachable before spending the transfer budget on
+    // a link that was never going to carry it. Files the run cannot upload
+    // land in the rescue folder either way, so the capture survives the answer.
+    let reach = contribute::probe();
+    println!("contribute: reachability — {}", reach.explain());
+    // With no route to the drop the capture must still land somewhere, even
+    // when the run asked for upload-only: an unattended job that captures and
+    // then throws the result away is the worst of both.
+    let keep = cap
+        .local_copy
+        .clone()
+        .or_else(|| (!reach.is_up()).then(default_rescue_dir));
+    let uploader = contribute::Uploader::spawn(keep.clone().unwrap_or_else(default_rescue_dir));
     let count = files.len();
     for (name, bytes) in files {
-        if let Some(dir) = &cap.local_copy
-            && let Err(e) = std::fs::write(dir.join(&name), &bytes)
-        {
-            warn!(name, "contribution: local save failed: {e}");
+        if let Some(dir) = &keep {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(dir = %dir.display(), "contribution: folder unusable: {e}");
+            } else if let Err(e) = std::fs::write(dir.join(&name), &bytes) {
+                warn!(name, "contribution: local save failed: {e}");
+            }
         }
-        println!("contribute: queuing {name} ({} KiB)", bytes.len() / 1024);
-        uploader.submit(name, bytes);
+        if reach.is_up() {
+            println!("contribute: queuing {name} ({} KiB)", bytes.len() / 1024);
+            uploader.submit(name, bytes);
+        }
+    }
+    if !reach.is_up() {
+        return Err(format!(
+            "not uploaded: {} — the capture was kept in {} and can be handed over on {}",
+            reach.explain(),
+            keep.unwrap_or_else(default_rescue_dir).display(),
+            contribute::DISCORD_INVITE
+        ));
     }
     // Block until the upload queue drains — cron has no UI to watch it.
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + contribute::batch_budget(count);
     loop {
         let st = uploader.status();
         if st.pending == 0 {
@@ -1764,9 +1806,17 @@ fn run_headless_contribute(cap: CaptureArgs) -> Result<(), String> {
                 println!("contribute: OK — {count} file(s) uploaded ({stem})");
                 return Ok(());
             }
+            let kept = st
+                .rescued_in
+                .clone()
+                .unwrap_or_else(|| uploader.rescue_dir());
             return Err(format!(
-                "only {}/{count} file(s) uploaded — last error: {:?}",
-                st.uploaded, st.last_error
+                "only {}/{count} file(s) uploaded — last error: {:?}; what did not go up was \
+                 kept in {} and can be handed over on {}",
+                st.uploaded,
+                st.last_error,
+                kept.display(),
+                contribute::DISCORD_INVITE
             ));
         }
         if Instant::now() > deadline {
@@ -2417,6 +2467,12 @@ struct App {
     consent_checked: bool,
     /// Background uploader for shared captures (write-only Nextcloud drop).
     uploader: contribute::Uploader,
+    /// Whether this machine can reach the drop at all, checked before the
+    /// panel offers to upload anything. A pincab behind a firewall used to
+    /// find out only after capturing — 35 files, no error, nothing received.
+    drop_reach: ReachState,
+    /// Receiver for the reachability probe running off the UI thread.
+    drop_probe: Option<mpsc::Receiver<contribute::Reach>>,
     /// Stem of the last capture shared, shown so the user can note it (needed
     /// to request a removal, since the drop is anonymous).
     contrib_last: Option<String>,
@@ -5123,7 +5179,9 @@ impl App {
             selected_stream: StreamKind::Rgb,
             contribute_open: false,
             consent_checked: false,
-            uploader: contribute::Uploader::spawn(),
+            uploader: contribute::Uploader::spawn(default_rescue_dir()),
+            drop_reach: ReachState::Unknown,
+            drop_probe: None,
             contrib_last: None,
             contrib_local: LocalCopy::default(),
             contrib_saved_in: None,
@@ -5407,10 +5465,27 @@ impl App {
         // instead of assuming.
         self.contrib_saved_in = None;
         self.contrib_save_error = None;
+        let upload = self.drop_reach.allows_upload();
+        // With no route to the drop, the capture still has to land somewhere:
+        // the folder the contributor chose, or ours if they declined one.
+        // "Upload only" stops meaning anything when there is no upload.
         let local = match &self.contrib_local {
             LocalCopy::Folder(dir) => Some(dir.clone()),
+            LocalCopy::Unasked | LocalCopy::Declined if !upload => Some(default_rescue_dir()),
             LocalCopy::Unasked | LocalCopy::Declined => None,
         };
+        if let Some(dir) = &local {
+            // Anything the drop refuses lands beside the copy they already
+            // know about, so a hand-over is one folder, not two.
+            self.uploader.set_rescue_dir(dir.clone());
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(dir = %dir.display(), "contribution: local folder unusable: {e}");
+                self.contrib_save_error = Some(format!("{}: {e}", dir.display()));
+            }
+        }
+        // Counts describe this capture, not the session: a failure inside a
+        // set of seven must not hide behind an accumulated success total.
+        self.uploader.begin_batch();
         let mut saved = 0usize;
         for (name, bytes) in files {
             if let Some(dir) = &local {
@@ -5423,12 +5498,14 @@ impl App {
                     }
                 }
             }
-            self.uploader.submit(name, bytes);
+            if upload {
+                self.uploader.submit(name, bytes);
+            }
         }
         if saved > 0 {
             self.contrib_saved_in = local;
         }
-        info!(stem, saved, "capture shared");
+        info!(stem, saved, upload, "capture shared");
         self.contrib_last = Some(stem);
     }
 
@@ -6511,10 +6588,63 @@ impl App {
         });
     }
 
+    /// Ask the drop whether it is reachable, off the UI thread.
+    ///
+    /// One HEAD request; the panel shows "checking…" meanwhile and the button
+    /// stays disabled. Re-runnable from the panel, because the answer is about
+    /// the network and the network changes.
+    fn start_drop_probe(&mut self) {
+        if matches!(self.drop_reach, ReachState::Checking) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        if std::thread::Builder::new()
+            .name("drop-probe".into())
+            .spawn(move || {
+                let reach = contribute::probe();
+                info!(?reach, "contribution drop reachability");
+                let _ = tx.send(reach);
+            })
+            .is_ok()
+        {
+            self.drop_reach = ReachState::Checking;
+            self.drop_probe = Some(rx);
+        }
+    }
+
+    /// Collect the probe's answer if it has landed. Never blocks.
+    fn poll_drop_probe(&mut self) {
+        let Some(rx) = &self.drop_probe else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(reach) => {
+                self.drop_reach = ReachState::Known(reach);
+                self.drop_probe = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The thread died without answering: treat as unreachable
+                // rather than leaving the panel spinning forever.
+                self.drop_reach = ReachState::Known(contribute::Reach::Unreachable(
+                    "the check did not complete".into(),
+                ));
+                self.drop_probe = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     /// The "Share a capture" window: the informed-consent notice + checkbox,
     /// the share button (gated on consent + a live frame), upload status, and
     /// a short capture reminder. All demo-only — the plugin has none of this.
     fn contribute_window(&mut self, ctx: &egui::Context) {
+        // The reachability answer is needed before the capture, not after it,
+        // so the check starts the moment the panel opens and is re-read on
+        // every frame it stays open.
+        self.poll_drop_probe();
+        if matches!(self.drop_reach, ReachState::Unknown) {
+            self.start_drop_probe();
+        }
         let mut open = self.contribute_open;
         egui::Window::new("🎁 Share a capture")
             .open(&mut open)
@@ -6570,40 +6700,134 @@ impl App {
                     .active
                     .as_ref()
                     .is_some_and(|a| a.last_rgb_frame.is_some());
+                // Can this machine even reach the drop? Asked here, before a
+                // capture is taken, because the alternative is what actually
+                // happened to a contributor: 35 files shared, no error shown,
+                // nothing received.
+                let can_upload = self.drop_reach.allows_upload();
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    match &self.drop_reach {
+                        ReachState::Unknown | ReachState::Checking => {
+                            ui.spinner();
+                            ui.label("checking that this machine can reach the capture server…");
+                        }
+                        ReachState::Known(reach) if reach.is_up() => {
+                            ui.label(RichText::new("✓ capture server reachable").color(COLOR_OK));
+                        }
+                        ReachState::Known(reach) => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "✖ upload unavailable — {}",
+                                    reach.explain()
+                                ))
+                                .color(COLOR_BAD)
+                                .strong(),
+                            );
+                        }
+                    }
+                    if !matches!(self.drop_reach, ReachState::Checking)
+                        && ui.small_button("↻ check again").clicked()
+                    {
+                        self.start_drop_probe();
+                    }
+                });
+                ui.add_space(4.0);
                 let ready = self.consent_checked && has_frame;
-                if ui
-                    .add_enabled(ready, egui::Button::new("📸 Share this capture"))
-                    .clicked()
-                {
+                // With no route to the server the button does not vanish: it
+                // becomes a save. A capture that exists on disk can still be
+                // handed over; a capture never taken is gone for good.
+                let label = if can_upload {
+                    "📸 Share this capture"
+                } else {
+                    "💾 Save this capture to send by hand"
+                };
+                if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
                     self.share_capture();
                 }
                 if !has_frame {
                     ui.label(RichText::new("(select a device and wait for the feed first)").weak());
                 }
-                // Upload status.
+                if !can_upload && !matches!(self.drop_reach, ReachState::Checking) {
+                    ui.label(
+                        "Your capture will be written to a folder on this machine, and you can \
+                         send it to us on Discord — it is worth just as much as an upload.",
+                    );
+                    ui.hyperlink_to(
+                        "Join the Discord to hand it over",
+                        contribute::DISCORD_INVITE,
+                    );
+                }
+                // Upload status — per share, so one failure inside a set of
+                // seven cannot hide behind a green running total.
                 let st = self.uploader.status();
                 if st.pending > 0 {
                     ui.label(format!("uploading… {} file(s) pending", st.pending));
+                    ui.label(
+                        RichText::new("Please leave this window open until it reaches zero.")
+                            .weak(),
+                    );
                 }
-                if st.uploaded > 0 {
+                if st.uploaded > 0 && !st.has_failure() {
                     ui.label(
                         RichText::new(format!("✓ {} file(s) uploaded", st.uploaded))
-                            .color(Color32::from_rgb(0x66, 0xff, 0x99)),
+                            .color(COLOR_OK),
                     );
                 }
-                if let Some(err) = &st.last_error {
-                    // Only mention a local copy when there actually is one.
-                    let tail = if self.contrib_saved_in.is_some() {
-                        " — your own copy was saved"
-                    } else {
-                        " — and no local copy was kept"
-                    };
-                    ui.label(
-                        RichText::new(format!("upload issue: {err}{tail}"))
-                            .color(Color32::from_rgb(0xff, 0x99, 0x66)),
-                    );
+                if st.has_failure() {
+                    ui.add_space(4.0);
+                    egui::Frame::group(ui.style())
+                        .fill(Color32::from_rgb(0x3a, 0x12, 0x12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "✖ UPLOAD FAILED — {} file(s) did not reach us{}",
+                                    st.failed,
+                                    if st.uploaded > 0 {
+                                        format!(" ({} did)", st.uploaded)
+                                    } else {
+                                        String::new()
+                                    }
+                                ))
+                                .color(COLOR_BAD)
+                                .strong()
+                                .size(16.0),
+                            );
+                            if let Some(err) = &st.last_error {
+                                ui.label(RichText::new(err.as_str()).monospace().color(COLOR_BAD));
+                            }
+                            match (&st.rescued_in, &st.rescue_error) {
+                                (_, Some(e)) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "and the copy we tried to keep could not be written \
+                                             either — {e}"
+                                        ))
+                                        .color(COLOR_BAD),
+                                    );
+                                }
+                                (Some(dir), None) => {
+                                    ui.label("Your capture was kept here:");
+                                    ui.monospace(dir.display().to_string());
+                                    ui.label(
+                                        "Nothing is lost — drop those files on our Discord and \
+                                         they go straight into the training set.",
+                                    );
+                                    ui.hyperlink_to(
+                                        "Join the Discord to hand them over",
+                                        contribute::DISCORD_INVITE,
+                                    );
+                                }
+                                (None, None) => {}
+                            }
+                        });
                 }
-                if let Some(stem) = &self.contrib_last {
+                // The removal ID only means something for a capture that
+                // actually reached us — offering it after a save-only run
+                // would be telling the contributor we have something we don't.
+                if let Some(stem) = &self.contrib_last
+                    && st.uploaded > 0
+                {
                     ui.add_space(4.0);
                     ui.label("Shared — note this if you may want it removed:");
                     ui.monospace(format!("{stem}_raw.png · {stem}_det.png"));
@@ -7942,6 +8166,49 @@ enum LocalCopy {
 /// cancels, when the folder they chose cannot actually be written to, or when
 /// no picker is reachable at all (a bare compositor with no desktop portal) —
 /// every one of those falls back to upload-only, which is a working outcome.
+/// Status colours for the contribution panel. Green means "we have it", red
+/// means "we do not" — an upload that failed used to be orange, one shade away
+/// from the yellow call-outs, sitting under a green success counter.
+const COLOR_OK: Color32 = Color32::from_rgb(0x66, 0xff, 0x99);
+const COLOR_BAD: Color32 = Color32::from_rgb(0xff, 0x5c, 0x5c);
+
+/// UI-side view of the drop's reachability.
+#[derive(Debug, Clone, Default)]
+enum ReachState {
+    /// Never asked (the probe starts when the panel is first opened).
+    #[default]
+    Unknown,
+    /// A probe is in flight.
+    Checking,
+    Known(contribute::Reach),
+}
+
+impl ReachState {
+    /// Uploading is offered only on a proven-good answer. "Not asked yet" and
+    /// "still asking" are not permission — the whole point is that a capture
+    /// is never taken on the assumption that it can be sent.
+    fn allows_upload(&self) -> bool {
+        matches!(self, Self::Known(r) if r.is_up())
+    }
+}
+
+/// Where a capture the drop refused is kept so it can still be handed over.
+///
+/// Not the install folder (Program Files is read-only for a normal user, and
+/// a pincab runs the demo from wherever it was unzipped) and not a temp
+/// directory (the contributor has to be able to find it and drag it into
+/// Discord). The home directory is the one place that is writable, stable and
+/// nameable in a sentence.
+fn default_rescue_dir() -> std::path::PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    match home {
+        Some(dir) => dir.join("headtracking-captures-not-sent"),
+        None => std::path::PathBuf::from("headtracking-captures-not-sent"),
+    }
+}
+
 fn ask_local_copy_folder() -> Option<std::path::PathBuf> {
     let dir = rfd::FileDialog::new()
         .set_title("Keep your own copy of the capture — choose a folder (Cancel: upload only)")

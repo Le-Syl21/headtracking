@@ -184,6 +184,12 @@ to have it removed. Empty cab or mid-game, day or night, every variation
 helps — captures with **a player standing at the cab** are the rarest and
 most valuable.
 
+**If the upload can't go through** (a firewall, a proxy, an antivirus that
+intercepts HTTPS), the demo says so in red *before* you capture and keeps the
+capture in a folder it names on screen. Send that folder on Discord — it is
+worth exactly as much as an upload. `headtracking-demo --upload-test` answers
+in one line whether this machine can reach the server at all.
+
 ## 🙌 Contributors wanted
 
 **This project needs a small crew to go from "the hard parts work" to "you can
@@ -317,6 +323,12 @@ y a autour — vérifiez l'aperçu avant d'accepter. L'envoi ne demande aucun co
 pouvez citer sur Discord pour demander sa suppression. Cab vide ou en pleine
 partie, jour ou nuit, toute variation aide — les relevés avec **un joueur
 devant le cab** sont les plus rares et les plus précieux.
+
+**Si l'envoi ne peut pas passer** (pare-feu, proxy, antivirus qui intercepte
+le HTTPS), la démo le dit en rouge *avant* la capture et garde le relevé dans
+un dossier dont elle affiche le chemin. Envoyez ce dossier sur Discord : il
+vaut exactement autant qu'un upload. `headtracking-demo --upload-test` répond
+en une ligne si la machine atteint le serveur.
 
 **Ce qui le rend unique :**
 
