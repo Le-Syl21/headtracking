@@ -2150,6 +2150,37 @@ fn kinect_present_but_not_set_up() -> bool {
     !present.is_subset(&covered)
 }
 
+/// What the Windows driver probe actually found, in one sentence.
+///
+/// This used to be a legend — one fixed string spelling out what `present=0`
+/// and `missing>0` would each mean — with the real numbers appended as
+/// structured fields at the far right of the line. A contributor whose setup
+/// was perfectly healthy (`present=1 missing=0`) shipped a log whose probe
+/// line opened with "nothing on the USB bus: check the v2 power adapter",
+/// and it read as a verdict to them and to us. A log line has to state its
+/// own finding.
+///
+/// Gated on `test` as well so the Linux CI exercises it.
+#[cfg(any(target_os = "windows", test))]
+fn driver_probe_verdict(present: u32, missing: u32) -> String {
+    match (present, missing) {
+        // A v2 without its powered adapter is completely invisible — not even
+        // an unknown device — so this is the adapter/port question, not a
+        // driver one.
+        (0, _) => "windows Kinect driver probe: no Kinect function on the USB bus — \
+                   check the v2 power adapter and use a rear USB 3.0 port"
+            .to_owned(),
+        (p, 0) => format!(
+            "windows Kinect driver probe: {p} Kinect function(s) on the bus, all libusb-capable — \
+             nothing to fix here"
+        ),
+        (p, m) => format!(
+            "windows Kinect driver probe: {m} of {p} Kinect function(s) still lack WinUSB — \
+             run the in-app driver install (a half-bound sensor enumerates but fails to open)"
+        ),
+    }
+}
+
 /// Windows: a Kinect (v1 sub-device or v2 sensor) is present on the USB
 /// bus but no libusb-capable driver (WinUSB / libusbK) is bound to any of
 /// its interfaces. Queried via PowerShell's `Get-PnpDevice` — no extra
@@ -2202,15 +2233,15 @@ fn kinect_present_but_not_set_up() -> bool {
     let present = field("present=");
     let missing = field("missing=");
     // Always log what the probe saw — "no banner" support cases are
-    // undiagnosable otherwise. present=0 usually means the Kinect isn't
-    // on the USB bus at all (a v2 without its powered adapter is
-    // completely invisible, not even an unknown device).
+    // undiagnosable otherwise. Say what was *found*, not what the two
+    // numbers would mean: the legend version of this line read as a verdict,
+    // and a healthy `present=1 missing=0` run still told the reader to go
+    // check their power adapter (field report 2026-09-03).
     info!(
         present,
         missing,
-        "windows Kinect driver probe (present=0 → nothing on the USB bus: \
-         check the v2 power adapter and use a rear USB 3.0 port; \
-         missing>0 → that many Kinect functions still lack WinUSB)"
+        "{}",
+        driver_probe_verdict(present, missing)
     );
     if !out.status.success() {
         warn!(
@@ -9338,6 +9369,31 @@ mod tests {
             m.cpu_pct.is_finite() && m.cpu_pct >= 0.0,
             "cpu {}",
             m.cpu_pct
+        );
+    }
+
+    /// The probe line has to say what it found. The legend it used to print
+    /// opened with "nothing on the USB bus: check the v2 power adapter" on
+    /// every run, including the healthy ones.
+    #[test]
+    fn a_healthy_driver_probe_does_not_read_like_a_fault() {
+        let ok = driver_probe_verdict(1, 0);
+        assert!(ok.contains('1'), "{ok}");
+        assert!(
+            !ok.contains("power adapter") && !ok.contains("lack WinUSB"),
+            "a healthy probe must not send anyone hunting: {ok}"
+        );
+
+        let absent = driver_probe_verdict(0, 0);
+        assert!(
+            absent.contains("power adapter"),
+            "nothing on the bus is the adapter question: {absent}"
+        );
+
+        let half = driver_probe_verdict(3, 2);
+        assert!(
+            half.contains("2 of 3") && half.contains("WinUSB"),
+            "a half-bound sensor must name the count: {half}"
         );
     }
 }
