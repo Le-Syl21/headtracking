@@ -2445,14 +2445,24 @@ struct App {
     /// Last USB verdict and when it was taken. Enumerating the bus is cheap
     /// but not free, and the UI repaints far faster than a cable gets moved,
     /// so it is refreshed on a timer rather than per frame.
-    usb_cache: Option<(Instant, usb_check::Sensor, usb_check::UsbReport)>,
+    /// Last USB snapshot, produced on a worker thread. `None` until the first
+    /// probe lands.
+    ///
+    /// Enumerating the bus is not free: ~0.8 ms on this Linux box, and an
+    /// order of magnitude more on Windows, where it goes through SetupAPI and
+    /// the registry once per device. The old device brief called
+    /// `usb_check::check` inline on every frame it was open — 60 full bus
+    /// enumerations a second on the render thread — and on a Windows cabinet
+    /// that is the whole frame budget and then some. The interface stopped
+    /// dead while the popup was up. Nothing about USB is read on the render
+    /// thread any more.
+    usb_cache: Option<(usb_check::Sensor, UsbSnapshot)>,
+    /// In-flight probe, if any.
+    usb_probe: Option<mpsc::Receiver<UsbSnapshot>>,
     /// The USB window, opened from the toolbar badge. A plain window, never a
     /// modal: someone reading their bus tree usually wants to unplug something
     /// and watch the list change, which a modal makes impossible.
     usb_window_open: bool,
-    /// Bus tree for that window, refreshed on open and on demand. Enumerating
-    /// costs a syscall per device, so it does not belong in a per-frame path.
-    usb_tree: Vec<usb_check::BusNode>,
     /// What the freshly opened device can deliver, shown once. `None` when
     /// there is nothing to say or the user has dismissed it.
     brief: Option<DeviceBrief>,
@@ -2631,17 +2641,43 @@ impl App {
         Duration::from_secs_f32(1.0 / 60.0)
     }
 
-    /// USB verdict for `sensor`, re-read at most every two seconds.
-    fn usb_report(&mut self, sensor: usb_check::Sensor) -> Option<&usb_check::UsbReport> {
-        const REFRESH: Duration = Duration::from_secs(2);
-        let stale = match &self.usb_cache {
-            Some((at, s, _)) => *s != sensor || at.elapsed() >= REFRESH,
-            None => true,
-        };
-        if stale {
-            self.usb_cache = usb_check::check(sensor).map(|r| (Instant::now(), sensor, r));
+    /// Ask a worker thread for a fresh USB snapshot. Cheap to call twice: a
+    /// probe already in flight wins.
+    fn start_usb_probe(&mut self, sensor: usb_check::Sensor) {
+        if self.usb_probe.is_some() {
+            return;
         }
-        self.usb_cache.as_ref().map(|(_, _, r)| r)
+        let (tx, rx) = mpsc::channel();
+        if std::thread::Builder::new()
+            .name("usb-probe".into())
+            .spawn(move || {
+                let _ = tx.send(UsbSnapshot {
+                    report: usb_check::check(sensor),
+                    tree: usb_check::topology(sensor),
+                });
+            })
+            .is_ok()
+        {
+            self.usb_probe = Some(rx);
+        }
+    }
+
+    /// Collect a finished probe. Never blocks: a bus that takes 200 ms to
+    /// enumerate must cost the render thread nothing.
+    fn poll_usb_probe(&mut self, sensor: usb_check::Sensor) {
+        let Some(rx) = &self.usb_probe else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(snap) => {
+                self.usb_cache = Some((sensor, snap));
+                self.usb_probe = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            // The worker died without answering; drop it so the next click
+            // can try again rather than waiting forever on a dead channel.
+            Err(mpsc::TryRecvError::Disconnected) => self.usb_probe = None,
+        }
     }
 
     fn label_for(&self, backend: Backend) -> String {
@@ -5433,8 +5469,8 @@ impl App {
         Self {
             selected: Backend::None,
             usb_cache: None,
+            usb_probe: None,
             usb_window_open: false,
-            usb_tree: Vec::new(),
             brief: None,
             available,
             active: None,
@@ -6200,24 +6236,26 @@ impl App {
                     Backend::KinectV1 => Some(usb_check::Sensor::KinectV1),
                     Backend::KinectV2 => Some(usb_check::Sensor::KinectV2),
                     _ => None,
-                } && let Some(report) = self.usb_report(sensor)
-                {
-                    let colour = report.level.colour();
-                    let glyph = report.level.glyph().to_owned();
+                } {
+                    self.poll_usb_probe(sensor);
+                    // Colour comes from a snapshot already in hand, if there
+                    // is one. The button schedules; it never enumerates.
+                    let colour = self
+                        .usb_cache
+                        .as_ref()
+                        .filter(|(s, _)| *s == sensor)
+                        .and_then(|(_, snap)| snap.report.as_ref())
+                        .map_or(Color32::GRAY, |r| r.level.colour());
                     if ui
-                        .button(
-                            RichText::new(format!("USB {glyph}"))
-                                .color(colour)
-                                .monospace(),
-                        )
+                        .button(RichText::new("USB").color(colour).monospace())
                         .on_hover_text(
                             "What USB gives this sensor, and everything plugged into every \
-                             controller. Click to open.",
+                             bus. Click to open.",
                         )
                         .clicked()
                     {
                         self.usb_window_open = true;
-                        self.usb_tree = usb_check::topology(sensor);
+                        self.start_usb_probe(sensor);
                     }
                 }
                 let selected_label = self.label_for(self.selected);
@@ -7277,7 +7315,18 @@ impl App {
             Backend::KinectV2 => Some(usb_check::Sensor::KinectV2),
             _ => None,
         };
-        let report = sensor.and_then(|s| self.usb_report(s).cloned());
+        if let Some(s) = sensor {
+            self.poll_usb_probe(s);
+        }
+        // Whatever the last worker produced. Nothing here reads the bus.
+        let snap = self
+            .usb_cache
+            .as_ref()
+            .filter(|(s, _)| Some(*s) == sensor)
+            .map(|(_, snap)| snap);
+        let report = snap.and_then(|s| s.report.clone());
+        let tree: Vec<usb_check::BusNode> = snap.map(|s| s.tree.clone()).unwrap_or_default();
+        let scanning = self.usb_probe.is_some();
         let mut open = self.usb_window_open;
         let mut refresh = false;
         egui::Window::new("USB")
@@ -7298,7 +7347,7 @@ impl App {
                     }
                 }
                 ui.separator();
-                let (buses, devices) = usb_check::counts(&self.usb_tree);
+                let (buses, devices) = usb_check::counts(&tree);
                 ui.label(
                     RichText::new(format!(
                         "This machine reports {buses} USB bus(es) and {devices} device(s)."
@@ -7342,7 +7391,7 @@ impl App {
                     .color(Color32::GRAY),
                 );
                 ui.add_space(6.0);
-                if self.usb_tree.iter().any(|n| n.sensor_underspeed) {
+                if tree.iter().any(|n| n.sensor_underspeed) {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(
@@ -7355,18 +7404,27 @@ impl App {
                     );
                 }
                 ui.add_space(6.0);
-                if ui.button("↻ Rescan the bus").clicked() {
-                    refresh = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!scanning, egui::Button::new("↻ Rescan the bus"))
+                        .clicked()
+                    {
+                        refresh = true;
+                    }
+                    if scanning {
+                        ui.spinner();
+                        ui.label(RichText::new("reading the bus…").color(Color32::GRAY));
+                    }
+                });
                 ui.add_space(4.0);
                 egui::ScrollArea::both().max_height(320.0).show(ui, |ui| {
-                    if self.usb_tree.is_empty() {
+                    if tree.is_empty() && !scanning {
                         ui.label(
                             RichText::new("The bus could not be enumerated on this system.")
                                 .color(Color32::GRAY),
                         );
                     }
-                    for node in &self.usb_tree {
+                    for node in &tree {
                         if node.depth == 0 {
                             ui.add_space(4.0);
                             ui.label(RichText::new(&node.label).monospace().strong());
@@ -7393,7 +7451,7 @@ impl App {
                 });
             });
         if refresh && let Some(s) = sensor {
-            self.usb_tree = usb_check::topology(s);
+            self.start_usb_probe(s);
         }
         self.usb_window_open = open;
     }
@@ -8784,6 +8842,16 @@ enum LocalCopy {
 /// from the yellow call-outs, sitting under a green success counter.
 const COLOR_OK: Color32 = Color32::from_rgb(0x66, 0xff, 0x99);
 const COLOR_BAD: Color32 = Color32::from_rgb(0xff, 0x5c, 0x5c);
+
+/// One USB reading, produced entirely on a worker thread.
+///
+/// The report and the tree travel together because they come from the same
+/// enumeration: splitting them would mean walking the bus twice to draw one
+/// window.
+struct UsbSnapshot {
+    report: Option<usb_check::UsbReport>,
+    tree: Vec<usb_check::BusNode>,
+}
 
 /// UI-side view of the drop's reachability.
 #[derive(Debug, Clone, Default)]

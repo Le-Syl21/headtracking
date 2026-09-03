@@ -51,15 +51,6 @@ impl Level {
             Self::Absent => egui::Color32::GRAY,
         }
     }
-
-    #[must_use]
-    pub fn glyph(self) -> &'static str {
-        match self {
-            Self::Ok => "OK",
-            Self::Bad => "X",
-            Self::Absent => "-",
-        }
-    }
 }
 
 /// One sensor's USB situation: what it wants, what it has, and why that is or
