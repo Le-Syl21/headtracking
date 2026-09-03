@@ -18,7 +18,7 @@ use super::kinect_v1::KinectV1Backend;
 use super::kinect_v2::KinectV2Backend;
 #[cfg(feature = "webcam")]
 use super::webcam::WebcamBackend;
-use super::{HeadTracker, Pose};
+use super::{HeadTracker, Pose, TrackingFault};
 use crate::config::{BackendKind, Config};
 use crate::filter::{MedianGate, OneEuroParams, OneEuroPose3D};
 
@@ -131,11 +131,12 @@ pub struct TrackerSession {
     /// Filled by the tracker thread once the RGB anchor-calibration phase
     /// completes successfully (never, if nothing was recognized).
     calibration: Arc<std::sync::Mutex<Option<CameraCalibration>>>,
-    /// A sentence for the player, set by the tracker thread when it gives up.
-    /// Read once by the plugin and pushed as a native VPX notification: a
-    /// session that cannot reach its tracking stream must say so on screen,
-    /// not only in a log nobody opens.
-    fault: Arc<std::sync::Mutex<Option<String>>>,
+    /// Why the tracker thread gave up, when it did. A cause rather than a
+    /// sentence — the plugin owns the wording, so it can be translated. Read
+    /// once and pushed as a native VPX notification: a session that cannot
+    /// reach its tracking stream must say so on screen, not only in a log
+    /// nobody opens.
+    fault: Arc<std::sync::Mutex<Option<TrackingFault>>>,
 }
 
 impl TrackerSession {
@@ -192,7 +193,7 @@ impl TrackerSession {
                 // tracking is worse than none, because it gets reported as a
                 // tracking bug instead of as the busy device it is.
                 if let Err(why) = backend.begin_tracking() {
-                    warn!(backend = backend_name, %why, "tracker thread stopping");
+                    warn!(backend = backend_name, ?why, "tracker thread stopping");
                     *fault_for_thread.lock().expect("fault mutex") = Some(why);
                     return;
                 }
@@ -278,7 +279,7 @@ impl TrackerSession {
 
     /// Take the tracker thread's fault message, if it left one. Taken rather
     /// than read, so the notification fires once.
-    pub fn take_fault(&self) -> Option<String> {
+    pub fn take_fault(&self) -> Option<TrackingFault> {
         self.fault.lock().expect("fault mutex").take()
     }
 }

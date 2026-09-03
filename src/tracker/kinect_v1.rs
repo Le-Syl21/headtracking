@@ -29,7 +29,7 @@ use freenect::{CX, CY, Context, Device, FX, FY, VideoStream};
 use super::pipeline::{
     DEPTH_MIN_SAMPLES, HeadPixel, Intrinsics, gray8_to_rgb888, head_pixel_from_pose_depth,
 };
-use super::{HeadTracker, Pose};
+use super::{HeadTracker, Pose, TrackingFault};
 
 pub struct KinectV1Backend {
     // Drop order (declaration order): device first, then context.
@@ -144,7 +144,7 @@ impl HeadTracker for KinectV1Backend {
         Some((rgb.width, rgb.height, rgb.data))
     }
 
-    fn begin_tracking(&mut self) -> Result<(), String> {
+    fn begin_tracking(&mut self) -> Result<(), TrackingFault> {
         // The v1 has one video endpoint: colour and infrared cannot both be
         // live. It served colour for the anchor phase, and now has to hand it
         // over. There is deliberately no colour fallback — see the module doc.
@@ -154,13 +154,10 @@ impl HeadTracker for KinectV1Backend {
                 Ok(())
             }
             Err(e) => {
+                // The driver's own words stay here, where they help; the
+                // player gets a translatable cause instead.
                 warn!(?e, "kinect-v1: switch to IR failed");
-                Err(
-                    "Head tracking off: cannot open the Kinect's infrared stream. \
-                     Its camera stream is in use — close any other app using the Kinect \
-                     (the head-tracking demo, a capture tool) and restart the table."
-                        .to_owned(),
-                )
+                Err(TrackingFault::IrStreamBusy)
             }
         }
     }

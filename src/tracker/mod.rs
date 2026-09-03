@@ -42,6 +42,21 @@ impl Default for Pose {
 /// Backends are owned by a dedicated tracker thread spawned at plugin load.
 /// The thread writes the latest `Pose` into an `arc_swap::ArcSwap<Pose>` that
 /// the VPX render-thread callback reads each frame.
+/// Why a backend could not enter its tracking stream.
+///
+/// A cause, never a sentence. The wording belongs to whatever is showing it —
+/// today `plugin::ffi`, beside the other player-facing notes — because a
+/// message assembled down here could not be translated, and the driver's own
+/// error text is diagnostic material for the log rather than something to put
+/// in front of a player mid-game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackingFault {
+    /// The video endpoint could not be handed over to infrared. The Kinect v1
+    /// has exactly one, shared between colour and IR, so this means something
+    /// else on the machine is holding the camera.
+    IrStreamBusy,
+}
+
 pub trait HeadTracker: Send {
     /// Pull the next available pose from the backend, if any.
     /// Returns `None` if no new sample is ready since the last call.
@@ -67,11 +82,11 @@ pub trait HeadTracker: Send {
 
     /// Leave the calibration phase and start the tracking stream.
     ///
-    /// Called exactly once, before the first `poll`. `Err` carries a sentence
-    /// meant for the player, not a log line: a backend that cannot reach its
-    /// tracking stream has failed, and saying so beats degrading to something
-    /// that half works and gets reported as a tracking bug months later.
-    fn begin_tracking(&mut self) -> Result<(), String> {
+    /// Called exactly once, before the first `poll`. A backend that cannot
+    /// reach its tracking stream has failed, and saying so beats degrading to
+    /// something that half works and gets reported as a tracking bug months
+    /// later.
+    fn begin_tracking(&mut self) -> Result<(), TrackingFault> {
         Ok(())
     }
 

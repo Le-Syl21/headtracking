@@ -22,8 +22,8 @@ use super::vpx_sys::{
 };
 use crate::camera::mapping::{MappingParams, ViewMode, pose_delta_to_view_delta};
 use crate::config;
-use crate::tracker::Pose;
 use crate::tracker::session::TrackerSession;
+use crate::tracker::{Pose, TrackingFault};
 
 /// Lifecycle state captured at `PluginLoad` and torn down at `PluginUnload`.
 struct PluginState {
@@ -480,8 +480,8 @@ fn apply_pose_to_view() {
     // which reached us months later as a tracking bug rather than as the busy
     // device it was. Taken, so it fires once.
     if let Some(fault) = game.tracker.take_fault()
+        && let Some(note) = fault_note(fault)
         && let Some(notify) = vpx.PushNotification
-        && let Ok(note) = std::ffi::CString::new(fault)
     {
         // SAFETY: NUL-terminated CString kept alive across the call.
         unsafe { notify(note.as_ptr(), STARTUP_NOTE_MS) };
@@ -642,6 +642,23 @@ fn window_player_rotation(view: &VPXViewSetupDef) -> f32 {
 /// Build the one-shot startup notification: the camera the plugin tracks
 /// on and the VPX settings the head-tracking experience depends on. The
 /// camera-pose line arrives later, once the live anchor calibration lands.
+/// The player-facing wording for a [`TrackingFault`].
+///
+/// Every sentence a player reads is built in this module, not in the backend
+/// that detected the problem — a backend returns a cause, and the cause is
+/// worded here. That is the seam a translation catalogue plugs into later:
+/// one `match` per language rather than prose scattered across the trackers.
+fn fault_note(fault: TrackingFault) -> Option<std::ffi::CString> {
+    let text = match fault {
+        TrackingFault::IrStreamBusy => {
+            "Head tracking off: the Kinect's infrared stream cannot be opened because its \
+             camera stream is already in use. Close whatever else is holding the Kinect \
+             (the head-tracking demo, a capture tool) and restart the table."
+        }
+    };
+    std::ffi::CString::new(text).ok()
+}
+
 fn startup_note(device: &str, _backend: &str, _cfg: &config::Config) -> Option<std::ffi::CString> {
     let text = format!(
         "Head tracking: {device} active\
@@ -789,4 +806,30 @@ enum LoadError {
     MissingFunction(&'static str),
     #[error("host did not expose VPXPluginAPI (no responder for VPX/GetAPI)")]
     NoVpxApi,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TrackingFault, fault_note};
+
+    /// Every cause must have wording a player can act on. `fault_note`
+    /// matches exhaustively, so a new variant cannot compile without one —
+    /// but it can compile with an empty or useless one, and a blank
+    /// notification reads as "nothing happened" rather than "tracking is off".
+    #[test]
+    fn every_tracking_fault_has_something_to_say() {
+        // One variant today. The loop is the point: it is the list a new
+        // `TrackingFault` has to join, and the assertion below is what stops
+        // it shipping without wording.
+        #[allow(clippy::single_element_loop, reason = "grows with the enum")]
+        for fault in [TrackingFault::IrStreamBusy] {
+            let note = fault_note(fault).unwrap_or_else(|| panic!("no wording for {fault:?}"));
+            let text = note.to_str().expect("utf-8");
+            assert!(text.len() > 40, "{fault:?}: {text:?}");
+            assert!(
+                text.starts_with("Head tracking off"),
+                "a fault note has to open by saying tracking stopped: {text:?}"
+            );
+        }
+    }
 }
