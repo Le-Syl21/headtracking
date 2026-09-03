@@ -5544,6 +5544,12 @@ impl App {
         }
         self.selected = Backend::None;
         self.available = detect_backends();
+        // Rescanning means the bus is expected to have changed — that is the
+        // whole reason to press the button. Keeping the old snapshot would
+        // show someone the bus as it was before they plugged the sensor back
+        // in, which is worse than showing nothing. The next frame starts a
+        // fresh probe on its own.
+        self.usb_cache = None;
         self.kinect_access_hint = compute_kinect_access_hint();
         self.kinect_access_result = None;
     }
@@ -6238,6 +6244,14 @@ impl App {
                     _ => None,
                 } {
                     self.poll_usb_probe(sensor);
+                    // One probe per sensor, off-thread, and never again until
+                    // the sensor changes or a rescan clears the snapshot —
+                    // this is a scheduling decision made every frame, not a
+                    // bus read. It is what lets the badge carry a colour and
+                    // the window open with content already in it.
+                    if !self.usb_cache.as_ref().is_some_and(|(s, _)| *s == sensor) {
+                        self.start_usb_probe(sensor);
+                    }
                     // Colour comes from a snapshot already in hand, if there
                     // is one. The button schedules; it never enumerates.
                     let colour = self
