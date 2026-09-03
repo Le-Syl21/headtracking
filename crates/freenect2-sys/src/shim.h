@@ -26,6 +26,7 @@ struct StreamStats;
 struct IrCameraParams;
 struct ColorCameraParams;
 struct ColorPixel;
+struct ColorExposure;
 
 // The combined IR+Depth listener slot. libfreenect2 delivers both the IR and
 // the Depth frame to a *single* FrameListener (setIrAndDepthFrameListener),
@@ -101,11 +102,38 @@ public:
         return dropped_.load(std::memory_order_relaxed);
     }
 
+    // The colour camera's own auto-exposure read-out, straight off the last
+    // frame. Atomics rather than the mutex: this is read from the perf tick,
+    // which must never wait behind an 8.3 MB copy.
+    float exposure() const {
+        return exposure_.load(std::memory_order_relaxed);
+    }
+    float gain() const {
+        return gain_.load(std::memory_order_relaxed);
+    }
+    float gamma() const {
+        return gamma_.load(std::memory_order_relaxed);
+    }
+    // Sensor-side frame clock, unit 0.125 ms. Consecutive colour frames step
+    // by 266 at 30 Hz and 533 at 15 Hz, so the delta is the camera's own
+    // declared cadence — independent of anything we count.
+    uint32_t last_timestamp() const {
+        return last_timestamp_.load(std::memory_order_relaxed);
+    }
+    uint32_t prev_timestamp() const {
+        return prev_timestamp_.load(std::memory_order_relaxed);
+    }
+
 private:
     std::mutex mu_;
     std::atomic<bool> has_new_{false};
     std::atomic<uint64_t> received_{0};
     std::atomic<uint64_t> dropped_{0};
+    std::atomic<float> exposure_{0.0f};
+    std::atomic<float> gain_{0.0f};
+    std::atomic<float> gamma_{0.0f};
+    std::atomic<uint32_t> last_timestamp_{0};
+    std::atomic<uint32_t> prev_timestamp_{0};
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t timestamp_ = 0;
@@ -184,6 +212,9 @@ bool poll_depth_into(Freenect2Dev &dev, rust::Slice<float> out, FrameMeta &meta)
 bool poll_ir_into(Freenect2Dev &dev, rust::Slice<float> out, FrameMeta &meta);
 bool poll_rgb_into(Freenect2Dev &dev, rust::Slice<uint8_t> out, FrameMeta &meta);
 StreamStats stream_stats(const Freenect2Dev &dev);
+
+/// The colour camera's auto-exposure read-out and its own frame clock.
+ColorExposure color_exposure(const Freenect2Dev &dev);
 IrCameraParams ir_params(const Freenect2Dev &dev);
 ColorCameraParams color_params(const Freenect2Dev &dev);
 std::unique_ptr<Registration> new_registration(const Freenect2Dev &dev);

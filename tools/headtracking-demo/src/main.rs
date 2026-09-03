@@ -3633,6 +3633,18 @@ struct CaptureVitals {
     rgb_dropped: AtomicU64,
     depth_delivered: AtomicU64,
     depth_dropped: AtomicU64,
+    /// The colour camera's own auto-exposure, as `f32` bits. This is what
+    /// explains a `cam` rate that sits at half the `ir+depth` one: the v2
+    /// auto-exposes and halves to 15 Hz in a dim room, while IR and depth hold
+    /// ~30 Hz off their own illuminator. Without it, reading `cam 14.9` left
+    /// the reader to guess whether the room was dark or we were struggling —
+    /// two problems with opposite answers.
+    exposure_bits: AtomicU32,
+    gain_bits: AtomicU32,
+    /// Step of the sensor's own frame clock, 0.125 ms per unit: 266 at 30 Hz,
+    /// 533 at 15 Hz. The camera's own account of its cadence, owing nothing to
+    /// any counter of ours.
+    frame_step: AtomicU32,
 }
 
 impl CaptureVitals {
@@ -3655,6 +3667,11 @@ impl CaptureVitals {
         let Inner::KinectV2 { device, .. } = &cap.inner else {
             return;
         };
+        let e = device.color_exposure();
+        self.exposure_bits
+            .store(e.exposure.to_bits(), Ordering::Relaxed);
+        self.gain_bits.store(e.gain.to_bits(), Ordering::Relaxed);
+        self.frame_step.store(e.frame_step, Ordering::Relaxed);
         let s = device.stream_stats();
         self.rgb_delivered.store(s.rgb_received, Ordering::Relaxed);
         self.rgb_dropped.store(s.rgb_dropped, Ordering::Relaxed);
@@ -3662,6 +3679,18 @@ impl CaptureVitals {
             .store(s.depth_received, Ordering::Relaxed);
         self.depth_dropped.store(s.depth_dropped, Ordering::Relaxed);
         self.reports_sensor.store(true, Ordering::Release);
+    }
+
+    /// What the colour camera's auto-exposure is doing, and the sensor's own
+    /// frame step. `None` on a backend that cannot report it.
+    fn exposure(&self) -> Option<(f32, f32, u32)> {
+        self.reports_sensor.load(Ordering::Acquire).then(|| {
+            (
+                f32::from_bits(self.exposure_bits.load(Ordering::Relaxed)),
+                f32::from_bits(self.gain_bits.load(Ordering::Relaxed)),
+                self.frame_step.load(Ordering::Relaxed),
+            )
+        })
     }
 
     /// `(captured, depth, ir, sensor)` — `sensor` is `None` on a backend whose
@@ -4900,6 +4929,9 @@ struct Metrics {
     /// Whether the backend reports delivered/dropped at all (libfreenect2 does,
     /// nothing else does).
     reports_sensor: bool,
+    /// The colour camera's auto-exposure read-out and the sensor's own frame
+    /// step, when the backend can give them.
+    exposure: Option<(f32, f32, u32)>,
     /// Depth / IR capture rates. Diagnostic only — neither is a display rate.
     /// The Kinect streams them from its **own IR illuminator**, so they hold
     /// ~30 Hz in the dark while the auto-exposed colour stream halves to 15:
@@ -4945,6 +4977,7 @@ impl Metrics {
             sensor_rgb_base: SensorCounts::default(),
             sensor_depth_base: SensorCounts::default(),
             reports_sensor: false,
+            exposure: None,
             anchor_locked: false,
             was_over: false,
             budget_ms: 1000.0 / 30.0,
@@ -5016,6 +5049,31 @@ impl Metrics {
     /// not that it delivered nothing. Keeping the two apart is the whole point
     /// of the suffix: a Kinect v2 reporting `0.0 of 0.0 sensor` says the
     /// sensor went quiet, while a webcam simply has nothing to add.
+    /// The colour camera's own brightness read-out. See [`Self::light_note`].
+    fn note_exposure(&mut self, e: Option<(f32, f32, u32)>) {
+        self.exposure = e;
+    }
+
+    /// ` LIGHT(exposure 12.4, gain 1.0, sensor 15.0 Hz)`, or nothing on a
+    /// backend that cannot say.
+    ///
+    /// `exposure` runs 0.5 (very bright) to ~60 (lens covered) and `gain` 1.0
+    /// to 1.5 — libfreenect2 gives no unit, so this is a brightness index, not
+    /// photometry. The Hz is derived from the sensor's own frame clock
+    /// (0.125 ms per step: 266 → 30 Hz, 533 → 15 Hz), which is the one rate in
+    /// this line that owes nothing to a counter of ours.
+    fn light_note(&self) -> String {
+        let Some((exposure, gain, step)) = self.exposure else {
+            return String::new();
+        };
+        let hz = if step > 0 {
+            format!("{:.1} Hz", 8000.0 / f64::from(step))
+        } else {
+            "?".to_owned()
+        };
+        format!(" LIGHT(exposure {exposure:.1}, gain {gain:.2}, sensor {hz}),")
+    }
+
     fn note_sensor(&mut self, counts: Option<(SensorCounts, SensorCounts)>) {
         self.reports_sensor = counts.is_some();
         let Some((rgb, depth)) = counts else {
@@ -5188,7 +5246,7 @@ impl Metrics {
                 // ASCII only: a `->` and not an arrow glyph, because Windows
                 // tools open this file as ANSI and turn UTF-8 arrows into
                 // mojibake.
-                "perf IN(cam {:.1} fps{} | ir+depth {:.1} fps{}), \
+                "perf IN(cam {:.1} fps{} | ir+depth {:.1} fps{}),{} \
                  COPY(frame {:.1} ms), \
                  MAP(align {}), \
                  AI(anchor {} | head {:.1} ms, own thread), \
@@ -5200,6 +5258,7 @@ impl Metrics {
                 Self::sensor_note(self.sensor_in_fps, self.in_drop_pct),
                 self.ir_fps,
                 Self::sensor_note(self.sensor_ir_fps, self.ir_drop_pct),
+                self.light_note(),
                 self.copy_ms,
                 if self.reg_ms > 0.0 {
                     format!("{:.1} ms", self.reg_ms)
@@ -5665,6 +5724,9 @@ impl App {
             .add_ir(ir_captured.saturating_sub(active.last_ir_count));
         active.last_ir_count = ir_captured;
         active.metrics.note_sensor(sensor);
+        active
+            .metrics
+            .note_exposure(active.worker.vitals.exposure());
         active.metrics.tick();
         // Hand the live-tunable 1€ / bypass knobs to the capture thread (cheap
         // atomics); the device poll + inference now run over there.
@@ -9670,6 +9732,29 @@ mod tests {
             half.contains("2 of 3") && half.contains("WinUSB"),
             "a half-bound sensor must name the count: {half}"
         );
+    }
+
+    /// The frame clock is the one cadence in the perf line that owes nothing
+    /// to a counter of ours: 266 units of 0.125 ms is 30 Hz, 533 is 15 Hz.
+    /// Getting that arithmetic wrong would turn the most trustworthy number
+    /// in the line into the least.
+    #[test]
+    fn the_sensor_frame_step_reads_as_the_sensor_own_rate() {
+        let note = |step| {
+            let mut m = Metrics::new();
+            m.note_exposure(Some((12.4, 1.0, step)));
+            m.light_note()
+        };
+        assert!(note(266).contains("30.1 Hz"), "{}", note(266));
+        assert!(note(533).contains("15.0 Hz"), "{}", note(533));
+        // Before two frames have arrived there is no step to divide by.
+        assert!(note(0).contains('?'), "{}", note(0));
+        assert!(note(266).contains("exposure 12.4"), "{}", note(266));
+
+        // A webcam has no such figure; inventing a zero would read as darkness.
+        let mut m = Metrics::new();
+        m.note_exposure(None);
+        assert!(m.light_note().is_empty());
     }
 
     /// Eight hex characters, and actually varying — an id that collides

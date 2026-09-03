@@ -126,6 +126,30 @@ mod ffi {
         pub ir_dropped: u64,
     }
 
+    /// What the colour camera's own auto-exposure decided, plus its frame
+    /// clock — read straight off the last colour frame libfreenect2 decoded.
+    ///
+    /// This is the missing half of the frame-rate story. The Kinect v2's
+    /// colour camera auto-exposes, and halves to 15 Hz when the room is dark
+    /// enough to need it, while the IR/depth streams hold ~30 Hz off their own
+    /// illuminator. Reading `cam 14.9 | ir+depth 29.8` and having to *guess*
+    /// whether the room was dim is what made those logs ambiguous.
+    ///
+    /// `exposure` runs from 0.5 (very bright) to about 60.0 (lens covered),
+    /// `gain` from 1.0 to 1.5, `gamma` from 1.0 to 6.4 — libfreenect2 gives no
+    /// unit beyond that, so treat them as a brightness index, not photometry.
+    #[derive(Clone, Copy, Default)]
+    pub struct ColorExposure {
+        pub exposure: f32,
+        pub gain: f32,
+        pub gamma: f32,
+        /// Step between the last two colour frames on the sensor's own clock,
+        /// in units of 0.125 ms: 266 at 30 Hz, 533 at 15 Hz. `0` until two
+        /// frames have arrived. Unlike everything else we print, this number
+        /// is the camera's own account of its cadence.
+        pub frame_step: u32,
+    }
+
     /// IR camera intrinsics (depth camera). Matches `Freenect2Device::IrCameraParams`.
     #[derive(Clone, Copy, Default)]
     pub struct IrCameraParams {
@@ -261,6 +285,7 @@ mod ffi {
 
         /// Frames delivered and frames dropped, per stream. See [`StreamStats`].
         fn stream_stats(dev: &Freenect2Dev) -> StreamStats;
+        fn color_exposure(dev: &Freenect2Dev) -> ColorExposure;
 
         /// IR / depth camera intrinsics, available after the device starts.
         fn ir_params(dev: &Freenect2Dev) -> IrCameraParams;
@@ -324,14 +349,14 @@ mod ffi {
 }
 
 pub use ffi::{
-    ColorCameraParams, ColorPixel, FrameMeta, Freenect2Ctx, Freenect2Dev, IrCameraParams,
-    Registration, StreamStats,
+    ColorCameraParams, ColorExposure, ColorPixel, FrameMeta, Freenect2Ctx, Freenect2Dev,
+    IrCameraParams, Registration, StreamStats,
 };
 pub use ffi::{
-    color_params, depth_pipeline, depth_window_min, enumerate, install_logger, ir_params,
-    map_depth_to_color, new_context, new_registration, new_registration_from_params, open_default,
-    poll_depth_into, poll_ir_into, poll_rgb_into, register_bigdepth, start_depth, start_streams,
-    stop_device, stream_stats,
+    color_exposure, color_params, depth_pipeline, depth_window_min, enumerate, install_logger,
+    ir_params, map_depth_to_color, new_context, new_registration, new_registration_from_params,
+    open_default, poll_depth_into, poll_ir_into, poll_rgb_into, register_bigdepth, start_depth,
+    start_streams, stop_device, stream_stats,
 };
 
 /// Length of the color-space depth buffer [`register_bigdepth`] fills:

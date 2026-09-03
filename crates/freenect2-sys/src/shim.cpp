@@ -140,6 +140,14 @@ bool RgbSink::onNewFrame(libfreenect2::Frame::Type type,
         static_cast<size_t>(frame->width) * frame->height * frame->bytes_per_pixel;
     width_ = frame->width;
     height_ = frame->height;
+    // Keep the previous stamp before overwriting: the pair is what turns the
+    // sensor's clock into a cadence.
+    prev_timestamp_.store(last_timestamp_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+    last_timestamp_.store(frame->timestamp, std::memory_order_relaxed);
+    exposure_.store(frame->exposure, std::memory_order_relaxed);
+    gain_.store(frame->gain, std::memory_order_relaxed);
+    gamma_.store(frame->gamma, std::memory_order_relaxed);
     timestamp_ = frame->timestamp;
     data_.resize(bytes);
     std::memcpy(data_.data(), frame->data, bytes);
@@ -276,6 +284,19 @@ bool poll_rgb_into(Freenect2Dev &dev, rust::Slice<uint8_t> out, FrameMeta &meta)
     meta.height = h;
     meta.timestamp_raw = ts;
     return true;
+}
+
+ColorExposure color_exposure(const Freenect2Dev &dev) {
+    ColorExposure e{};
+    e.exposure = dev.rgb_listener.exposure();
+    e.gain = dev.rgb_listener.gain();
+    e.gamma = dev.rgb_listener.gamma();
+    const uint32_t last = dev.rgb_listener.last_timestamp();
+    const uint32_t prev = dev.rgb_listener.prev_timestamp();
+    // Unsigned wrap is correct here: the sensor clock is a free-running
+    // 32-bit counter. A zero step means we have not seen two frames yet.
+    e.frame_step = (last == 0 || prev == 0) ? 0 : (last - prev);
+    return e;
 }
 
 StreamStats stream_stats(const Freenect2Dev &dev) {

@@ -30,8 +30,8 @@ use parking_lot::Mutex;
 
 use freenect2_sys as sys;
 pub use freenect2_sys::{
-    BIGDEPTH_LEN, ColorCameraParams, DepthFrame, IrCameraParams, IrFrame, RgbFrame, StreamStats,
-    take_last_log_error,
+    BIGDEPTH_LEN, ColorCameraParams, ColorExposure, DepthFrame, IrCameraParams, IrFrame, RgbFrame,
+    StreamStats, take_last_log_error,
 };
 
 /// Samples in one Kinect v2 depth or IR frame (512 × 424).
@@ -335,6 +335,21 @@ impl Device {
     pub fn stream_stats(&self) -> StreamStats {
         let guard = self.inner.lock();
         sys::stream_stats(&guard)
+    }
+
+    /// What the colour camera's own auto-exposure decided on the last frame,
+    /// and the step of the sensor's frame clock.
+    ///
+    /// The other half of the frame-rate story: the v2's colour camera
+    /// auto-exposes and halves to 15 Hz in a dim room, while IR and depth hold
+    /// ~30 Hz off their own illuminator. Without this, a log showing
+    /// `cam 14.9 | ir+depth 29.8` leaves the reader to guess whether the room
+    /// was dark or the pipeline was struggling — and those call for opposite
+    /// answers. See [`sys::ColorExposure`] for the ranges.
+    #[must_use]
+    pub fn color_exposure(&self) -> ColorExposure {
+        let guard = self.inner.lock();
+        sys::color_exposure(&guard)
     }
 
     /// IR camera intrinsics. Valid after [`Device::start`].
