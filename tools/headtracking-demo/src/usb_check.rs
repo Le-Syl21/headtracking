@@ -188,9 +188,11 @@ pub fn check(sensor: Sensor) -> Option<UsbReport> {
         if !strangers.is_empty() {
             notes.push(format!(
                 "Shares its controller with {} other device(s): {}. Normally \
-                 harmless -- the v2 peaks near 2 Gbit/s of the 5 this \
-                 controller carries. Another camera on the same controller is \
-                 the one combination to avoid.",
+                 harmless: isochronous bandwidth is reserved per streaming \
+                 endpoint, and a keyboard or an I/O board reserves next to \
+                 nothing. Another camera is the one neighbour that matters -- \
+                 two video reservations that do not fit means the second \
+                 stream is refused outright, not slowed.",
                 strangers.len(),
                 strangers.join(", ")
             ));

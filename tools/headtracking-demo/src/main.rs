@@ -7321,12 +7321,24 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(
-                        "A USB controller is shared: everything below one heading competes \
-                         for the same bandwidth. The Kinect v2 needs about 2 Gbit/s of the \
-                         5 a USB 3.0 controller carries, so a keyboard, a mouse or a \
-                         cabinet I/O board beside it costs nothing. Two cameras on one \
-                         controller is the combination to avoid — that is what this tree \
-                         is for.",
+                        "Everything below one heading shares that controller's budget — but \
+                         only while it streams. A camera reserves its bandwidth up front, \
+                         for as long as it is running, and hands it back when it stops; a \
+                         keyboard, a mouse or a cabinet I/O board reserve almost nothing at \
+                         any time. The Kinect v2 claims about 2 Gbit/s of the 5 a USB 3.0 \
+                         controller carries, so it has room to spare next to ordinary \
+                         devices.",
+                    )
+                    .color(Color32::GRAY),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Two cameras on one controller is the combination to avoid, and it \
+                         does not show up as lag: if both reservations do not fit, the \
+                         second one is refused and that camera simply never starts. If a \
+                         webcam and the Kinect are under the same heading below, that is \
+                         worth changing.",
                     )
                     .color(Color32::GRAY),
                 );
