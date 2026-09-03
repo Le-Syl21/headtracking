@@ -337,6 +337,43 @@ impl Device {
         sys::stream_stats(&guard)
     }
 
+    /// Hand the colour camera back to its own auto-exposure.
+    ///
+    /// `compensation` runs [-2.0, 2.0]: negative underexposes, positive
+    /// overexposes. This is the state the camera opens in, so it is also the
+    /// way back from either manual mode.
+    ///
+    /// Colour only. The v2's IR and depth integrate under firmware control and
+    /// libfreenect2 offers nothing equivalent for them — which is why the
+    /// depth rate holds ~30 Hz whatever the room does, while the colour one
+    /// halves.
+    pub fn set_color_auto_exposure(&self, compensation: f32) {
+        let mut guard = self.inner.lock();
+        sys::set_color_auto_exposure(guard.pin_mut(), compensation);
+    }
+
+    /// Flicker-free exposure: the camera rounds the requested time down to a
+    /// whole mains-light period (10 ms at 50 Hz, 8.33 ms at 60 Hz) and raises
+    /// analog gain to compensate.
+    ///
+    /// `pseudo_ms` runs (0.0, 66.0+]. Asking for less than one period turns
+    /// flicker back on, which is the trade being made.
+    pub fn set_color_semi_auto_exposure(&self, pseudo_ms: f32) {
+        let mut guard = self.inner.lock();
+        sys::set_color_semi_auto_exposure(guard.pin_mut(), pseudo_ms);
+    }
+
+    /// True shutter time and analog gain, nothing automatic left.
+    ///
+    /// `integration_ms` runs (0.0, 66.0] and `analog_gain` [1.0, 4.0]. The top
+    /// of the integration range is one whole frame period at 15 Hz: past about
+    /// 33 ms the camera cannot hold 30 fps, which is the entire reason a dim
+    /// room halves the colour rate while IR and depth stay at 30.
+    pub fn set_color_manual_exposure(&self, integration_ms: f32, analog_gain: f32) {
+        let mut guard = self.inner.lock();
+        sys::set_color_manual_exposure(guard.pin_mut(), integration_ms, analog_gain);
+    }
+
     /// What the colour camera's own auto-exposure decided on the last frame,
     /// and the step of the sensor's frame clock.
     ///

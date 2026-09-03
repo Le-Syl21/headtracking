@@ -286,6 +286,13 @@ mod ffi {
         /// Frames delivered and frames dropped, per stream. See [`StreamStats`].
         fn stream_stats(dev: &Freenect2Dev) -> StreamStats;
         fn color_exposure(dev: &Freenect2Dev) -> ColorExposure;
+        fn set_color_auto_exposure(dev: Pin<&mut Freenect2Dev>, compensation: f32);
+        fn set_color_semi_auto_exposure(dev: Pin<&mut Freenect2Dev>, pseudo_ms: f32);
+        fn set_color_manual_exposure(
+            dev: Pin<&mut Freenect2Dev>,
+            integration_ms: f32,
+            analog_gain: f32,
+        );
 
         /// IR / depth camera intrinsics, available after the device starts.
         fn ir_params(dev: &Freenect2Dev) -> IrCameraParams;
@@ -355,7 +362,8 @@ pub use ffi::{
 pub use ffi::{
     color_exposure, color_params, depth_pipeline, depth_window_min, enumerate, install_logger,
     ir_params, map_depth_to_color, new_context, new_registration, new_registration_from_params,
-    open_default, poll_depth_into, poll_ir_into, poll_rgb_into, register_bigdepth, start_depth,
+    open_default, poll_depth_into, poll_ir_into, poll_rgb_into, register_bigdepth,
+    set_color_auto_exposure, set_color_manual_exposure, set_color_semi_auto_exposure, start_depth,
     start_streams, stop_device, stream_stats,
 };
 

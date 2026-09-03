@@ -2502,6 +2502,10 @@ struct App {
     /// [`StreamKind::Rgb`] on every backend change, since not every device
     /// offers the same streams.
     selected_stream: StreamKind,
+    /// Colour-camera exposure, Kinect v2 only. Held here because the camera
+    /// has no getter: the sliders read back what we last applied, not what the
+    /// hardware currently believes.
+    color_exposure: ColorExposureMode,
     /// "Share a capture" window toggle + state.
     contribute_open: bool,
     /// The informed-consent checkbox (see the privacy notice). Gates the
@@ -3560,6 +3564,36 @@ struct LatestFrame {
 /// Device I/O the GL thread asks the capture thread to run (things outside the
 /// steady poll): the Kinect v1 motor + LED, a baseline reset, and the v1
 /// video grabs that may need a momentary mode switch.
+/// What the Kinect v2's colour camera should do about exposure.
+///
+/// Colour only, and that is a hardware fact rather than an omission:
+/// libfreenect2 exposes `setColorAutoExposure` / `SemiAuto` / `Manual` for the
+/// colour camera and nothing at all for IR or depth, whose integration the
+/// firmware runs by itself. Which is also why a dim room halves the colour
+/// rate while depth and IR hold ~30 Hz.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ColorExposureMode {
+    /// The camera decides. `compensation` in [-2.0, 2.0]: negative
+    /// underexposes, positive overexposes. This is how the camera opens.
+    Auto { compensation: f32 },
+    /// Flicker-free: the requested time is rounded down to a whole mains-light
+    /// period (10 ms at 50 Hz, 8.33 at 60) and gain compensates.
+    SemiAuto { pseudo_ms: f32 },
+    /// Shutter and analog gain fixed. `integration_ms` in (0.0, 66.0] —
+    /// 66 ms being one whole frame period at 15 Hz, which is why anything past
+    /// ~33 ms costs half the colour frame rate.
+    Manual {
+        integration_ms: f32,
+        analog_gain: f32,
+    },
+}
+
+impl Default for ColorExposureMode {
+    fn default() -> Self {
+        Self::Auto { compensation: 0.0 }
+    }
+}
+
 enum CaptureCmd {
     SetTilt(f32),
     SetLed(freenect::LedState),
@@ -3580,6 +3614,9 @@ enum CaptureCmd {
     /// thaws the frozen best-of-warmup and drops the geometry derived from it,
     /// for when the camera has been moved or re-aimed.
     Recalibrate,
+    /// Colour-camera exposure (Kinect v2 only). Applied on the capture thread
+    /// because that is where the device lives; a no-op elsewhere.
+    SetColorExposure(ColorExposureMode),
     /// Display-stream choice. Only the Kinect v1 acts on it at the device level
     /// (colour and IR are mutually exclusive there); every other backend keeps
     /// all its streams running and this stays a pure display concern.
@@ -3904,6 +3941,23 @@ fn capture_thread_loop(
                     }
                 }
                 CaptureCmd::ResetBaseline => cap.baseline = None,
+                CaptureCmd::SetColorExposure(mode) => {
+                    if let Inner::KinectV2 { device, .. } = &cap.inner {
+                        match mode {
+                            ColorExposureMode::Auto { compensation } => {
+                                device.set_color_auto_exposure(compensation);
+                            }
+                            ColorExposureMode::SemiAuto { pseudo_ms } => {
+                                device.set_color_semi_auto_exposure(pseudo_ms);
+                            }
+                            ColorExposureMode::Manual {
+                                integration_ms,
+                                analog_gain,
+                            } => device.set_color_manual_exposure(integration_ms, analog_gain),
+                        }
+                        info!(?mode, "colour exposure applied");
+                    }
+                }
                 CaptureCmd::SelectStream(kind) => {
                     // Remembered so the v2 only pays for the colour-space depth
                     // view while it's actually on screen.
@@ -5396,6 +5450,7 @@ impl App {
             head_filter_beta: 0.03,
             bypass_filters: false,
             selected_stream: StreamKind::Rgb,
+            color_exposure: ColorExposureMode::default(),
             contribute_open: false,
             consent_checked: false,
             uploader: contribute::Uploader::spawn(default_rescue_dir()),
@@ -7192,6 +7247,166 @@ impl App {
             if let Some(active) = self.active.as_ref() {
                 let _ = active.worker.cmd_tx.send(CaptureCmd::SelectStream(kind));
             }
+        }
+        ui.add_space(2.0);
+        self.what_the_plugin_uses(ui);
+        self.color_exposure_bar(ui);
+    }
+
+    /// What the VPX plugin actually reads, said once and plainly.
+    ///
+    /// The demo shows colour first because it is the stream a human can judge,
+    /// and testers reasonably conclude that colour is what the tracking runs
+    /// on — then spend their effort lighting a room for a camera the plugin is
+    /// not, by default, looking at. On a Kinect the plugin's `Tracking Stream`
+    /// setting defaults to Auto, which finds the head in the INFRARED matrix;
+    /// the DEPTH matrix gives its distance in either case. Colour tracking
+    /// exists, but only if that VPX setting is switched to Color.
+    fn what_the_plugin_uses(&self, ui: &mut egui::Ui) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if !matches!(active.backend, Backend::KinectV1 | Backend::KinectV2) {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.label(RichText::new("ℹ").color(Color32::from_rgb(0x66, 0xcc, 0xff)));
+            ui.label(
+                RichText::new(
+                    "On a Kinect, the VPX plugin finds the head in the INFRARED image and \
+                     reads its distance from the DEPTH image. Colour is preview and \
+                     capture material — unless you set VPX's 'Tracking Stream' to Color.",
+                )
+                .color(Color32::GRAY),
+            );
+        })
+        .response
+        .on_hover_text(
+            "This is why tracking keeps working in the dark: the sensor lights the scene \
+             itself in infrared, so it holds ~30 Hz where the colour camera halves to 15. \
+             Depth gives the distance in both modes — the choice only decides which image \
+             the head is found in.",
+        );
+        ui.add_space(2.0);
+    }
+
+    /// Colour-camera exposure controls, on the v2 while colour is on screen.
+    ///
+    /// Deliberately not offered for infrared or depth: libfreenect2 has no
+    /// such knob for them, the firmware runs their integration itself, and a
+    /// slider that silently does nothing is worse than no slider. Nothing here
+    /// changes what the plugin tracks on — it changes what you see, and what a
+    /// shared capture will contain.
+    fn color_exposure_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if active.backend != Backend::KinectV2
+            || !matches!(self.selected_stream, StreamKind::Rgb | StreamKind::RgbHigh)
+        {
+            return;
+        }
+        let before = self.color_exposure;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new("colour exposure")
+                    .strong()
+                    .color(Color32::GRAY)
+                    .monospace(),
+            )
+            .on_hover_text("Colour camera only — infrared and depth are driven by the firmware.");
+            ui.separator();
+
+            let mut mode = self.color_exposure;
+            // Radio over a combo: three options, and the choice governs which
+            // sliders make sense below it.
+            if ui
+                .selectable_label(matches!(mode, ColorExposureMode::Auto { .. }), "auto")
+                .on_hover_text("The camera decides. How it opens.")
+                .clicked()
+            {
+                mode = ColorExposureMode::Auto { compensation: 0.0 };
+            }
+            if ui
+                .selectable_label(
+                    matches!(mode, ColorExposureMode::SemiAuto { .. }),
+                    "flicker-free",
+                )
+                .on_hover_text(
+                    "Rounds the shutter down to a whole mains-light period (10 ms at 50 Hz, \
+                     8.3 at 60) and raises gain to compensate — kills the banding under \
+                     fluorescent and LED lighting.",
+                )
+                .clicked()
+            {
+                mode = ColorExposureMode::SemiAuto { pseudo_ms: 16.0 };
+            }
+            if ui
+                .selectable_label(matches!(mode, ColorExposureMode::Manual { .. }), "manual")
+                .on_hover_text("Shutter and gain fixed. Nothing automatic left.")
+                .clicked()
+            {
+                mode = ColorExposureMode::Manual {
+                    integration_ms: 16.0,
+                    analog_gain: 1.0,
+                };
+            }
+            ui.separator();
+
+            match &mut mode {
+                ColorExposureMode::Auto { compensation } => {
+                    ui.add(
+                        egui::Slider::new(compensation, -2.0..=2.0)
+                            .text("compensation")
+                            .fixed_decimals(1),
+                    )
+                    .on_hover_text("Negative underexposes, positive overexposes.");
+                }
+                ColorExposureMode::SemiAuto { pseudo_ms } => {
+                    ui.add(
+                        egui::Slider::new(pseudo_ms, 1.0..=66.0)
+                            .text("shutter (ms)")
+                            .fixed_decimals(1),
+                    )
+                    .on_hover_text(
+                        "Asking for less than one mains period brings the flicker back — \
+                         that is the trade.",
+                    );
+                }
+                ColorExposureMode::Manual {
+                    integration_ms,
+                    analog_gain,
+                } => {
+                    ui.add(
+                        egui::Slider::new(integration_ms, 1.0..=66.0)
+                            .text("shutter (ms)")
+                            .fixed_decimals(1),
+                    )
+                    .on_hover_text(
+                        "Past ~33 ms the colour stream drops to 15 fps: 66 ms is one whole \
+                         frame at 15 Hz. Infrared and depth are unaffected.",
+                    );
+                    ui.add(
+                        egui::Slider::new(analog_gain, 1.0..=4.0)
+                            .text("gain")
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text(
+                        "Brightens without lengthening the shutter — at the cost of noise.",
+                    );
+                }
+            }
+            self.color_exposure = mode;
+        });
+        if self.color_exposure != before
+            && let Some(active) = self.active.as_ref()
+        {
+            let _ = active
+                .worker
+                .cmd_tx
+                .send(CaptureCmd::SetColorExposure(self.color_exposure));
         }
         ui.add_space(2.0);
     }

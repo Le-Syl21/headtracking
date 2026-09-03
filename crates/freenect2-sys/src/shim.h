@@ -215,6 +215,15 @@ StreamStats stream_stats(const Freenect2Dev &dev);
 
 /// The colour camera's auto-exposure read-out and its own frame clock.
 ColorExposure color_exposure(const Freenect2Dev &dev);
+
+/// Colour-camera exposure control. The Kinect v2 exposes these for the colour
+/// camera only — the IR/depth sensor's own integration is handled in firmware
+/// and libfreenect2 offers no equivalent for it. Each is a no-op on a device
+/// that failed to open.
+void set_color_auto_exposure(Freenect2Dev &dev, float compensation);
+void set_color_semi_auto_exposure(Freenect2Dev &dev, float pseudo_ms);
+void set_color_manual_exposure(Freenect2Dev &dev, float integration_ms,
+                               float analog_gain);
 IrCameraParams ir_params(const Freenect2Dev &dev);
 ColorCameraParams color_params(const Freenect2Dev &dev);
 std::unique_ptr<Registration> new_registration(const Freenect2Dev &dev);

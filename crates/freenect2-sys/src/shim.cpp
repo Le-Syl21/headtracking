@@ -299,6 +299,25 @@ ColorExposure color_exposure(const Freenect2Dev &dev) {
     return e;
 }
 
+void set_color_auto_exposure(Freenect2Dev &dev, float compensation) {
+    if (dev.dev) {
+        dev.dev->setColorAutoExposure(compensation);
+    }
+}
+
+void set_color_semi_auto_exposure(Freenect2Dev &dev, float pseudo_ms) {
+    if (dev.dev) {
+        dev.dev->setColorSemiAutoExposure(pseudo_ms);
+    }
+}
+
+void set_color_manual_exposure(Freenect2Dev &dev, float integration_ms,
+                               float analog_gain) {
+    if (dev.dev) {
+        dev.dev->setColorManualExposure(integration_ms, analog_gain);
+    }
+}
+
 StreamStats stream_stats(const Freenect2Dev &dev) {
     StreamStats s{};
     s.rgb_received = dev.rgb_listener.received();
