@@ -43,7 +43,7 @@ use egui_rotate::{Rotation, RotationPlugin, SoftwareCursor};
 use egui_winit::winit;
 use headtracking::plugin::logging::DEFAULT_LOG_FILTER;
 use nalgebra::Matrix4;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 use tracing::{error, info, warn};
@@ -3286,33 +3286,13 @@ impl Capture {
 
     /// Build an immutable snapshot for the GL thread. Only called right after
     /// `poll_once` returned `true`, so `last_rgb_frame` is `Some`.
-    fn snapshot_frame(&self, frame_id: u64, captured: u64) -> LatestFrame {
+    fn snapshot_frame(&self, frame_id: u64) -> LatestFrame {
         let (w, h, pixels, layout) = self
             .last_rgb_frame
             .clone()
             .expect("snapshot_frame with no RGB frame");
-        // Only libfreenect2 tells us what it delivered versus what we read.
-        let (rgb_counts, depth_counts) = match &self.inner {
-            Inner::KinectV2 { device, .. } => {
-                let s = device.stream_stats();
-                (
-                    SensorCounts {
-                        delivered: s.rgb_received,
-                        dropped: s.rgb_dropped,
-                    },
-                    SensorCounts {
-                        delivered: s.depth_received,
-                        dropped: s.depth_dropped,
-                    },
-                )
-            }
-            _ => (SensorCounts::default(), SensorCounts::default()),
-        };
         LatestFrame {
             frame_id,
-            captured,
-            depth_captured: self.depth_frames,
-            ir_captured: self.ir_frames,
             w,
             h,
             pixels,
@@ -3336,8 +3316,6 @@ impl Capture {
             filter_us: self.filter_us,
             convert_ms: self.convert_ms,
             copy_ms: self.copy_ms,
-            sensor_rgb: rgb_counts,
-            sensor_depth: depth_counts,
             anchor_locked: self.anchor_worker.is_locked(),
         }
     }
@@ -3520,13 +3498,6 @@ struct SensorCounts {
 struct LatestFrame {
     /// Increments per published frame; the GL thread uploads only when it changes.
     frame_id: u64,
-    /// Cumulative count of captured RGB frames (drives the IN counter delta).
-    captured: u64,
-    /// Cumulative depth / IR frame counts. Published every RGB frame but
-    /// counted independently, so their rates stay correct even when the depth
-    /// stream outruns the colour one (v2 in a dark room).
-    depth_captured: u64,
-    ir_captured: u64,
     w: u32,
     h: u32,
     /// The frame as the driver produced it — see `layout`. Converting to
@@ -3567,10 +3538,6 @@ struct LatestFrame {
     /// pose model reads (ms). Kinect v2 only — the other backends hand over a
     /// ready buffer.
     copy_ms: f32,
-    /// Sensor-side frame accounting for this instant. Kinect v2 only; zeroed
-    /// elsewhere, where the capture counters already are the sensor rate.
-    sensor_rgb: SensorCounts,
-    sensor_depth: SensorCounts,
     /// Cost of the v2 depth-to-colour alignment for this frame (ms); `0.0`
     /// when it isn't running.
     reg_ms: f32,
@@ -3623,9 +3590,98 @@ enum Startup {
 
 /// GL-side handle to the capture thread. Dropping it stops + joins the thread,
 /// which drops the device (the only place it lives).
+/// Counters the capture thread keeps current on *every* turn of its loop,
+/// whether or not it published a frame.
+///
+/// The perf read-out used to be fed only from inside the GL thread's
+/// "a new frame was published, consume it" branch — capture rate, sensor rate
+/// and drop share alike. So the instrument went dark at exactly the moment it
+/// was needed: a field log (2026-09-03) held thirteen minutes of
+/// `cam 0.0 fps | ir+depth 0.0 fps` with the ` of N sensor` suffix gone, and
+/// that line cannot tell "the sensor delivered nothing" apart from "we stopped
+/// reading it" — the two produce identical output. Exported captures from the
+/// same session proved frames were still flowing. Reading these atomics
+/// unconditionally is what makes the next such report answer the question by
+/// itself.
+/// How often the capture thread re-reads the driver's own delivered/dropped
+/// counters. Ten times per perf window: enough to be current, rare enough not
+/// to fight the frame listener for the device mutex.
+const SENSOR_STATS_EVERY: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct CaptureVitals {
+    /// Cumulative frames pulled out of the driver, per stream.
+    captured: AtomicU64,
+    depth_captured: AtomicU64,
+    ir_captured: AtomicU64,
+    /// Whether this backend's driver can report what it delivered at all.
+    /// Only libfreenect2 can; elsewhere the capture rate already *is* the
+    /// sensor rate, and a figure of 0 would be a lie rather than a finding.
+    reports_sensor: AtomicBool,
+    rgb_delivered: AtomicU64,
+    rgb_dropped: AtomicU64,
+    depth_delivered: AtomicU64,
+    depth_dropped: AtomicU64,
+}
+
+impl CaptureVitals {
+    /// Our own counters: three relaxed stores, cheap enough for every turn of
+    /// the loop including the idle ones.
+    fn store_counts(&self, captured: u64, cap: &Capture) {
+        self.captured.store(captured, Ordering::Relaxed);
+        self.depth_captured
+            .store(cap.depth_frames, Ordering::Relaxed);
+        self.ir_captured.store(cap.ir_frames, Ordering::Relaxed);
+    }
+
+    /// The driver's own counters. Deliberately *not* on the hot path:
+    /// `stream_stats` takes the device mutex the frame listener also wants,
+    /// and the idle branch of the loop turns over every millisecond — reading
+    /// it there would add contention precisely when the pipeline is already
+    /// struggling. The perf window is a second wide, so a refresh every
+    /// [`SENSOR_STATS_EVERY`] costs nothing in resolution.
+    fn store_sensor(&self, cap: &Capture) {
+        let Inner::KinectV2 { device, .. } = &cap.inner else {
+            return;
+        };
+        let s = device.stream_stats();
+        self.rgb_delivered.store(s.rgb_received, Ordering::Relaxed);
+        self.rgb_dropped.store(s.rgb_dropped, Ordering::Relaxed);
+        self.depth_delivered
+            .store(s.depth_received, Ordering::Relaxed);
+        self.depth_dropped.store(s.depth_dropped, Ordering::Relaxed);
+        self.reports_sensor.store(true, Ordering::Release);
+    }
+
+    /// `(captured, depth, ir, sensor)` — `sensor` is `None` on a backend whose
+    /// driver cannot report, which is not the same as one reporting zero.
+    fn read(&self) -> (u64, u64, u64, Option<(SensorCounts, SensorCounts)>) {
+        let sensor = self.reports_sensor.load(Ordering::Acquire).then(|| {
+            (
+                SensorCounts {
+                    delivered: self.rgb_delivered.load(Ordering::Relaxed),
+                    dropped: self.rgb_dropped.load(Ordering::Relaxed),
+                },
+                SensorCounts {
+                    delivered: self.depth_delivered.load(Ordering::Relaxed),
+                    dropped: self.depth_dropped.load(Ordering::Relaxed),
+                },
+            )
+        });
+        (
+            self.captured.load(Ordering::Relaxed),
+            self.depth_captured.load(Ordering::Relaxed),
+            self.ir_captured.load(Ordering::Relaxed),
+            sensor,
+        )
+    }
+}
+
 struct CaptureWorker {
     backend: Backend,
     latest: Arc<ArcSwapOption<LatestFrame>>,
+    /// Live counters, readable whatever the GL thread is doing.
+    vitals: Arc<CaptureVitals>,
     cmd_tx: mpsc::Sender<CaptureCmd>,
     /// Latest Kinect v1 tilt/accel read-out (v1 only), refreshed by the loop.
     tilt_state: Arc<Mutex<Option<freenect::TiltState>>>,
@@ -3641,6 +3697,7 @@ struct CaptureWorker {
 impl CaptureWorker {
     fn spawn(backend: Backend) -> Self {
         let latest = Arc::new(ArcSwapOption::empty());
+        let vitals = Arc::new(CaptureVitals::default());
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let tilt_state = Arc::new(Mutex::new(None));
         let startup = Arc::new(Mutex::new(Startup::Pending));
@@ -3649,8 +3706,9 @@ impl CaptureWorker {
         let median_window = Arc::new(AtomicUsize::new(3));
         let bypass = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let (latest_t, tilt_t, startup_t, mc_t, beta_t, mw_t, byp_t, stop_t) = (
+        let (latest_t, vitals_t, tilt_t, startup_t, mc_t, beta_t, mw_t, byp_t, stop_t) = (
             Arc::clone(&latest),
+            Arc::clone(&vitals),
             Arc::clone(&tilt_state),
             Arc::clone(&startup),
             Arc::clone(&filter_min_cutoff),
@@ -3663,14 +3721,15 @@ impl CaptureWorker {
             .name("capture".into())
             .spawn(move || {
                 capture_thread_loop(
-                    backend, cmd_rx, &latest_t, &tilt_t, &startup_t, &mc_t, &beta_t, &mw_t, &byp_t,
-                    &stop_t,
+                    backend, cmd_rx, &latest_t, &vitals_t, &tilt_t, &startup_t, &mc_t, &beta_t,
+                    &mw_t, &byp_t, &stop_t,
                 );
             })
             .expect("spawn capture thread");
         Self {
             backend,
             latest,
+            vitals,
             cmd_tx,
             tilt_state,
             startup,
@@ -3715,6 +3774,7 @@ fn capture_thread_loop(
     backend: Backend,
     cmd_rx: mpsc::Receiver<CaptureCmd>,
     latest: &Arc<ArcSwapOption<LatestFrame>>,
+    vitals: &Arc<CaptureVitals>,
     tilt_state: &Arc<Mutex<Option<freenect::TiltState>>>,
     startup: &Arc<Mutex<Startup>>,
     filter_min_cutoff: &Arc<AtomicU32>,
@@ -3782,6 +3842,8 @@ fn capture_thread_loop(
     cap.blaze_worker.set_min_interval_ms(0);
     let mut frame_id = 0u64;
     let mut captured = 0u64;
+    // Far enough in the past that the first turn publishes immediately.
+    let mut last_sensor_stats = Instant::now() - SENSOR_STATS_EVERY;
     let mut last_tilt_refresh = Instant::now() - Duration::from_millis(600);
     while !stop.load(Ordering::Acquire) {
         // Device I/O commands from the UI (v1 motor/LED, baseline, IR grab).
@@ -3897,10 +3959,18 @@ fn capture_thread_loop(
         if cap.poll_once(byp, true) {
             captured += 1;
             frame_id += 1;
-            latest.store(Some(Arc::new(cap.snapshot_frame(frame_id, captured))));
+            latest.store(Some(Arc::new(cap.snapshot_frame(frame_id))));
         } else {
             // No new camera frame — yield briefly so we don't busy-spin.
             std::thread::sleep(Duration::from_millis(1));
+        }
+        // Outside the branch on purpose: a stall is exactly when these numbers
+        // matter, and publishing them only alongside a frame made a stalled
+        // pipeline and an unread one look identical. See [`CaptureVitals`].
+        vitals.store_counts(captured, &cap);
+        if last_sensor_stats.elapsed() >= SENSOR_STATS_EVERY {
+            vitals.store_sensor(&cap);
+            last_sensor_stats = Instant::now();
         }
     }
 }
@@ -4816,6 +4886,9 @@ struct Metrics {
     sensor_depth: SensorCounts,
     sensor_rgb_base: SensorCounts,
     sensor_depth_base: SensorCounts,
+    /// Whether the backend reports delivered/dropped at all (libfreenect2 does,
+    /// nothing else does).
+    reports_sensor: bool,
     /// Depth / IR capture rates. Diagnostic only — neither is a display rate.
     /// The Kinect streams them from its **own IR illuminator**, so they hold
     /// ~30 Hz in the dark while the auto-exposed colour stream halves to 15:
@@ -4860,6 +4933,7 @@ impl Metrics {
             sensor_depth: SensorCounts::default(),
             sensor_rgb_base: SensorCounts::default(),
             sensor_depth_base: SensorCounts::default(),
+            reports_sensor: false,
             anchor_locked: false,
             was_over: false,
             budget_ms: 1000.0 / 30.0,
@@ -4927,7 +5001,15 @@ impl Metrics {
 
     /// Latest cumulative sensor counters from the capture thread. Differenced
     /// against the window base in [`Self::tick`] — cumulative in, rates out.
-    fn note_sensor(&mut self, rgb: SensorCounts, depth: SensorCounts) {
+    /// `None` means this backend's driver cannot report what it delivered —
+    /// not that it delivered nothing. Keeping the two apart is the whole point
+    /// of the suffix: a Kinect v2 reporting `0.0 of 0.0 sensor` says the
+    /// sensor went quiet, while a webcam simply has nothing to add.
+    fn note_sensor(&mut self, counts: Option<(SensorCounts, SensorCounts)>) {
+        self.reports_sensor = counts.is_some();
+        let Some((rgb, depth)) = counts else {
+            return;
+        };
         self.sensor_rgb = rgb;
         self.sensor_depth = depth;
     }
@@ -5018,10 +5100,19 @@ impl Metrics {
             // Cumulative counters differenced over the same window as the
             // capture rates, so the two are directly comparable: "9.9 of 30"
             // means the sensor did its job and we read one frame in three.
+            // `got == 0` used to yield `None`, which erased the suffix and made
+            // a silent sensor indistinguishable from a backend that never had
+            // the figure. A driver that can count reports its zero.
+            let reports = self.reports_sensor;
             let rate = |now: SensorCounts, base: SensorCounts| {
                 let got = now.delivered.saturating_sub(base.delivered);
                 let lost = now.dropped.saturating_sub(base.dropped);
-                (got > 0).then(|| (got as f32 / elapsed, 100.0 * lost as f32 / got as f32))
+                let drop_pct = if got > 0 {
+                    100.0 * lost as f32 / got as f32
+                } else {
+                    0.0
+                };
+                reports.then(|| (got as f32 / elapsed, drop_pct))
             };
             let rgb = rate(self.sensor_rgb, self.sensor_rgb_base);
             let depth = rate(self.sensor_depth, self.sensor_depth_base);
@@ -5544,6 +5635,25 @@ impl App {
         let Some(active) = self.active.as_mut() else {
             return;
         };
+        // Perf counters come from the capture thread's live atomics, never from
+        // the frame this thread happens to consume: a stall is exactly when
+        // they matter, and reading them inside the consume branch made "the
+        // sensor delivered nothing" and "we stopped reading it" print the same
+        // zeros. See [`CaptureVitals`].
+        let (captured, depth_captured, ir_captured, sensor) = active.worker.vitals.read();
+        active
+            .metrics
+            .add_input(captured.saturating_sub(active.last_captured));
+        active.last_captured = captured;
+        active
+            .metrics
+            .add_depth(depth_captured.saturating_sub(active.last_depth_count));
+        active.last_depth_count = depth_captured;
+        active
+            .metrics
+            .add_ir(ir_captured.saturating_sub(active.last_ir_count));
+        active.last_ir_count = ir_captured;
+        active.metrics.note_sensor(sensor);
         active.metrics.tick();
         // Hand the live-tunable 1€ / bypass knobs to the capture thread (cheap
         // atomics); the device poll + inference now run over there.
@@ -5553,25 +5663,13 @@ impl App {
             self.median_window_frames,
             self.bypass_filters,
         );
-        // Consume the latest processed frame the capture thread published. IN
-        // advances by the cumulative-capture delta (so it counts frames this GL
-        // thread never saw); OUT counts only what we upload → `out ≤ in`, with a
-        // genuine gap whenever rendering runs slower than capture.
+        // Consume the latest processed frame the capture thread published.
+        // This branch now only feeds the display: OUT counts what we upload,
+        // so `out ≤ in`, with a genuine gap whenever rendering runs slower
+        // than capture — and IN keeps counting when it does not run at all.
         if let Some(frame) = active.worker.latest.load_full()
             && frame.frame_id != active.last_consumed_id
         {
-            let delta = frame.captured.saturating_sub(active.last_captured);
-            active.metrics.add_input(delta);
-            active.last_captured = frame.captured;
-            // Same delta trick for the sensor streams (diagnostic only).
-            active
-                .metrics
-                .add_depth(frame.depth_captured.saturating_sub(active.last_depth_count));
-            active
-                .metrics
-                .add_ir(frame.ir_captured.saturating_sub(active.last_ir_count));
-            active.last_depth_count = frame.depth_captured;
-            active.last_ir_count = frame.ir_captured;
             active.last_consumed_id = frame.frame_id;
             let mut img = stream_color_image(&frame, self.selected_stream);
             if self.flatten_view
@@ -5630,9 +5728,6 @@ impl App {
             active.metrics.note_filter_us(frame.filter_us);
             active.metrics.note_convert_ms(frame.convert_ms);
             active.metrics.note_copy_ms(frame.copy_ms);
-            active
-                .metrics
-                .note_sensor(frame.sensor_rgb, frame.sensor_depth);
             active.anchor_locked = frame.anchor_locked;
             if frame.anchor_locked {
                 active.metrics.note_anchor_locked();
@@ -9394,6 +9489,44 @@ mod tests {
         assert!(
             half.contains("2 of 3") && half.contains("WinUSB"),
             "a half-bound sensor must name the count: {half}"
+        );
+    }
+
+    /// A backend whose driver cannot count must stay silent rather than
+    /// report a zero it never measured.
+    #[test]
+    fn a_backend_that_cannot_count_reports_nothing_not_zero() {
+        let vitals = CaptureVitals::default();
+        let (captured, depth, ir, sensor) = vitals.read();
+        assert_eq!((captured, depth, ir), (0, 0, 0));
+        assert!(sensor.is_none(), "silence is not a measurement of zero");
+    }
+
+    /// The regression that made a field report undiagnosable: a Kinect v2 that
+    /// delivered nothing over the window printed a bare `0.0 fps`, exactly like
+    /// a backend that never had the figure — so the log could not say whether
+    /// the sensor had gone quiet or we had stopped reading it.
+    #[test]
+    fn a_silent_kinect_says_so_instead_of_going_blank() {
+        let mut m = Metrics::new();
+        // The driver can count, and counted nothing this window.
+        m.note_sensor(Some((SensorCounts::default(), SensorCounts::default())));
+        m.window_start = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        m.tick();
+        let note = Metrics::sensor_note(m.sensor_in_fps, m.in_drop_pct);
+        assert!(
+            note.contains("0.0 sensor"),
+            "a driver that can count must report its zero, got {note:?}"
+        );
+
+        // Same window, on a backend that cannot report: still nothing to add.
+        let mut m = Metrics::new();
+        m.note_sensor(None);
+        m.window_start = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        m.tick();
+        assert!(
+            Metrics::sensor_note(m.sensor_in_fps, m.in_drop_pct).is_empty(),
+            "a webcam has no sensor figure to give"
         );
     }
 }
