@@ -9279,7 +9279,9 @@ fn init_tracing(sink: Arc<Mutex<VecDeque<String>>>) {
     // The file keeps the target: it is what fills the diagnostics table's
     // `source` column, and it says at a glance whether a line came from us or
     // from libfreenect2 -- without hunting for a `[Component]` prefix.
-    let file_layer = open_log_file().map(|f| {
+    let file_layer = open_log_file().map(|mut f| {
+        // First bytes of this session, before any event can be written.
+        let _ = f.write_all(log_start_marker(env!("CARGO_PKG_VERSION")).as_bytes());
         tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_ansi(false)
@@ -9302,10 +9304,60 @@ fn init_tracing(sink: Arc<Mutex<VecDeque<String>>>) {
         .init();
 }
 
-/// Open `headtracking-demo.log` next to the executable in append mode.
-/// Returns `None` when the executable path can't be resolved or the file
-/// can't be opened (read-only install dir, missing permissions) — the
-/// caller drops the file layer in that case.
+/// Rigid session delimiter, written straight to the log file rather than
+/// through `tracing`.
+///
+/// Deliberately not a tracing event: the point is to survive a change of log
+/// format, and the format is exactly what drifted. Segmenting the contributed
+/// logs by the startup banner silently lost every 0.0.30 session, because that
+/// release wrote `INFO headtracking-demo starting` where later ones write
+/// `INFO headtracking_demo: headtracking-demo starting` — sessions got merged
+/// into their neighbour and a depth pipeline was read off the wrong version.
+/// A fixed byte prefix cannot drift.
+///
+/// Start only, with no matching end: a session runs to the next start marker,
+/// or to the end of the file if it is the last one. An end marker would add
+/// nothing to that, and could not be trusted anyway — a crash or a kill never
+/// writes one, so its absence would mean both "ended badly" and "still
+/// running". A clean shutdown is worth logging, but as an ordinary event with
+/// a timestamp and a reason, not as a delimiter.
+///
+/// No timestamp on the marker either: the tracing line right after it carries
+/// one, and a second clock here would be one more thing to keep in sync.
+const LOG_START_PREFIX: &str = "===== headtracking-demo log start v";
+const LOG_MARKER_SUFFIX: &str = " =====";
+
+fn log_start_marker(version: &str) -> String {
+    format!("{LOG_START_PREFIX}{version}{LOG_MARKER_SUFFIX}\n")
+}
+
+/// The header prepended to a contributed log tail.
+///
+/// The delimiter above fixes session *boundaries*; it does nothing for a
+/// session whose start scrolled out of the 256 KiB window — and five of the
+/// first twelve contributed logs arrived exactly like that, with no version
+/// line anywhere in them. There was no way to tell what build produced them.
+/// The app knows its own version at the moment it packs the tail, so it says
+/// so here, above the cut, where truncation cannot reach.
+///
+/// A prefix of its own, never `LOG_START_PREFIX`: this describes the upload,
+/// not a session. Whatever sits between it and the first real start marker
+/// belongs to a run that began above the cut — possibly an older build — and
+/// stamping that with today's version would be a guess dressed as a fact.
+const LOG_TAIL_PREFIX: &str = "===== headtracking-demo log tail v";
+
+fn log_tail_header(version: &str, keep_bytes: u64, truncated: bool) -> String {
+    let note = if truncated {
+        format!(
+            "last {} KiB — anything above the first start marker began before the cut",
+            keep_bytes / 1024
+        )
+    } else {
+        "whole file".to_owned()
+    };
+    format!("{LOG_TAIL_PREFIX}{version}, {note}{LOG_MARKER_SUFFIX}\n")
+}
+
 /// The tail of our own log, for the contribution.
 ///
 /// Only the last stretch: a capture is judged against the minutes around it,
@@ -9318,12 +9370,18 @@ fn log_tail_for_contribution() -> Option<Vec<u8>> {
     let exe = std::env::current_exe().ok()?;
     let path = exe.parent()?.join("headtracking-demo.log");
     let text = std::fs::read_to_string(&path).ok()?;
-    let start = text.len().saturating_sub(KEEP_BYTES as usize);
+    let cut = text.len().saturating_sub(KEEP_BYTES as usize);
     // Never cut mid-line: find the first newline at or after the cut.
-    let start = text[start..].find('\n').map_or(start, |i| start + i + 1);
-    Some(text.as_bytes()[start..].to_vec())
+    let start = text[cut..].find('\n').map_or(cut, |i| cut + i + 1);
+    let mut out = log_tail_header(env!("CARGO_PKG_VERSION"), KEEP_BYTES, cut > 0).into_bytes();
+    out.extend_from_slice(&text.as_bytes()[start..]);
+    Some(out)
 }
 
+/// Open `headtracking-demo.log` next to the executable in append mode.
+/// Returns `None` when the executable path can't be resolved or the file
+/// can't be opened (read-only install dir, missing permissions) — the
+/// caller drops the file layer in that case.
 fn open_log_file() -> Option<std::fs::File> {
     let exe = std::env::current_exe().ok()?;
     let path = exe.parent()?.join("headtracking-demo.log");
@@ -9515,6 +9573,83 @@ mod tests {
         assert!(
             half.contains("2 of 3") && half.contains("WinUSB"),
             "a half-bound sensor must name the count: {half}"
+        );
+    }
+
+    /// A session runs from its start marker to the next one, or to the end of
+    /// the file if it is the last. That rule is the whole contract, and it has
+    /// to hold across a change of log format — which is what broke the
+    /// previous scheme.
+    #[test]
+    fn a_session_ends_where_the_next_one_starts_or_at_the_end_of_the_file() {
+        let log = format!(
+            "{}{}{}{}{}",
+            log_start_marker("0.0.30"),
+            // The old format, target-less, as 0.0.30 actually wrote it.
+            "2026-08-11T14:50:15Z  INFO headtracking-demo starting version=\"0.0.30\"\n\
+             2026-08-11T14:50:16Z  INFO depth 9.9 fps | ir 9.9 fps\n",
+            log_start_marker("0.0.38"),
+            // The current format, with the target prefix.
+            "2026-09-03T08:39:20Z  INFO headtracking_demo: perf IN(cam 29.5 fps)\n",
+            // No trailing marker: the last session runs to EOF.
+            "2026-09-03T08:39:25Z  INFO headtracking_demo: perf IN(cam 0.0 fps)\n",
+        );
+
+        let starts: Vec<_> = log
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with(LOG_START_PREFIX))
+            .map(|(i, l)| {
+                (
+                    i,
+                    l.trim_start_matches(LOG_START_PREFIX)
+                        .trim_end_matches(LOG_MARKER_SUFFIX)
+                        .to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            starts.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["0.0.30", "0.0.38"],
+            "both sessions must be found, whatever their log format"
+        );
+
+        let lines: Vec<_> = log.lines().collect();
+        let bounds: Vec<_> = starts
+            .iter()
+            .map(|(i, _)| *i)
+            .zip(
+                starts
+                    .iter()
+                    .skip(1)
+                    .map(|(i, _)| *i)
+                    .chain(std::iter::once(lines.len())),
+            )
+            .collect();
+        // The 0.0.30 session must not swallow the 0.0.38 perf lines — that
+        // exact merge is what put a depth pipeline on the wrong version.
+        assert!(
+            !lines[bounds[0].0..bounds[0].1]
+                .iter()
+                .any(|l| l.contains("cam 29.5"))
+        );
+        assert!(
+            lines[bounds[1].0..bounds[1].1]
+                .iter()
+                .any(|l| l.contains("cam 0.0"))
+        );
+    }
+
+    /// The tail header must never be mistaken for a session start: what sits
+    /// above the first real marker came from a run we cannot name.
+    #[test]
+    fn the_tail_header_is_not_a_session_start() {
+        let h = log_tail_header("0.0.38", 256 * 1024, true);
+        assert!(!h.starts_with(LOG_START_PREFIX), "{h}");
+        assert!(h.contains("0.0.38") && h.contains("256 KiB"), "{h}");
+        assert!(
+            log_tail_header("0.0.38", 256 * 1024, false).contains("whole file"),
+            "an untruncated log should say so"
         );
     }
 
