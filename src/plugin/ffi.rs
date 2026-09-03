@@ -475,6 +475,18 @@ fn apply_pose_to_view() {
         unsafe { notify(note.as_ptr(), STARTUP_NOTE_MS) };
     }
 
+    // The tracker thread gave up. Say it on screen: a session that cannot
+    // reach its tracking stream used to degrade to something that half worked,
+    // which reached us months later as a tracking bug rather than as the busy
+    // device it was. Taken, so it fires once.
+    if let Some(fault) = game.tracker.take_fault()
+        && let Some(notify) = vpx.PushNotification
+        && let Ok(note) = std::ffi::CString::new(fault)
+    {
+        // SAFETY: NUL-terminated CString kept alive across the call.
+        unsafe { notify(note.as_ptr(), STARTUP_NOTE_MS) };
+    }
+
     // Camera-pose notification, once the tracker thread's RGB anchor
     // calibration lands (a few seconds into the game, or never).
     if !game.calib_notified

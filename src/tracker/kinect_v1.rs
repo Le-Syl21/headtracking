@@ -4,12 +4,17 @@
 //! between the colour and IR cameras, so exactly one of them streams at a
 //! time:
 //!
-//! * **IR-first** (default): `set_video_stream(Ir)` — actively illuminated,
-//!   full rate in a dark game room. The 8-bit IR frame feeds BlazePose
-//!   directly; IR and depth share the sensor and the 640×480 grid, so the
-//!   head point samples the native `u16` depth exactly.
-//! * **Colour**: BlazePose on the RGB888 stream; the head point rescales
-//!   into the depth grid (same 640×480 nominal framing).
+//! colour serves the anchor phase, then `set_video_stream(Ir)` hands the
+//! endpoint to infrared for the whole session. Actively illuminated, full
+//! rate in a dark game room. The 8-bit IR frame feeds BlazePose directly; IR
+//! and depth share the sensor and the 640×480 grid, so the head point samples
+//! the native `u16` depth exactly.
+//!
+//! If that switch fails there is no colour fallback. Tracking on colour would
+//! half-work — no night operation, and the head found in one framing while its
+//! distance comes from another — and a half-working session gets reported
+//! months later as a tracking bug rather than as the busy device it is. The
+//! session fails with a sentence the player can act on instead.
 //!
 //! Depth sampling widens `u16` per-sample inside the 17×17 window instead
 //! of paying a full-frame `u16→f32` copy per poll, and deprojection uses
@@ -22,8 +27,7 @@ use tracing::{info, warn};
 use freenect::{CX, CY, Context, Device, FX, FY, VideoStream};
 
 use super::pipeline::{
-    DEPTH_MIN_SAMPLES, HeadPixel, Intrinsics, TrackingStream, gray8_to_rgb888,
-    head_pixel_from_pose_depth,
+    DEPTH_MIN_SAMPLES, HeadPixel, Intrinsics, gray8_to_rgb888, head_pixel_from_pose_depth,
 };
 use super::{HeadTracker, Pose};
 
@@ -32,7 +36,6 @@ pub struct KinectV1Backend {
     device: Device,
     _ctx: Context,
     blaze: blazepose::BlazePose,
-    stream: TrackingStream,
     depth_intr: Intrinsics,
     last_pose: Option<blazepose::Pose>,
     pose_src: (u32, u32),
@@ -59,11 +62,9 @@ impl KinectV1Backend {
         // Colour first, whatever the target: the anchor-calibration phase
         // needs RGB frames; `begin_tracking` switches to IR afterwards.
         device.start_streams(true, true)?;
-        let stream = TrackingStream::Ir;
         let blaze = blazepose::BlazePose::new()?;
         info!(
             n_devices = count,
-            ?stream,
             fx = FX,
             fy = FY,
             "kinect-v1: device opened (640x480 depth in mm)"
@@ -72,7 +73,6 @@ impl KinectV1Backend {
             device,
             _ctx: ctx,
             blaze,
-            stream,
             depth_intr: Intrinsics {
                 fx: FX,
                 fy: FY,
@@ -87,46 +87,21 @@ impl KinectV1Backend {
     }
 
     fn refresh_pose(&mut self) {
-        match self.stream {
-            TrackingStream::Ir => {
-                if let Some(ir) = self.device.poll_ir_frame() {
-                    // v1 IR is native 8-bit — no levelling needed, just the
-                    // 3-channel expansion BlazePose expects.
-                    let rgb888 = gray8_to_rgb888(&ir.data);
-                    match self.blaze.poll(
-                        &rgb888,
-                        ir.width,
-                        ir.height,
-                        blazepose::PixelLayout::Rgb888,
-                    ) {
-                        Ok(pose) => {
-                            if pose.is_some() {
-                                self.pose_src = (ir.width, ir.height);
-                            }
-                            self.last_pose = pose;
-                        }
-                        Err(e) => warn!("kinect-v1: blazepose failed on IR: {e}"),
+        if let Some(ir) = self.device.poll_ir_frame() {
+            // v1 IR is native 8-bit — no levelling needed, just the
+            // 3-channel expansion BlazePose expects.
+            let rgb888 = gray8_to_rgb888(&ir.data);
+            match self
+                .blaze
+                .poll(&rgb888, ir.width, ir.height, blazepose::PixelLayout::Rgb888)
+            {
+                Ok(pose) => {
+                    if pose.is_some() {
+                        self.pose_src = (ir.width, ir.height);
                     }
+                    self.last_pose = pose;
                 }
-            }
-            TrackingStream::Rgb => {
-                if let Some(rgb) = self.device.poll_rgb() {
-                    // libfreenect's colour stream is already RGB888.
-                    match self.blaze.poll(
-                        &rgb.data,
-                        rgb.width,
-                        rgb.height,
-                        blazepose::PixelLayout::Rgb888,
-                    ) {
-                        Ok(pose) => {
-                            if pose.is_some() {
-                                self.pose_src = (rgb.width, rgb.height);
-                            }
-                            self.last_pose = pose;
-                        }
-                        Err(e) => warn!("kinect-v1: blazepose failed on colour: {e}"),
-                    }
-                }
+                Err(e) => warn!("kinect-v1: blazepose failed on IR: {e}"),
             }
         }
     }
@@ -160,10 +135,7 @@ impl HeadTracker for KinectV1Backend {
     }
 
     fn device_label(&self) -> String {
-        match self.stream {
-            TrackingStream::Ir => "Kinect v1 (IR stream)".to_string(),
-            TrackingStream::Rgb => "Kinect v1 (color stream)".to_string(),
-        }
+        "Kinect v1 (IR stream)".to_string()
     }
 
     fn poll_calibration_frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
@@ -172,13 +144,23 @@ impl HeadTracker for KinectV1Backend {
         Some((rgb.width, rgb.height, rgb.data))
     }
 
-    fn begin_tracking(&mut self) {
-        if self.stream == TrackingStream::Ir {
-            if let Err(e) = self.device.set_video_stream(VideoStream::Ir) {
-                warn!(?e, "kinect-v1: switch to IR failed; staying on colour");
-                self.stream = TrackingStream::Rgb;
-            } else {
+    fn begin_tracking(&mut self) -> Result<(), String> {
+        // The v1 has one video endpoint: colour and infrared cannot both be
+        // live. It served colour for the anchor phase, and now has to hand it
+        // over. There is deliberately no colour fallback — see the module doc.
+        match self.device.set_video_stream(VideoStream::Ir) {
+            Ok(()) => {
                 info!("kinect-v1: calibration done, video stream switched to IR");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(?e, "kinect-v1: switch to IR failed");
+                Err(
+                    "Head tracking off: cannot open the Kinect's infrared stream. \
+                     Its camera stream is in use — close any other app using the Kinect \
+                     (the head-tracking demo, a capture tool) and restart the table."
+                        .to_owned(),
+                )
             }
         }
     }

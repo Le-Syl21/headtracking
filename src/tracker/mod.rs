@@ -65,9 +65,15 @@ pub trait HeadTracker: Send {
         None
     }
 
-    /// Leave the calibration phase and start the configured tracking stream.
-    /// No-op by default; called exactly once, before the first `poll`.
-    fn begin_tracking(&mut self) {}
+    /// Leave the calibration phase and start the tracking stream.
+    ///
+    /// Called exactly once, before the first `poll`. `Err` carries a sentence
+    /// meant for the player, not a log line: a backend that cannot reach its
+    /// tracking stream has failed, and saying so beats degrading to something
+    /// that half works and gets reported as a tracking bug months later.
+    fn begin_tracking(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Intrinsics `[fx, fy, cx, cy]` of the stream [`poll_calibration_frame`]
     /// serves, when the device knows them (Kinect factory calibration).

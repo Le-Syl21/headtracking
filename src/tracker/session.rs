@@ -131,6 +131,11 @@ pub struct TrackerSession {
     /// Filled by the tracker thread once the RGB anchor-calibration phase
     /// completes successfully (never, if nothing was recognized).
     calibration: Arc<std::sync::Mutex<Option<CameraCalibration>>>,
+    /// A sentence for the player, set by the tracker thread when it gives up.
+    /// Read once by the plugin and pushed as a native VPX notification: a
+    /// session that cannot reach its tracking stream must say so on screen,
+    /// not only in a log nobody opens.
+    fault: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl TrackerSession {
@@ -156,6 +161,7 @@ impl TrackerSession {
         let stop = Arc::new(AtomicBool::new(false));
         let reset_filter = Arc::new(AtomicBool::new(false));
         let calibration = Arc::new(std::sync::Mutex::new(None));
+        let fault = Arc::new(std::sync::Mutex::new(None));
 
         let to_params = |cfg: &Config| {
             cfg.one_euro_params().map(|a| OneEuroParams {
@@ -171,6 +177,7 @@ impl TrackerSession {
         let stop_for_thread = Arc::clone(&stop);
         let reset_for_thread = Arc::clone(&reset_filter);
         let calibration_for_thread = Arc::clone(&calibration);
+        let fault_for_thread = Arc::clone(&fault);
         let handle = thread::Builder::new()
             .name(format!("headtracking-{backend_name}"))
             .spawn(move || {
@@ -181,7 +188,14 @@ impl TrackerSession {
                     *calibration_for_thread.lock().expect("calibration mutex") = Some(calib);
                 }
                 // Phase 2 — hand the device to the tracking stream and run.
-                backend.begin_tracking();
+                // A backend that cannot get there stops here: half-working
+                // tracking is worse than none, because it gets reported as a
+                // tracking bug instead of as the busy device it is.
+                if let Err(why) = backend.begin_tracking() {
+                    warn!(backend = backend_name, %why, "tracker thread stopping");
+                    *fault_for_thread.lock().expect("fault mutex") = Some(why);
+                    return;
+                }
                 let mut filter = OneEuroPose3D::new_per_axis(initial);
                 // Spike gate ahead of the One-Euro filter; the window size
                 // is a live setting (see MedianGate docs for the trade-off).
@@ -232,6 +246,7 @@ impl TrackerSession {
             device_label,
             reset_filter,
             calibration,
+            fault,
         })
     }
 
@@ -259,6 +274,12 @@ impl TrackerSession {
     /// the tracker thread has produced one.
     pub fn calibration(&self) -> Option<CameraCalibration> {
         *self.calibration.lock().expect("calibration mutex")
+    }
+
+    /// Take the tracker thread's fault message, if it left one. Taken rather
+    /// than read, so the notification fires once.
+    pub fn take_fault(&self) -> Option<String> {
+        self.fault.lock().expect("fault mutex").take()
     }
 }
 
