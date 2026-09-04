@@ -158,7 +158,7 @@ pub fn check(sensor: Sensor) -> Option<UsbReport> {
             .iter()
             .filter(|d| d.bus_id() == bus && !ours_addrs.contains(&d.device_address()))
             // Hubs carry no traffic of their own.
-            .filter(|d| d.class() != 0x09)
+            .filter(|d| d.class() != CLASS_HUB)
             .map(|d| {
                 d.product_string().map_or_else(
                     || format!("{:04x}:{:04x}", d.vendor_id(), d.product_id()),
@@ -228,7 +228,7 @@ pub fn log_startup() {
         let bus = first.bus_id();
         let neighbours = devices
             .iter()
-            .filter(|d| d.bus_id() == bus && d.class() != 0x09)
+            .filter(|d| d.bus_id() == bus && d.class() != CLASS_HUB)
             .count()
             .saturating_sub(ours.len());
         tracing::info!(
@@ -323,6 +323,10 @@ pub struct BusNode {
     /// On a bus heading: what periodic transfers may claim here — 80% of a
     /// USB 2.0 bus, 90% of a USB 3.x one. Zero on a device line.
     pub budget_mbit: u32,
+    /// Moves data in bulk — see [`is_bulk_storage`]. Set on the drive itself
+    /// and on the bus heading above it, so the heading can carry the note
+    /// about a copy running during a game.
+    pub bulk_storage: bool,
 }
 
 impl BusNode {
@@ -367,11 +371,22 @@ const PIDS_V2_STREAMING: &[u16] = &[0x02c4];
 /// carry nothing like this load.
 const PIDS_V1_STREAMING: &[u16] = &[0x02ae, 0x02bf, 0x02be];
 
+/// A camera class device's claim: uncompressed 1920x1080 at 60 fps, two bytes
+/// a pixel, rounded up from 1991. The worst thing a consumer UVC camera can
+/// ask for, so charging it here can only overstate a real webcam.
+const CLASS_VIDEO_MBIT: u32 = 2000;
+
+/// An audio class device's claim. Eight channels of 24-bit 48 kHz is 9.2
+/// Mbit/s; even eight channels of 32-bit 192 kHz only reaches 49. Ten is the
+/// consumer case, and it never decides anything on a bus measured in hundreds.
+const CLASS_AUDIO_MBIT: u32 = 10;
+
 /// What a device reserves on its bus while it streams, in Mbit/s.
 ///
 /// Isochronous bandwidth is claimed up front, per bus, and the claim is what
-/// has to fit. These figures are the claims themselves, taken from what the
-/// drivers demand rather than measured or guessed:
+/// has to fit. Two of these figures are read from the drivers themselves; the
+/// other two are assumed for a whole class of device, which is a deliberate
+/// choice explained below.
 ///
 /// * **Kinect v2** - libfreenect2 refuses to start unless endpoint 0x84 offers
 ///   `0x8400` (33792) bytes per isochronous packet. A SuperSpeed service
@@ -383,16 +398,24 @@ const PIDS_V1_STREAMING: &[u16] = &[0x02ae, 0x02bf, 0x02be];
 ///   `VIDEO_PKTSIZE` 1920 bytes per 125 us microframe: 235 Mbit/s together,
 ///   49% of a 480 Mbit/s bus against an 80% ceiling. That is the arithmetic
 ///   behind the old advice to give a v1 its own controller.
-/// * **A video-class device** - a UVC camera can ask for uncompressed
-///   1920x1080 at 60 fps, which at two bytes a pixel is 1990 Mbit/s. Capped by
-///   what its own link carries, since a 12 Mbit device cannot demand more.
-/// * **An audio-class device** - eight channels of 24-bit 48 kHz is under 10
-///   Mbit/s. Counted because it is not zero, but it never decides anything.
+/// * **A video-class device** - [`CLASS_VIDEO_MBIT`].
+/// * **An audio-class device** - [`CLASS_AUDIO_MBIT`].
 ///
-/// Zero for anything unidentified, which makes the total an
-/// **under**-estimate and never an over-estimate. That is the right direction
-/// for the error: this must not cry wolf, which is precisely what the warning
-/// it replaces did.
+/// The two class figures are assumed rather than read, and that is on purpose:
+/// the honest-looking alternative, charging a device whatever its link
+/// carries, is much worse. A USB 3.0 headset would then be charged 5000
+/// Mbit/s for streaming stereo, and any bus carrying one would go red. An
+/// assumption that matches the hardware beats a reading that does not measure
+/// the right thing.
+///
+/// The link rate is still a ceiling, in the one direction where it cannot be
+/// wrong: a 12 Mbit device physically cannot claim more than 12, whatever its
+/// class suggests. So a Full Speed webcam is charged 12, not 2000.
+///
+/// Zero for anything unidentified and for anything that transfers in bulk (see
+/// [`is_bulk_storage`]), which makes the total an **under**-estimate rather
+/// than an over-estimate. That is the right direction for the error: this must
+/// not cry wolf, which is precisely what the warning it replaces did.
 fn demand_mbit(d: &DeviceInfo) -> u32 {
     let link_mbit = match d.speed() {
         Some(Speed::Low) => 1,
@@ -411,13 +434,42 @@ fn demand_mbit(d: &DeviceInfo) -> u32 {
         }
     }
     let classes: Vec<u8> = d.interfaces().map(|i| i.class()).collect();
-    if classes.contains(&0x0e) {
-        return 1990.min(link_mbit);
+    class_demand_mbit(&classes, link_mbit)
+}
+
+/// The class half of [`demand_mbit`], split out so the two guard rails it
+/// encodes can be tested without a USB bus to plug things into.
+fn class_demand_mbit(classes: &[u8], link_mbit: u32) -> u32 {
+    if classes.contains(&CLASS_VIDEO) {
+        return CLASS_VIDEO_MBIT.min(link_mbit);
     }
-    if classes.contains(&0x01) {
-        return 10.min(link_mbit);
+    if classes.contains(&CLASS_AUDIO) {
+        return CLASS_AUDIO_MBIT.min(link_mbit);
     }
     0
+}
+
+/// USB device classes we recognise, from the class codes the USB-IF assigns.
+const CLASS_AUDIO: u8 = 0x01;
+const CLASS_STORAGE: u8 = 0x08;
+const CLASS_HUB: u8 = 0x09;
+const CLASS_VIDEO: u8 = 0x0e;
+
+/// This device moves its data in bulk transfers: an external drive, a card
+/// reader, a USB stick.
+///
+/// Worth telling apart from a device that claims nothing because we did not
+/// recognise it, because the reason is different and so is the advice. Bulk
+/// transfers reserve **no** bandwidth at all -- they are served with whatever
+/// the periodic traffic leaves behind, which is why a drive can sit beside a
+/// Kinect without ever preventing it from starting. What a drive does do is
+/// fill the bus whenever it is asked to, so a long copy running during a game
+/// shares a controller with the sensor in a way a keyboard never does.
+///
+/// So: not counted in the budget, because it genuinely reserves nothing, but
+/// named on its line so nobody reads the zero as "this device is idle".
+fn is_bulk_storage(d: &DeviceInfo) -> bool {
+    d.class() == CLASS_STORAGE || d.interfaces().any(|i| i.class() == CLASS_STORAGE)
 }
 
 /// How much of a bus periodic transfers may claim, in Mbit/s.
@@ -482,7 +534,7 @@ pub fn topology(sensor: Sensor) -> Vec<BusNode> {
                     || format!("{:04x}:{:04x}", d.vendor_id(), d.product_id()),
                     str::to_string,
                 );
-                let hub = if d.class() == 0x09 { " (hub)" } else { "" };
+                let hub = if d.class() == CLASS_HUB { " (hub)" } else { "" };
                 let port = d
                     .port_chain()
                     .last()
@@ -494,6 +546,7 @@ pub fn topology(sensor: Sensor) -> Vec<BusNode> {
                     is_sensor,
                     sensor_underspeed: is_sensor && !fast_enough(sensor, speed),
                     demand_mbit: demand_mbit(d),
+                    bulk_storage: is_bulk_storage(d),
                 }
             })
             .collect();
@@ -511,6 +564,7 @@ struct Row {
     is_sensor: bool,
     sensor_underspeed: bool,
     demand_mbit: u32,
+    bulk_storage: bool,
 }
 
 /// One bus heading followed by its devices. Split out from [`topology`] so the
@@ -527,6 +581,7 @@ fn bus_block(bus_id: &str, bus_speed: Option<Speed>, rows: Vec<Row>) -> Vec<BusN
         sensor_underspeed: rows.iter().any(|r| r.sensor_underspeed),
         demand_mbit: rows.iter().map(|r| r.demand_mbit).sum(),
         budget_mbit: periodic_budget_mbit(bus_speed),
+        bulk_storage: rows.iter().any(|r| r.bulk_storage),
     }];
     out.extend(rows.into_iter().map(|row| BusNode {
         depth: row.chain.len().max(1),
@@ -536,6 +591,7 @@ fn bus_block(bus_id: &str, bus_speed: Option<Speed>, rows: Vec<Row>) -> Vec<BusN
         sensor_underspeed: row.sensor_underspeed,
         demand_mbit: row.demand_mbit,
         budget_mbit: 0,
+        bulk_storage: row.bulk_storage,
     }));
     out
 }
@@ -548,7 +604,10 @@ pub fn counts(tree: &[BusNode]) -> (usize, usize) {
 
 #[cfg(test)]
 mod topology_tests {
-    use super::{BusNode, Row, Sensor, bus_block, fast_enough, periodic_budget_mbit, rate};
+    use super::{
+        BusNode, CLASS_AUDIO, CLASS_STORAGE, CLASS_VIDEO, Row, Sensor, bus_block,
+        class_demand_mbit, fast_enough, periodic_budget_mbit, rate,
+    };
     use nusb::Speed;
 
     fn row(chain: &[u8], name: &str, speed: Option<Speed>, sensor: bool, demand: u32) -> Row {
@@ -559,6 +618,14 @@ mod topology_tests {
             is_sensor: sensor,
             sensor_underspeed: sensor && !fast_enough(Sensor::KinectV2, speed),
             demand_mbit: demand,
+            bulk_storage: false,
+        }
+    }
+
+    fn drive(chain: &[u8], name: &str, speed: Option<Speed>) -> Row {
+        Row {
+            bulk_storage: true,
+            ..row(chain, name, speed, false, 0)
         }
     }
 
@@ -639,11 +706,17 @@ mod topology_tests {
             Some(Speed::Super),
             vec![
                 row(&[1], "Kinect v2", Some(Speed::Super), true, 2160),
-                row(&[2], "Webcam", Some(Speed::Super), false, 1990),
+                row(
+                    &[2],
+                    "Webcam",
+                    Some(Speed::Super),
+                    false,
+                    class_demand_mbit(&[CLASS_VIDEO], 5000),
+                ),
             ],
         );
-        assert_eq!(t[0].demand_mbit, 4150);
-        assert!(!t[0].over_budget(), "4150 fits 4500, but only just");
+        assert_eq!(t[0].demand_mbit, 4160);
+        assert!(!t[0].over_budget(), "4160 fits 4500, but only just");
         assert!(t[0].tight());
     }
 
@@ -709,6 +782,70 @@ mod topology_tests {
         assert!(fast_enough(Sensor::KinectV1, Some(Speed::High)));
         assert!(!fast_enough(Sensor::KinectV2, Some(Speed::High)));
         assert!(fast_enough(Sensor::KinectV2, Some(Speed::Super)));
+    }
+
+    /// The guard rail against tomorrow's hardware. A class figure is an
+    /// assumption about what the device *does*, and that beats charging it
+    /// whatever its link happens to carry: a SuperSpeed headset streams
+    /// stereo, not 5 Gbit/s, and pricing it at its link rate would paint every
+    /// bus carrying one red.
+    #[test]
+    fn a_superspeed_headset_is_charged_for_audio_not_for_its_link() {
+        let headset = &[CLASS_AUDIO];
+        assert_eq!(class_demand_mbit(headset, 5000), 10, "USB 3.0 headset");
+        assert_eq!(class_demand_mbit(headset, 12), 10, "USB 1.1 headset, same");
+        // Eight of them together are still nothing beside one Kinect v2.
+        let eight: u32 = (0..8).map(|_| class_demand_mbit(headset, 5000)).sum();
+        assert!(eight < 2160 / 10, "{eight} Mbit for eight headsets");
+    }
+
+    /// The link rate stays a ceiling in the one direction it cannot be wrong:
+    /// a 12 Mbit device physically cannot claim more than 12, whatever class
+    /// it declares.
+    #[test]
+    fn the_link_rate_caps_a_class_figure_but_never_raises_it() {
+        let camera = &[CLASS_VIDEO];
+        assert_eq!(class_demand_mbit(camera, 5000), 2000, "the class figure");
+        assert_eq!(class_demand_mbit(camera, 12), 12, "capped by a slow link");
+        assert_eq!(class_demand_mbit(camera, 0), 0, "unknown link, no claim");
+    }
+
+    /// A drive claims nothing, because bulk transfers reserve nothing: they
+    /// are served with what periodic traffic leaves behind. So an external
+    /// disk beside a Kinect cannot stop it starting — but it is flagged, so
+    /// its zero is not read as "idle".
+    #[test]
+    fn an_external_drive_reserves_nothing_but_is_still_named() {
+        assert_eq!(
+            class_demand_mbit(&[CLASS_STORAGE], 5000),
+            0,
+            "bulk reserves nothing, whatever the link carries"
+        );
+        let t = tree(
+            "usb1",
+            Some(Speed::Super),
+            vec![
+                row(&[1], "Kinect v2", Some(Speed::Super), true, 2160),
+                drive(&[2], "Portable SSD", Some(Speed::Super)),
+            ],
+        );
+        assert_eq!(t[0].demand_mbit, 2160, "the drive adds nothing");
+        assert!(!t[0].over_budget() && !t[0].tight());
+        assert!(t[2].bulk_storage, "but the drive is marked");
+        assert!(t[0].bulk_storage, "and so is the bus carrying it");
+        assert!(!t[1].bulk_storage, "the Kinect is not a drive");
+    }
+
+    /// A bus with no drive on it says so, so the note about copies during a
+    /// game only appears where it applies.
+    #[test]
+    fn a_bus_without_a_drive_is_not_flagged() {
+        let t = tree(
+            "usb1",
+            Some(Speed::High),
+            vec![row(&[1], "Keyboard", Some(Speed::Full), false, 0)],
+        );
+        assert!(!t[0].bulk_storage);
     }
 
     /// The rate column is the short form lsusb uses, because it is a column.

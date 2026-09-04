@@ -7404,6 +7404,23 @@ impl App {
                     )
                     .color(Color32::GRAY),
                 );
+                if tree
+                    .iter()
+                    .any(|n| n.depth == 0 && n.bulk_storage && n.demand_mbit > 0)
+                {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "A drive shares a bus with a camera below, marked `bulk`. That \
+                             is not a reservation and it costs the camera nothing: bulk \
+                             transfers are served with whatever the streams leave behind, \
+                             so a disk can never stop a camera from starting. It is the \
+                             one device here that is silent until you use it — worth \
+                             knowing if a long copy happens to run during a game.",
+                        )
+                        .color(Color32::GRAY),
+                    );
+                }
                 ui.add_space(6.0);
                 if tree.iter().any(|n| n.sensor_underspeed) {
                     ui.add_space(4.0);
@@ -7495,10 +7512,15 @@ impl App {
                         let pad = width.saturating_sub(left.chars().count());
                         // A bus heading that carries claims says how much of
                         // its budget they take; a device says what it claims.
+                        // A drive says `bulk` instead of a figure: its claim
+                        // really is nothing, and an empty column there would
+                        // read the same as a keyboard's.
                         let claim = if node.depth == 0 && node.demand_mbit > 0 {
                             format!("  {} / {} Mbit", node.demand_mbit, node.budget_mbit)
                         } else if node.depth > 0 && node.demand_mbit > 0 {
                             format!("  {} Mbit", node.demand_mbit)
+                        } else if node.depth > 0 && node.bulk_storage {
+                            "  bulk".to_string()
                         } else {
                             String::new()
                         };
