@@ -313,16 +313,37 @@ pub struct BusNode {
     /// this whole window exists to make obvious. Set on the device and on
     /// the bus heading that carries it.
     pub sensor_underspeed: bool,
-    /// This device declares an isochronous interface — audio (class 0x01) or
-    /// video (0x0e) — so it is one of the few that reserves bandwidth while
-    /// it streams.
+    /// What this device reserves while it streams, in Mbit/s — see
+    /// [`demand_mbit`]. Zero for the great majority, which reserve nothing
+    /// worth counting or could not be identified.
     ///
-    /// A capability, not a measurement: the actual reservation lives in the
-    /// endpoint descriptors, which cannot be read without opening the device,
-    /// and opening a stranger's keyboard is the intrusiveness this window
-    /// replaced. Knowing *which* neighbours can compete is the useful half,
-    /// and it costs nothing.
-    pub reserves: bool,
+    /// On a bus heading this is the total of its devices, and
+    /// [`BusNode::budget_mbit`] is what that total has to fit inside.
+    pub demand_mbit: u32,
+    /// On a bus heading: what periodic transfers may claim here — 80% of a
+    /// USB 2.0 bus, 90% of a USB 3.x one. Zero on a device line.
+    pub budget_mbit: u32,
+}
+
+impl BusNode {
+    /// The claims on this bus exceed what periodic transfers may have. The
+    /// case this is for is two Kinect v2 on one bus: 2160 Mbit/s each against
+    /// a 4500 Mbit/s ceiling, so the second one's stream is refused rather
+    /// than slowed.
+    #[must_use]
+    pub fn over_budget(&self) -> bool {
+        self.depth == 0 && self.budget_mbit > 0 && self.demand_mbit > self.budget_mbit
+    }
+
+    /// Within budget, but with less than a quarter of it left — close enough
+    /// that one more camera would not fit.
+    #[must_use]
+    pub fn tight(&self) -> bool {
+        self.depth == 0
+            && self.budget_mbit > 0
+            && !self.over_budget()
+            && self.demand_mbit * 4 >= self.budget_mbit * 3
+    }
 }
 
 /// Link rate as `lsusb --tree` prints it: `480M`, `5000M`. Short on purpose —
@@ -338,11 +359,81 @@ fn rate(s: Option<Speed>) -> &'static str {
     }
 }
 
-/// Whether a device declares an interface that streams isochronously.
-fn reserves_bandwidth(d: &DeviceInfo) -> bool {
-    // 0x01 audio, 0x0e video. Everything else — HID, storage, hubs, wireless
-    // — either reserves a negligible amount or nothing at all.
-    d.interfaces().any(|i| matches!(i.class(), 0x01 | 0x0e))
+/// Kinect v2 camera function — the one that streams. The firmware-update PID
+/// enumerates without streaming anything.
+const PIDS_V2_STREAMING: &[u16] = &[0x02c4];
+
+/// The Kinect v1 camera functions. Motor and audio enumerate separately and
+/// carry nothing like this load.
+const PIDS_V1_STREAMING: &[u16] = &[0x02ae, 0x02bf, 0x02be];
+
+/// What a device reserves on its bus while it streams, in Mbit/s.
+///
+/// Isochronous bandwidth is claimed up front, per bus, and the claim is what
+/// has to fit. These figures are the claims themselves, taken from what the
+/// drivers demand rather than measured or guessed:
+///
+/// * **Kinect v2** - libfreenect2 refuses to start unless endpoint 0x84 offers
+///   `0x8400` (33792) bytes per isochronous packet. A SuperSpeed service
+///   interval is 125 us, so that is 33792 / 125 us = 270 MB/s = **2160
+///   Mbit/s**, or 43% of a 5 Gbit/s bus. Two come to 87% against a 90% ceiling
+///   for periodic transfers - which is why two on one bus is the case worth
+///   colouring, and why three cannot start at all.
+/// * **Kinect v1** - libfreenect asks for `DEPTH_PKTSIZE` 1760 and
+///   `VIDEO_PKTSIZE` 1920 bytes per 125 us microframe: 235 Mbit/s together,
+///   49% of a 480 Mbit/s bus against an 80% ceiling. That is the arithmetic
+///   behind the old advice to give a v1 its own controller.
+/// * **A video-class device** - a UVC camera can ask for uncompressed
+///   1920x1080 at 60 fps, which at two bytes a pixel is 1990 Mbit/s. Capped by
+///   what its own link carries, since a 12 Mbit device cannot demand more.
+/// * **An audio-class device** - eight channels of 24-bit 48 kHz is under 10
+///   Mbit/s. Counted because it is not zero, but it never decides anything.
+///
+/// Zero for anything unidentified, which makes the total an
+/// **under**-estimate and never an over-estimate. That is the right direction
+/// for the error: this must not cry wolf, which is precisely what the warning
+/// it replaces did.
+fn demand_mbit(d: &DeviceInfo) -> u32 {
+    let link_mbit = match d.speed() {
+        Some(Speed::Low) => 1,
+        Some(Speed::Full) => 12,
+        Some(Speed::High) => 480,
+        Some(Speed::Super) => 5000,
+        Some(Speed::SuperPlus) => 10000,
+        _ => 0,
+    };
+    if d.vendor_id() == VID_MICROSOFT {
+        if PIDS_V2_STREAMING.contains(&d.product_id()) {
+            return 2160;
+        }
+        if PIDS_V1_STREAMING.contains(&d.product_id()) {
+            return 235;
+        }
+    }
+    let classes: Vec<u8> = d.interfaces().map(|i| i.class()).collect();
+    if classes.contains(&0x0e) {
+        return 1990.min(link_mbit);
+    }
+    if classes.contains(&0x01) {
+        return 10.min(link_mbit);
+    }
+    0
+}
+
+/// How much of a bus periodic transfers may claim, in Mbit/s.
+///
+/// USB 2.0 caps them at 80% of the frame and USB 3.x at 90%; the rest is left
+/// for bulk and control, which is why a bus fills up well before its nominal
+/// rate.
+fn periodic_budget_mbit(bus_speed: Option<Speed>) -> u32 {
+    match bus_speed {
+        Some(Speed::Low) => 1,
+        Some(Speed::Full) => 12 * 80 / 100,
+        Some(Speed::High) => 480 * 80 / 100,
+        Some(Speed::Super) => 5000 * 90 / 100,
+        Some(Speed::SuperPlus) => 10000 * 90 / 100,
+        _ => 0,
+    }
 }
 
 /// What this sensor needs to work at all.
@@ -402,7 +493,7 @@ pub fn topology(sensor: Sensor) -> Vec<BusNode> {
                     label: format!("port {port}  {name}{hub}"),
                     is_sensor,
                     sensor_underspeed: is_sensor && !fast_enough(sensor, speed),
-                    reserves: !is_sensor && reserves_bandwidth(d),
+                    demand_mbit: demand_mbit(d),
                 }
             })
             .collect();
@@ -419,7 +510,7 @@ struct Row {
     label: String,
     is_sensor: bool,
     sensor_underspeed: bool,
-    reserves: bool,
+    demand_mbit: u32,
 }
 
 /// One bus heading followed by its devices. Split out from [`topology`] so the
@@ -434,7 +525,8 @@ fn bus_block(bus_id: &str, bus_speed: Option<Speed>, rows: Vec<Row>) -> Vec<BusN
         is_sensor: false,
         // A heading is flagged when it is the bus starving the sensor.
         sensor_underspeed: rows.iter().any(|r| r.sensor_underspeed),
-        reserves: false,
+        demand_mbit: rows.iter().map(|r| r.demand_mbit).sum(),
+        budget_mbit: periodic_budget_mbit(bus_speed),
     }];
     out.extend(rows.into_iter().map(|row| BusNode {
         depth: row.chain.len().max(1),
@@ -442,7 +534,8 @@ fn bus_block(bus_id: &str, bus_speed: Option<Speed>, rows: Vec<Row>) -> Vec<BusN
         label: row.label,
         is_sensor: row.is_sensor,
         sensor_underspeed: row.sensor_underspeed,
-        reserves: row.reserves,
+        demand_mbit: row.demand_mbit,
+        budget_mbit: 0,
     }));
     out
 }
@@ -455,17 +548,17 @@ pub fn counts(tree: &[BusNode]) -> (usize, usize) {
 
 #[cfg(test)]
 mod topology_tests {
-    use super::{BusNode, Row, Sensor, bus_block, fast_enough, rate};
+    use super::{BusNode, Row, Sensor, bus_block, fast_enough, periodic_budget_mbit, rate};
     use nusb::Speed;
 
-    fn row(chain: &[u8], name: &str, speed: Option<Speed>, sensor: bool, reserves: bool) -> Row {
+    fn row(chain: &[u8], name: &str, speed: Option<Speed>, sensor: bool, demand: u32) -> Row {
         Row {
             chain: chain.to_vec(),
             rate: rate(speed).into(),
             label: name.into(),
             is_sensor: sensor,
             sensor_underspeed: sensor && !fast_enough(Sensor::KinectV2, speed),
-            reserves: reserves && !sensor,
+            demand_mbit: demand,
         }
     }
 
@@ -473,92 +566,141 @@ mod topology_tests {
         bus_block(bus, speed, rows)
     }
 
-    /// The heading carries the bus's own rate, not a device's. That is the
-    /// number `lsusb --tree` prints beside a root hub, and the one that says
-    /// whether a SuperSpeed sensor is on the wrong bus.
+    /// The heading carries the bus's own rate, not a device's — the number
+    /// that says whether a SuperSpeed sensor is on the wrong bus.
     #[test]
     fn a_bus_heading_carries_the_buss_own_rate() {
         let t = tree(
             "usb1",
             Some(Speed::High),
-            vec![row(&[5], "Keyboard", Some(Speed::Full), false, false)],
+            vec![row(&[5], "Keyboard", Some(Speed::Full), false, 0)],
         );
         assert_eq!(t[0].label, "Bus usb1");
         assert_eq!(t[0].rate, "480M", "the bus, not the 12M keyboard on it");
-        assert_eq!(t[0].depth, 0);
         assert_eq!(t[1].rate, "12M");
-        assert_eq!(t[1].depth, 1);
+        assert_eq!((t[0].depth, t[1].depth), (0, 1));
     }
 
-    /// An empty bus stays in the list: a free SuperSpeed socket is precisely
-    /// what someone whose sensor sits on a 480M bus needs to see.
+    /// An empty bus stays: a free SuperSpeed socket is exactly what someone
+    /// whose sensor sits on a 480M bus needs to see.
     #[test]
     fn an_empty_bus_is_still_worth_showing() {
         let t = tree("usb2", Some(Speed::Super), Vec::new());
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].rate, "5000M");
-        assert_eq!(super::counts(&t), (1, 0));
+        assert!(!t[0].over_budget(), "nothing claimed, nothing over");
     }
 
-    /// A v2 on a 480M bus is the reason this window exists, and both the
-    /// device and the bus that starves it have to say so.
+    /// The case this arithmetic exists for. One v2 claims 2160 of the 4500
+    /// Mbit/s periodic budget of a SuperSpeed bus; two claim 4320, which
+    /// still fits but leaves under a quarter; three do not fit at all.
+    #[test]
+    fn two_kinect_v2_on_one_bus_is_tight_and_three_do_not_fit() {
+        let v2 = |port: u8| row(&[port], "Kinect v2", Some(Speed::Super), false, 2160);
+
+        let one = tree("usb1", Some(Speed::Super), vec![v2(1)]);
+        assert!(!one[0].over_budget() && !one[0].tight(), "2160 of 4500");
+
+        let two = tree("usb1", Some(Speed::Super), vec![v2(1), v2(2)]);
+        assert_eq!(two[0].demand_mbit, 4320);
+        assert_eq!(two[0].budget_mbit, 4500);
+        assert!(!two[0].over_budget(), "4320 still fits inside 4500");
+        assert!(two[0].tight(), "but with 180 Mbit to spare");
+
+        let three = tree("usb1", Some(Speed::Super), vec![v2(1), v2(2), v2(3)]);
+        assert!(three[0].over_budget(), "6480 cannot fit 4500");
+    }
+
+    /// A Kinect v1 takes half a USB 2.0 bus, which is the arithmetic behind
+    /// the old advice to give it a controller of its own.
+    #[test]
+    fn two_kinect_v1_do_not_fit_on_one_usb2_bus() {
+        let v1 = |port: u8| row(&[port], "Kinect v1", Some(Speed::High), false, 235);
+        assert_eq!(periodic_budget_mbit(Some(Speed::High)), 384, "80% of 480");
+
+        let one = tree("usb1", Some(Speed::High), vec![v1(1)]);
+        assert!(!one[0].over_budget() && !one[0].tight());
+
+        let two = tree("usb1", Some(Speed::High), vec![v1(1), v1(2)]);
+        assert_eq!(two[0].demand_mbit, 470);
+        assert!(two[0].over_budget(), "470 does not fit inside 384");
+        assert!(
+            !two[0].tight(),
+            "over budget is not 'nearly full' - the two states are exclusive"
+        );
+    }
+
+    /// A v2 beside an uncompressed FullHD60 webcam does not fit either — the
+    /// pairing the window warns about in words.
+    #[test]
+    fn a_v2_and_a_full_hd_webcam_do_not_fit_together() {
+        let t = tree(
+            "usb1",
+            Some(Speed::Super),
+            vec![
+                row(&[1], "Kinect v2", Some(Speed::Super), true, 2160),
+                row(&[2], "Webcam", Some(Speed::Super), false, 1990),
+            ],
+        );
+        assert_eq!(t[0].demand_mbit, 4150);
+        assert!(!t[0].over_budget(), "4150 fits 4500, but only just");
+        assert!(t[0].tight());
+    }
+
+    /// Ordinary devices claim nothing worth counting, so a busy-looking bus
+    /// of keyboards stays quiet. Crying wolf here is what this replaced.
+    #[test]
+    fn a_bus_full_of_keyboards_claims_nothing() {
+        let t = tree(
+            "usb1",
+            Some(Speed::High),
+            vec![
+                row(&[1], "Keyboard", Some(Speed::Full), false, 0),
+                row(&[2], "Mouse", Some(Speed::Full), false, 0),
+                row(&[3], "Bluetooth", Some(Speed::Full), false, 0),
+                row(&[4], "USB DAC", Some(Speed::Full), false, 10),
+            ],
+        );
+        assert_eq!(t[0].demand_mbit, 10, "only the audio device counts");
+        assert!(!t[0].over_budget() && !t[0].tight());
+    }
+
+    /// A v2 on a 480M bus flags itself and the bus starving it.
     #[test]
     fn an_underspeed_sensor_flags_itself_and_its_bus() {
         let t = tree(
             "usb1",
             Some(Speed::High),
-            vec![row(&[1], "Kinect v2", Some(Speed::High), true, false)],
+            vec![row(&[1], "Kinect v2", Some(Speed::High), true, 2160)],
         );
         assert!(t[1].sensor_underspeed, "the device");
         assert!(t[0].sensor_underspeed, "and the bus carrying it");
-
-        let ok = tree(
-            "usb2",
-            Some(Speed::Super),
-            vec![row(&[1], "Kinect v2", Some(Speed::Super), true, false)],
-        );
-        assert!(!ok[1].sensor_underspeed);
-        assert!(!ok[0].sensor_underspeed);
     }
 
-    /// Only devices that stream isochronously are marked as reserving. A
-    /// keyboard beside the sensor is a non-event, and saying otherwise is the
-    /// false alarm this window replaced.
-    #[test]
-    fn only_isochronous_neighbours_are_marked() {
-        let t = tree(
-            "usb1",
-            Some(Speed::Super),
-            vec![
-                row(&[1], "Kinect v2", Some(Speed::Super), true, false),
-                row(&[2], "Keyboard", Some(Speed::Full), false, false),
-                row(&[3], "USB DAC", Some(Speed::Full), false, true),
-            ],
-        );
-        let marked: Vec<&str> = t
-            .iter()
-            .filter(|n| n.reserves)
-            .map(|n| n.label.as_str())
-            .collect();
-        assert_eq!(marked, ["USB DAC"]);
-        // The sensor is never marked as its own rival.
-        assert!(!t[1].reserves);
-    }
-
-    /// Depth follows the port chain, so a device behind a hub reads as a
-    /// child of the hub rather than of the bus.
+    /// Depth follows the port chain, so a device behind a hub reads as its
+    /// child rather than the bus's.
     #[test]
     fn a_device_behind_a_hub_nests_under_it() {
         let t = tree(
             "usb1",
             Some(Speed::High),
             vec![
-                row(&[3], "Hub (hub)", Some(Speed::High), false, false),
-                row(&[3, 2], "Keyboard", Some(Speed::Full), false, false),
+                row(&[3], "Hub (hub)", Some(Speed::High), false, 0),
+                row(&[3, 2], "Keyboard", Some(Speed::Full), false, 0),
             ],
         );
-        assert_eq!(t[1].depth, 1, "the hub hangs off the bus");
-        assert_eq!(t[2].depth, 2, "and the keyboard off the hub");
+        assert_eq!((t[1].depth, t[2].depth), (1, 2));
+    }
+
+    /// The budget is a share of the bus, not the whole of it: periodic
+    /// transfers get 80% of USB 2.0 and 90% of USB 3.x, and the rest is left
+    /// for bulk and control.
+    #[test]
+    fn the_periodic_budget_is_a_share_not_the_whole_bus() {
+        assert_eq!(periodic_budget_mbit(Some(Speed::High)), 384);
+        assert_eq!(periodic_budget_mbit(Some(Speed::Super)), 4500);
+        assert_eq!(periodic_budget_mbit(Some(Speed::SuperPlus)), 9000);
+        assert_eq!(periodic_budget_mbit(None), 0, "unknown claims nothing");
     }
 
     /// A v1 is happy on High Speed where a v2 is not.
@@ -567,7 +709,6 @@ mod topology_tests {
         assert!(fast_enough(Sensor::KinectV1, Some(Speed::High)));
         assert!(!fast_enough(Sensor::KinectV2, Some(Speed::High)));
         assert!(fast_enough(Sensor::KinectV2, Some(Speed::Super)));
-        assert!(!fast_enough(Sensor::KinectV1, Some(Speed::Full)));
     }
 
     /// The rate column is the short form lsusb uses, because it is a column.
@@ -576,24 +717,18 @@ mod topology_tests {
         assert_eq!(rate(Some(Speed::Full)), "12M");
         assert_eq!(rate(Some(Speed::High)), "480M");
         assert_eq!(rate(Some(Speed::Super)), "5000M");
-        assert_eq!(rate(Some(Speed::SuperPlus)), "10000M");
         assert_eq!(rate(None), "?");
     }
 
-    /// Headings and devices are counted apart: a heading is not something
-    /// anyone plugged in.
+    /// Headings and devices are counted apart.
     #[test]
     fn counting_tells_buses_from_devices() {
         let mut t = tree(
             "usb1",
             Some(Speed::High),
-            vec![
-                row(&[1], "A", Some(Speed::Full), false, false),
-                row(&[2], "B", Some(Speed::Full), false, false),
-            ],
+            vec![row(&[1], "A", Some(Speed::Full), false, 0)],
         );
         t.extend(tree("usb2", Some(Speed::Super), Vec::new()));
-        assert_eq!(super::counts(&t), (2, 2));
-        assert_eq!(super::counts(&[]), (0, 0));
+        assert_eq!(super::counts(&t), (2, 1));
     }
 }

@@ -7442,9 +7442,9 @@ impl App {
                     };
                     entry(ui, COLOR_OK, "this sensor");
                     ui.label(RichText::new("·").color(Color32::DARK_GRAY));
-                    entry(ui, COLOR_BAD, "too slow for it");
+                    entry(ui, COLOR_BAD, "too slow for it  ·  bus over budget");
                     ui.label(RichText::new("·").color(Color32::DARK_GRAY));
-                    entry(ui, COLOR_RESERVES, "reserves bandwidth (audio/video)");
+                    entry(ui, COLOR_RESERVES, "reserves bandwidth  ·  bus almost full");
                     ui.label(RichText::new("·").color(Color32::DARK_GRAY));
                     entry(ui, Color32::GRAY, "everything else");
                 });
@@ -7468,8 +7468,10 @@ impl App {
                         let (prefix, colour) = if node.depth == 0 {
                             (
                                 String::new(),
-                                if node.sensor_underspeed {
+                                if node.sensor_underspeed || node.over_budget() {
                                     COLOR_BAD
+                                } else if node.tight() {
+                                    COLOR_RESERVES
                                 } else {
                                     Color32::LIGHT_GRAY
                                 },
@@ -7482,7 +7484,7 @@ impl App {
                                 COLOR_BAD
                             } else if node.is_sensor {
                                 COLOR_OK
-                            } else if node.reserves {
+                            } else if node.demand_mbit > 0 {
                                 COLOR_RESERVES
                             } else {
                                 Color32::GRAY
@@ -7491,7 +7493,16 @@ impl App {
                         };
                         let left = format!("{prefix}{}", node.label);
                         let pad = width.saturating_sub(left.chars().count());
-                        let line = format!("{left}{:pad$}  [{}]", "", node.rate);
+                        // A bus heading that carries claims says how much of
+                        // its budget they take; a device says what it claims.
+                        let claim = if node.depth == 0 && node.demand_mbit > 0 {
+                            format!("  {} / {} Mbit", node.demand_mbit, node.budget_mbit)
+                        } else if node.depth > 0 && node.demand_mbit > 0 {
+                            format!("  {} Mbit", node.demand_mbit)
+                        } else {
+                            String::new()
+                        };
+                        let line = format!("{left}{:pad$}  [{}]{claim}", "", node.rate);
                         let text = RichText::new(line).monospace().color(colour);
                         let text = if node.depth == 0 || node.is_sensor {
                             text.strong()
