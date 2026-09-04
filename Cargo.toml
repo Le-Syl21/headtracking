@@ -20,7 +20,7 @@ members = [
 # is to pin the build a tester is running — reported 0.0.33 out of the 0.0.36
 # release. The tag/version guard in release.yml only checks `headtracking`, so
 # nothing caught it; now there is only one number to get wrong.
-version = "0.0.38"
+version = "0.0.39"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Le-Syl21/headtracking"
