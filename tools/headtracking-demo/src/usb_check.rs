@@ -11,7 +11,7 @@
 //! device), and exposes `bus_id` -- which is what "alone on its controller"
 //! actually means.
 
-use nusb::{DeviceInfo, MaybeFuture as _, Speed};
+use nusb::{BusInfo, DeviceInfo, MaybeFuture as _, Speed, UsbControllerType};
 
 /// Microsoft. Every Kinect function of both generations lives under it.
 const VID_MICROSOFT: u16 = 0x045e;
@@ -417,14 +417,7 @@ const CLASS_AUDIO_MBIT: u32 = 10;
 /// than an over-estimate. That is the right direction for the error: this must
 /// not cry wolf, which is precisely what the warning it replaces did.
 fn demand_mbit(d: &DeviceInfo) -> u32 {
-    let link_mbit = match d.speed() {
-        Some(Speed::Low) => 1,
-        Some(Speed::Full) => 12,
-        Some(Speed::High) => 480,
-        Some(Speed::Super) => 5000,
-        Some(Speed::SuperPlus) => 10000,
-        _ => 0,
-    };
+    let link_mbit = link_mbit(d.speed());
     if d.vendor_id() == VID_MICROSOFT {
         if PIDS_V2_STREAMING.contains(&d.product_id()) {
             return 2160;
@@ -472,20 +465,99 @@ fn is_bulk_storage(d: &DeviceInfo) -> bool {
     d.class() == CLASS_STORAGE || d.interfaces().any(|i| i.class() == CLASS_STORAGE)
 }
 
+/// What a link of this speed carries, in Mbit/s. Zero when the speed is
+/// unknown, which makes every figure derived from it zero too — the quiet
+/// direction to fail in.
+fn link_mbit(s: Option<Speed>) -> u32 {
+    match s {
+        Some(Speed::Low) => 1,
+        Some(Speed::Full) => 12,
+        Some(Speed::High) => 480,
+        Some(Speed::Super) => 5000,
+        Some(Speed::SuperPlus) => 10000,
+        _ => 0,
+    }
+}
+
+/// The bus's own link rate — the number a heading carries and the budget is
+/// computed from.
+///
+/// Linux is the only platform where `nusb` hands this over: it models each
+/// root hub as a device, so `BusInfo::root_hub()` has a negotiated speed on
+/// it. On Windows and macOS `BusInfo` carries an id, a driver name and a
+/// controller type, and nothing at all about speed — `root_hub()` is not
+/// merely empty there, it does not compile. That is what broke the macOS and
+/// Windows legs of the release while Linux stayed green.
+///
+/// Elsewhere it is inferred from two facts, neither sufficient alone:
+///
+/// * the **controller type** — an xHCI controller carries SuperSpeed, an EHCI
+///   one USB 2.0, an OHCI or UHCI one USB 1.1;
+/// * the **fastest device enumerated on the bus**, which is a floor: a bus
+///   with a SuperSpeedPlus device on it is a 10 Gbit bus, whatever else we
+///   think.
+///
+/// The faster of the two wins. The controller type alone would call a 10 Gbit
+/// bus a 5 Gbit one; the fastest device alone would leave an empty SuperSpeed
+/// bus unknown, and that free socket is exactly what someone whose sensor sits
+/// on a 480M bus needs pointing at.
+///
+/// One asymmetry is worth knowing when reading a Windows tree next to a Linux
+/// one. Linux splits an xHCI controller into two buses — a USB 2.0 one and a
+/// SuperSpeed one, on separate schedules — and `root_hub()` tells them apart
+/// exactly. Windows presents that same controller as a single root hub
+/// carrying both, so a USB 2.0 device's claim is counted against the
+/// SuperSpeed budget. That overstates the load, never understates it.
+fn bus_rate(bus: &BusInfo, devices: &[DeviceInfo]) -> Option<Speed> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = devices;
+        bus.root_hub().speed()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let fastest = devices
+            .iter()
+            .filter(|d| d.bus_id() == bus.bus_id())
+            .filter_map(DeviceInfo::speed)
+            .max();
+        infer_bus_rate(bus.controller_type(), fastest)
+    }
+}
+
+/// The inference [`bus_rate`] falls back on, as a pure function.
+///
+/// Split out so the rule can be tested on Linux, which is the one platform
+/// that never runs it — untested platform-specific code is what put a build
+/// that does not compile on two of four targets behind a green local run.
+///
+/// `Speed` derives `Ord` over variants declared slowest-first, so `max` here
+/// is genuinely the faster of the two and not an arbitrary pick.
+#[allow(dead_code)] // The caller is compiled off Linux only; the tests are not.
+fn infer_bus_rate(controller: Option<UsbControllerType>, fastest: Option<Speed>) -> Option<Speed> {
+    let from_controller = match controller {
+        Some(UsbControllerType::XHCI) => Some(Speed::Super),
+        Some(UsbControllerType::EHCI) => Some(Speed::High),
+        Some(UsbControllerType::OHCI | UsbControllerType::UHCI) => Some(Speed::Full),
+        // VHCI is virtual and has no rate worth quoting; None means the
+        // platform could not tell us.
+        _ => None,
+    };
+    from_controller.max(fastest)
+}
+
 /// How much of a bus periodic transfers may claim, in Mbit/s.
 ///
 /// USB 2.0 caps them at 80% of the frame and USB 3.x at 90%; the rest is left
 /// for bulk and control, which is why a bus fills up well before its nominal
 /// rate.
 fn periodic_budget_mbit(bus_speed: Option<Speed>) -> u32 {
-    match bus_speed {
-        Some(Speed::Low) => 1,
-        Some(Speed::Full) => 12 * 80 / 100,
-        Some(Speed::High) => 480 * 80 / 100,
-        Some(Speed::Super) => 5000 * 90 / 100,
-        Some(Speed::SuperPlus) => 10000 * 90 / 100,
-        _ => 0,
-    }
+    let share = match bus_speed {
+        Some(Speed::Super | Speed::SuperPlus) => 90,
+        Some(_) => 80,
+        None => return 0,
+    };
+    link_mbit(bus_speed) * share / 100
 }
 
 /// What this sensor needs to work at all.
@@ -517,13 +589,15 @@ pub fn topology(sensor: Sensor) -> Vec<BusNode> {
     let devices: Vec<DeviceInfo> = devices.collect();
     let wanted = pids(sensor);
 
-    let mut buses: Vec<(String, Option<Speed>)> = buses
-        .map(|b| (b.bus_id().to_string(), b.root_hub().speed()))
-        .collect();
-    buses.sort_by(|a, b| a.0.cmp(&b.0));
+    // Kept as `BusInfo`, not flattened to (id, speed): `bus_rate` needs the
+    // controller type off it on the platforms with no root hub to ask.
+    let mut buses: Vec<BusInfo> = buses.collect();
+    buses.sort_by(|a, b| a.bus_id().cmp(b.bus_id()));
 
     let mut out = Vec::new();
-    for (bus_id, bus_speed) in buses {
+    for bus in buses {
+        let bus_id = bus.bus_id();
+        let bus_speed = bus_rate(&bus, &devices);
         let mut rows: Vec<Row> = devices
             .iter()
             .filter(|d| d.bus_id() == bus_id)
@@ -551,7 +625,7 @@ pub fn topology(sensor: Sensor) -> Vec<BusNode> {
             })
             .collect();
         rows.sort_by(|a, b| a.chain.cmp(&b.chain));
-        out.extend(bus_block(&bus_id, bus_speed, rows));
+        out.extend(bus_block(bus_id, bus_speed, rows));
     }
     out
 }
@@ -846,6 +920,50 @@ mod topology_tests {
             vec![row(&[1], "Keyboard", Some(Speed::Full), false, 0)],
         );
         assert!(!t[0].bulk_storage);
+    }
+
+    /// The rule that stands in for a root hub on Windows and macOS. Neither
+    /// input is enough alone: the controller type would call a 10 Gbit bus a
+    /// 5 Gbit one, and the fastest device would leave an empty SuperSpeed bus
+    /// unknown — and an empty fast socket is exactly what someone whose
+    /// sensor sits on a 480M bus needs pointing at.
+    #[test]
+    fn a_bus_rate_is_inferred_from_the_controller_and_what_is_plugged_in() {
+        use super::{UsbControllerType as C, infer_bus_rate as infer};
+
+        assert_eq!(infer(Some(C::XHCI), None), Some(Speed::Super), "empty xHCI");
+        assert_eq!(infer(Some(C::EHCI), None), Some(Speed::High), "empty EHCI");
+        assert_eq!(
+            infer(Some(C::XHCI), Some(Speed::SuperPlus)),
+            Some(Speed::SuperPlus),
+            "a 10 Gbit device proves a 10 Gbit bus"
+        );
+        assert_eq!(
+            infer(Some(C::XHCI), Some(Speed::Full)),
+            Some(Speed::Super),
+            "a slow device on a fast bus does not slow the bus"
+        );
+        assert_eq!(
+            infer(None, Some(Speed::Super)),
+            Some(Speed::Super),
+            "unknown controller, but something fast is plugged into it"
+        );
+        assert_eq!(infer(None, None), None, "nothing known, nothing claimed");
+    }
+
+    /// An unknown bus rate claims no budget, so nothing is coloured on a
+    /// guess: the quiet direction to fail in.
+    #[test]
+    fn an_unknown_bus_rate_budgets_nothing() {
+        let t = tree(
+            "usb1",
+            None,
+            vec![row(&[1], "Kinect v2", Some(Speed::Super), true, 2160)],
+        );
+        assert_eq!(t[0].rate, "?");
+        assert_eq!(t[0].budget_mbit, 0);
+        assert!(!t[0].over_budget(), "no budget, no verdict");
+        assert!(!t[0].tight());
     }
 
     /// The rate column is the short form lsusb uses, because it is a column.
