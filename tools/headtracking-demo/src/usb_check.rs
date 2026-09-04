@@ -293,44 +293,56 @@ pub struct BusNode {
     /// 0 = the controller itself, 1 = plugged straight into it, 2+ = behind
     /// a hub.
     pub depth: usize,
-    /// `USB 3.0`, `USB 2.0`, … — first on the line and fixed width on
-    /// purpose. Someone opening this window because the Kinect lags is
-    /// looking for exactly one thing, and it should be readable down a
-    /// column rather than hunted for at the end of a sentence.
-    pub generation: String,
-    /// Device name, port, and the detailed rate.
+    /// `480M`, `5000M` — the link rate, right-aligned in its own column so a
+    /// glance down the list compares like with like. On a bus heading it is
+    /// the bus's own rate, from the root hub.
+    ///
+    /// Deliberately *not* a share of the bus. What enumeration gives is the
+    /// negotiated link rate, not consumption: five 12M devices on a 480M bus
+    /// would read as 12% while sending a few bytes every 8 ms, and a Kinect
+    /// alone on a SuperSpeed bus would read as 100% while reserving about
+    /// two fifths of it. A percentage built from these numbers would cry
+    /// wolf on the one healthy case that matters.
+    pub rate: String,
+    /// Device name, or `Bus <id>` on a heading. Nothing else — the rate is
+    /// its own column and the arrow carries the nesting.
     pub label: String,
     /// The sensor being asked about, so the UI can pick it out of the list.
     pub is_sensor: bool,
     /// The sensor is plugged in below the speed it needs — the single fact
-    /// this whole window exists to make obvious.
+    /// this whole window exists to make obvious. Set on the device and on
+    /// the bus heading that carries it.
     pub sensor_underspeed: bool,
+    /// This device declares an isochronous interface — audio (class 0x01) or
+    /// video (0x0e) — so it is one of the few that reserves bandwidth while
+    /// it streams.
+    ///
+    /// A capability, not a measurement: the actual reservation lives in the
+    /// endpoint descriptors, which cannot be read without opening the device,
+    /// and opening a stranger's keyboard is the intrusiveness this window
+    /// replaced. Knowing *which* neighbours can compete is the useful half,
+    /// and it costs nothing.
+    pub reserves: bool,
 }
 
-/// Just the generation, for the column: `USB 2.0` rather than
-/// `USB 2.0 (High, 480 Mbit)`.
-fn generation(s: Option<Speed>) -> &'static str {
+/// Link rate as `lsusb --tree` prints it: `480M`, `5000M`. Short on purpose —
+/// it is a column, not a sentence.
+fn rate(s: Option<Speed>) -> &'static str {
     match s {
-        Some(Speed::Low) => "USB 1.0",
-        Some(Speed::Full) => "USB 1.1",
-        Some(Speed::High) => "USB 2.0",
-        Some(Speed::Super) => "USB 3.0",
-        Some(Speed::SuperPlus) => "USB 3.1",
-        _ => "USB ?",
+        Some(Speed::Low) => "1.5M",
+        Some(Speed::Full) => "12M",
+        Some(Speed::High) => "480M",
+        Some(Speed::Super) => "5000M",
+        Some(Speed::SuperPlus) => "10000M",
+        _ => "?",
     }
 }
 
-/// The detailed rate, without repeating the generation already in its own
-/// column: `High, 480 Mbit`.
-fn rate_detail(s: Option<Speed>) -> &'static str {
-    match s {
-        Some(Speed::Low) => "Low, 1.5 Mbit",
-        Some(Speed::Full) => "Full, 12 Mbit",
-        Some(Speed::High) => "High, 480 Mbit",
-        Some(Speed::Super) => "SuperSpeed, 5 Gbit",
-        Some(Speed::SuperPlus) => "SuperSpeed+, 10 Gbit",
-        _ => "unknown rate",
-    }
+/// Whether a device declares an interface that streams isochronously.
+fn reserves_bandwidth(d: &DeviceInfo) -> bool {
+    // 0x01 audio, 0x0e video. Everything else — HID, storage, hubs, wireless
+    // — either reserves a negligible amount or nothing at all.
+    d.interfaces().any(|i| matches!(i.class(), 0x01 | 0x0e))
 }
 
 /// What this sensor needs to work at all.
@@ -353,89 +365,88 @@ fn fast_enough(sensor: Sensor, s: Option<Speed>) -> bool {
 /// machine.
 #[must_use]
 pub fn topology(sensor: Sensor) -> Vec<BusNode> {
+    let Ok(buses) = nusb::list_buses().wait() else {
+        return Vec::new();
+    };
     let Ok(devices) = nusb::list_devices().wait() else {
         return Vec::new();
     };
+    let devices: Vec<DeviceInfo> = devices.collect();
     let wanted = pids(sensor);
-    let mut rows: Vec<Row> = devices
-        .map(|d| {
-            let name = d.product_string().map_or_else(
-                || format!("{:04x}:{:04x}", d.vendor_id(), d.product_id()),
-                str::to_string,
-            );
-            let hub = if d.class() == 0x09 { " (hub)" } else { "" };
-            let is_sensor = d.vendor_id() == VID_MICROSOFT && wanted.contains(&d.product_id());
-            let speed = d.speed();
-            let port = d
-                .port_chain()
-                .last()
-                .map_or_else(|| "?".to_string(), u8::to_string);
-            Row {
-                bus: d.bus_id().to_string(),
-                chain: d.port_chain().to_vec(),
-                generation: generation(speed).to_string(),
-                label: format!("{name}{hub}  ·  port {port}, {}", rate_detail(speed)),
-                is_sensor,
-                sensor_underspeed: is_sensor && !fast_enough(sensor, speed),
-            }
-        })
+
+    let mut buses: Vec<(String, Option<Speed>)> = buses
+        .map(|b| (b.bus_id().to_string(), b.root_hub().speed()))
         .collect();
-    rows.sort_by(|a, b| a.bus.cmp(&b.bus).then_with(|| a.chain.cmp(&b.chain)));
-    render_tree(&rows)
-}
+    buses.sort_by(|a, b| a.0.cmp(&b.0));
 
-/// A device as collected, before it is arranged into a tree.
-struct Row {
-    bus: String,
-    chain: Vec<u8>,
-    generation: String,
-    label: String,
-    is_sensor: bool,
-    sensor_underspeed: bool,
-}
-
-/// Arrange sorted rows into indented lines, one controller heading per bus.
-/// Split out from [`topology`] so the shape can be tested without a USB bus.
-fn render_tree(rows: &[Row]) -> Vec<BusNode> {
     let mut out = Vec::new();
-    let mut bus = None;
-    for row in rows {
-        if bus.as_ref() != Some(&row.bus) {
-            out.push(BusNode {
-                depth: 0,
-                generation: String::new(),
-                label: format!("Bus {}", row.bus),
-                is_sensor: false,
-                sensor_underspeed: false,
-            });
-            bus = Some(row.bus.clone());
-        }
-        out.push(BusNode {
-            // A device plugged into the controller has a one-element chain and
-            // sits at depth 1; every hub in between adds one.
-            depth: row.chain.len().max(1),
-            generation: row.generation.clone(),
-            label: row.label.clone(),
-            is_sensor: row.is_sensor,
-            sensor_underspeed: row.sensor_underspeed,
-        });
+    for (bus_id, bus_speed) in buses {
+        let mut rows: Vec<Row> = devices
+            .iter()
+            .filter(|d| d.bus_id() == bus_id)
+            .map(|d| {
+                let speed = d.speed();
+                let is_sensor = d.vendor_id() == VID_MICROSOFT && wanted.contains(&d.product_id());
+                let name = d.product_string().map_or_else(
+                    || format!("{:04x}:{:04x}", d.vendor_id(), d.product_id()),
+                    str::to_string,
+                );
+                let hub = if d.class() == 0x09 { " (hub)" } else { "" };
+                let port = d
+                    .port_chain()
+                    .last()
+                    .map_or_else(|| "?".to_string(), u8::to_string);
+                Row {
+                    chain: d.port_chain().to_vec(),
+                    rate: rate(speed).to_string(),
+                    label: format!("port {port}  {name}{hub}"),
+                    is_sensor,
+                    sensor_underspeed: is_sensor && !fast_enough(sensor, speed),
+                    reserves: !is_sensor && reserves_bandwidth(d),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.chain.cmp(&b.chain));
+        out.extend(bus_block(&bus_id, bus_speed, rows));
     }
     out
 }
 
-/// How many buses and devices the tree holds.
-///
-/// **Buses, not controllers**, and the distinction is not pedantry. One xHCI
-/// controller presents two root hubs — a USB 2.0 one and a SuperSpeed one —
-/// because the two run on separate wire pairs with separate schedules. This
-/// dev machine shows four buses from two PCI controllers. Calling a bus a
-/// controller would inflate the count and, worse, would tell someone their
-/// board has controllers to spare when it has one.
-///
-/// The bus is nevertheless the right unit for the question this window
-/// answers: reserved isochronous bandwidth is budgeted per bus, so a USB 2.0
-/// webcam genuinely does not eat a SuperSpeed Kinect's reservation even when
-/// both are in the same physical socket.
+/// A device as collected, before it joins its bus.
+struct Row {
+    chain: Vec<u8>,
+    rate: String,
+    label: String,
+    is_sensor: bool,
+    sensor_underspeed: bool,
+    reserves: bool,
+}
+
+/// One bus heading followed by its devices. Split out from [`topology`] so the
+/// shape can be tested without a USB bus.
+fn bus_block(bus_id: &str, bus_speed: Option<Speed>, rows: Vec<Row>) -> Vec<BusNode> {
+    // An empty bus is kept on purpose: a free SuperSpeed socket is exactly
+    // what someone whose sensor sits on a 480M bus needs to be told about.
+    let mut out = vec![BusNode {
+        depth: 0,
+        rate: rate(bus_speed).to_string(),
+        label: format!("Bus {bus_id}"),
+        is_sensor: false,
+        // A heading is flagged when it is the bus starving the sensor.
+        sensor_underspeed: rows.iter().any(|r| r.sensor_underspeed),
+        reserves: false,
+    }];
+    out.extend(rows.into_iter().map(|row| BusNode {
+        depth: row.chain.len().max(1),
+        rate: row.rate,
+        label: row.label,
+        is_sensor: row.is_sensor,
+        sensor_underspeed: row.sensor_underspeed,
+        reserves: row.reserves,
+    }));
+    out
+}
+
 #[must_use]
 pub fn counts(tree: &[BusNode]) -> (usize, usize) {
     let buses = tree.iter().filter(|n| n.depth == 0).count();
@@ -444,109 +455,145 @@ pub fn counts(tree: &[BusNode]) -> (usize, usize) {
 
 #[cfg(test)]
 mod topology_tests {
-    use super::{Row, Sensor, fast_enough, generation, render_tree};
+    use super::{BusNode, Row, Sensor, bus_block, fast_enough, rate};
     use nusb::Speed;
 
-    fn row(bus: &str, chain: &[u8], name: &str, speed: Option<Speed>, sensor: bool) -> Row {
+    fn row(chain: &[u8], name: &str, speed: Option<Speed>, sensor: bool, reserves: bool) -> Row {
         Row {
-            bus: bus.into(),
             chain: chain.to_vec(),
-            generation: generation(speed).into(),
+            rate: rate(speed).into(),
             label: name.into(),
             is_sensor: sensor,
             sensor_underspeed: sensor && !fast_enough(Sensor::KinectV2, speed),
+            reserves: reserves && !sensor,
         }
     }
 
-    /// Depth has to follow the port chain, because that is the whole point of
-    /// the window: someone who cannot see that two devices hang off the same
-    /// controller cannot act on being told they do.
-    #[test]
-    fn devices_nest_under_their_controller_and_their_hub() {
-        let rows = vec![
-            row("usb1", &[1], "Kinect v2", Some(Speed::Super), true),
-            row("usb1", &[3], "Hub (hub)", Some(Speed::High), false),
-            row("usb1", &[3, 2], "Keyboard", Some(Speed::Full), false),
-            row("usb2", &[1], "Webcam", Some(Speed::High), false),
-        ];
-        let tree = render_tree(&rows);
-        let shape: Vec<(usize, bool)> = tree.iter().map(|n| (n.depth, n.is_sensor)).collect();
-        assert_eq!(
-            shape,
-            [
-                (0, false), // Controller usb1
-                (1, true),  // Kinect, straight into it
-                (1, false), // the hub
-                (2, false), // behind the hub
-                (0, false), // Controller usb2
-                (1, false), // the webcam
-            ]
-        );
-        assert!(tree[0].label.starts_with("Bus usb1"));
-        assert!(tree[4].label.starts_with("Bus usb2"));
+    fn tree(bus: &str, speed: Option<Speed>, rows: Vec<Row>) -> Vec<BusNode> {
+        bus_block(bus, speed, rows)
     }
 
-    /// Two cameras on one controller is the only combination worth acting on,
-    /// so the tree must make them visibly siblings.
+    /// The heading carries the bus's own rate, not a device's. That is the
+    /// number `lsusb --tree` prints beside a root hub, and the one that says
+    /// whether a SuperSpeed sensor is on the wrong bus.
     #[test]
-    fn two_cameras_on_one_controller_read_as_siblings() {
-        let rows = vec![
-            row("usb1", &[1], "Kinect v2", Some(Speed::Super), true),
-            row("usb1", &[2], "Webcam", Some(Speed::High), false),
-        ];
-        let tree = render_tree(&rows);
-        assert_eq!(tree.len(), 3, "one heading, two devices");
-        assert_eq!(tree[1].depth, tree[2].depth, "siblings share a depth");
-        assert_eq!(tree[0].depth, 0);
+    fn a_bus_heading_carries_the_buss_own_rate() {
+        let t = tree(
+            "usb1",
+            Some(Speed::High),
+            vec![row(&[5], "Keyboard", Some(Speed::Full), false, false)],
+        );
+        assert_eq!(t[0].label, "Bus usb1");
+        assert_eq!(t[0].rate, "480M", "the bus, not the 12M keyboard on it");
+        assert_eq!(t[0].depth, 0);
+        assert_eq!(t[1].rate, "12M");
+        assert_eq!(t[1].depth, 1);
     }
 
-    /// The reason someone opens this window: a v2 on a USB 2 port. The
-    /// generation must be readable on its own, and the sensor flagged —
-    /// buried in prose at the end of a line it is exactly what gets missed.
+    /// An empty bus stays in the list: a free SuperSpeed socket is precisely
+    /// what someone whose sensor sits on a 480M bus needs to see.
     #[test]
-    fn a_v2_on_a_usb2_port_says_so_in_its_own_column() {
-        let tree = render_tree(&[row("usb1", &[1], "Kinect v2", Some(Speed::High), true)]);
-        let kinect = &tree[1];
-        assert_eq!(kinect.generation, "USB 2.0");
-        assert!(
-            kinect.sensor_underspeed,
-            "a v2 below SuperSpeed has to be flagged"
-        );
+    fn an_empty_bus_is_still_worth_showing() {
+        let t = tree("usb2", Some(Speed::Super), Vec::new());
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].rate, "5000M");
+        assert_eq!(super::counts(&t), (1, 0));
+    }
 
-        let ok = render_tree(&[row("usb1", &[1], "Kinect v2", Some(Speed::Super), true)]);
-        assert_eq!(ok[1].generation, "USB 3.0");
+    /// A v2 on a 480M bus is the reason this window exists, and both the
+    /// device and the bus that starves it have to say so.
+    #[test]
+    fn an_underspeed_sensor_flags_itself_and_its_bus() {
+        let t = tree(
+            "usb1",
+            Some(Speed::High),
+            vec![row(&[1], "Kinect v2", Some(Speed::High), true, false)],
+        );
+        assert!(t[1].sensor_underspeed, "the device");
+        assert!(t[0].sensor_underspeed, "and the bus carrying it");
+
+        let ok = tree(
+            "usb2",
+            Some(Speed::Super),
+            vec![row(&[1], "Kinect v2", Some(Speed::Super), true, false)],
+        );
         assert!(!ok[1].sensor_underspeed);
+        assert!(!ok[0].sensor_underspeed);
     }
 
-    /// The count has to separate headings from devices, since a heading is
-    /// not something anyone plugged in.
+    /// Only devices that stream isochronously are marked as reserving. A
+    /// keyboard beside the sensor is a non-event, and saying otherwise is the
+    /// false alarm this window replaced.
     #[test]
-    fn counting_tells_controllers_from_devices() {
-        let tree = super::render_tree(&[
-            row("usb1", &[1], "Kinect v2", Some(Speed::Super), true),
-            row("usb1", &[2], "Keyboard", Some(Speed::Full), false),
-            row("usb2", &[1], "Webcam", Some(Speed::High), false),
-        ]);
-        assert_eq!(super::counts(&tree), (2, 3));
-
-        // The case that caused the head-scratching: one controller, several
-        // devices, and nothing wrong.
-        let one = super::render_tree(&[
-            row("usb1", &[1], "Kinect v2", Some(Speed::Super), true),
-            row("usb1", &[2], "Keyboard", Some(Speed::Full), false),
-        ]);
-        assert_eq!(super::counts(&one), (1, 2));
-
-        assert_eq!(super::counts(&[]), (0, 0), "an empty bus counts as nothing");
+    fn only_isochronous_neighbours_are_marked() {
+        let t = tree(
+            "usb1",
+            Some(Speed::Super),
+            vec![
+                row(&[1], "Kinect v2", Some(Speed::Super), true, false),
+                row(&[2], "Keyboard", Some(Speed::Full), false, false),
+                row(&[3], "USB DAC", Some(Speed::Full), false, true),
+            ],
+        );
+        let marked: Vec<&str> = t
+            .iter()
+            .filter(|n| n.reserves)
+            .map(|n| n.label.as_str())
+            .collect();
+        assert_eq!(marked, ["USB DAC"]);
+        // The sensor is never marked as its own rival.
+        assert!(!t[1].reserves);
     }
 
-    /// A v1 is happy on High Speed where a v2 is not — the flag has to follow
-    /// the sensor, not a fixed threshold.
+    /// Depth follows the port chain, so a device behind a hub reads as a
+    /// child of the hub rather than of the bus.
+    #[test]
+    fn a_device_behind_a_hub_nests_under_it() {
+        let t = tree(
+            "usb1",
+            Some(Speed::High),
+            vec![
+                row(&[3], "Hub (hub)", Some(Speed::High), false, false),
+                row(&[3, 2], "Keyboard", Some(Speed::Full), false, false),
+            ],
+        );
+        assert_eq!(t[1].depth, 1, "the hub hangs off the bus");
+        assert_eq!(t[2].depth, 2, "and the keyboard off the hub");
+    }
+
+    /// A v1 is happy on High Speed where a v2 is not.
     #[test]
     fn the_speed_a_sensor_needs_depends_on_the_sensor() {
         assert!(fast_enough(Sensor::KinectV1, Some(Speed::High)));
         assert!(!fast_enough(Sensor::KinectV2, Some(Speed::High)));
         assert!(fast_enough(Sensor::KinectV2, Some(Speed::Super)));
         assert!(!fast_enough(Sensor::KinectV1, Some(Speed::Full)));
+    }
+
+    /// The rate column is the short form lsusb uses, because it is a column.
+    #[test]
+    fn rates_read_as_lsusb_prints_them() {
+        assert_eq!(rate(Some(Speed::Full)), "12M");
+        assert_eq!(rate(Some(Speed::High)), "480M");
+        assert_eq!(rate(Some(Speed::Super)), "5000M");
+        assert_eq!(rate(Some(Speed::SuperPlus)), "10000M");
+        assert_eq!(rate(None), "?");
+    }
+
+    /// Headings and devices are counted apart: a heading is not something
+    /// anyone plugged in.
+    #[test]
+    fn counting_tells_buses_from_devices() {
+        let mut t = tree(
+            "usb1",
+            Some(Speed::High),
+            vec![
+                row(&[1], "A", Some(Speed::Full), false, false),
+                row(&[2], "B", Some(Speed::Full), false, false),
+            ],
+        );
+        t.extend(tree("usb2", Some(Speed::Super), Vec::new()));
+        assert_eq!(super::counts(&t), (2, 2));
+        assert_eq!(super::counts(&[]), (0, 0));
     }
 }

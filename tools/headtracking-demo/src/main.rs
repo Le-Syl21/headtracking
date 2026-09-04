@@ -7431,6 +7431,24 @@ impl App {
                     }
                 });
                 ui.add_space(4.0);
+                // Each entry is written in the colour it describes, so the
+                // legend is its own swatch. Fixed rather than built from
+                // what happens to be on screen: a legend that changes shape
+                // between two openings is harder to trust than a long one.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let entry = |ui: &mut egui::Ui, colour: Color32, text: &str| {
+                        ui.label(RichText::new(text).monospace().color(colour));
+                    };
+                    entry(ui, COLOR_OK, "this sensor");
+                    ui.label(RichText::new("·").color(Color32::DARK_GRAY));
+                    entry(ui, COLOR_BAD, "too slow for it");
+                    ui.label(RichText::new("·").color(Color32::DARK_GRAY));
+                    entry(ui, COLOR_RESERVES, "reserves bandwidth (audio/video)");
+                    ui.label(RichText::new("·").color(Color32::DARK_GRAY));
+                    entry(ui, Color32::GRAY, "everything else");
+                });
+                ui.add_space(4.0);
                 egui::ScrollArea::both().max_height(320.0).show(ui, |ui| {
                     if tree.is_empty() && !scanning {
                         ui.label(
@@ -7438,27 +7456,47 @@ impl App {
                                 .color(Color32::GRAY),
                         );
                     }
+                    // One column for the rate, so a glance down the list
+                    // compares like with like. Width from the longest line
+                    // actually present rather than a guessed constant.
+                    let width = tree
+                        .iter()
+                        .map(|n| n.label.chars().count() + if n.depth == 0 { 0 } else { 2 + 4 })
+                        .max()
+                        .unwrap_or(0);
                     for node in &tree {
-                        if node.depth == 0 {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(&node.label).monospace().strong());
-                            continue;
-                        }
-                        // Generation first and padded, so the column reads
-                        // straight down: someone here because the Kinect lags
-                        // is looking for one word. Two spaces per level for
-                        // the nesting, rather than box glyphs the embedded
-                        // font subsets do not all carry.
-                        let indent = "  ".repeat(node.depth);
-                        let line = format!("{indent}{:<8} {}", node.generation, node.label);
-                        let text = RichText::new(line).monospace();
-                        let text = if node.sensor_underspeed {
-                            // The one line worth shouting about.
-                            text.color(COLOR_BAD).strong()
-                        } else if node.is_sensor {
-                            text.color(COLOR_OK).strong()
+                        let (prefix, colour) = if node.depth == 0 {
+                            (
+                                String::new(),
+                                if node.sensor_underspeed {
+                                    COLOR_BAD
+                                } else {
+                                    Color32::LIGHT_GRAY
+                                },
+                            )
                         } else {
-                            text.color(Color32::GRAY)
+                            // The arrow carries the nesting; a hub adds a
+                            // level of indent under it.
+                            let indent = "  ".repeat(node.depth);
+                            let colour = if node.sensor_underspeed {
+                                COLOR_BAD
+                            } else if node.is_sensor {
+                                COLOR_OK
+                            } else if node.reserves {
+                                COLOR_RESERVES
+                            } else {
+                                Color32::GRAY
+                            };
+                            (format!("{indent}|-> "), colour)
+                        };
+                        let left = format!("{prefix}{}", node.label);
+                        let pad = width.saturating_sub(left.chars().count());
+                        let line = format!("{left}{:pad$}  [{}]", "", node.rate);
+                        let text = RichText::new(line).monospace().color(colour);
+                        let text = if node.depth == 0 || node.is_sensor {
+                            text.strong()
+                        } else {
+                            text
                         };
                         ui.label(text);
                     }
@@ -8856,6 +8894,10 @@ enum LocalCopy {
 /// from the yellow call-outs, sitting under a green success counter.
 const COLOR_OK: Color32 = Color32::from_rgb(0x66, 0xff, 0x99);
 const COLOR_BAD: Color32 = Color32::from_rgb(0xff, 0x5c, 0x5c);
+/// A device that streams isochronously — audio or video — and so reserves bus
+/// bandwidth while it runs. Amber rather than red: it is a capability, not a
+/// fault, and on a cabinet it is usually the sound card minding its business.
+const COLOR_RESERVES: Color32 = Color32::from_rgb(0xd2, 0x9a, 0x22);
 
 /// One USB reading, produced entirely on a worker thread.
 ///
