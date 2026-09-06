@@ -102,6 +102,15 @@ pub trait HeadTracker: Send {
         None
     }
 
+    /// Which stream `poll_calibration_frame` hands over.
+    ///
+    /// The anchor detector carries one model per stream. A backend that gets
+    /// this wrong feeds a model the distribution it was not trained on, which
+    /// is the failure the split exists to prevent.
+    fn calibration_stream(&self) -> anchor::Stream {
+        anchor::Stream::Colour
+    }
+
     /// Release device handles. Must be safe to call multiple times.
     fn shutdown(&mut self);
 }

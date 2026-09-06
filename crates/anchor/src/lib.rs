@@ -22,11 +22,34 @@
 
 use image::imageops::FilterType;
 use image::{ImageBuffer, Rgb, Rgba};
+pub mod ir;
+pub use ir::{IrSensor, prepare_ir, prepare_ir_rgb888};
+
 use ort::session::Session;
 use ort::value::Tensor;
 
-const MODEL_BYTES: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/models/anchor.onnx"));
+/// Which image the detector is looking at.
+///
+/// Infrared and colour do not look alike and are not prepared alike: the IR
+/// corpus is square-rooted and contrast-equalised before training, colour is
+/// used as it comes. One model straddling both would serve neither, so there
+/// is one per stream and the caller says which it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// A Kinect's infrared image, filtered as `poll_calibration_frame` filters it.
+    Infrared,
+    /// A colour frame, from a webcam or a Kinect's colour camera.
+    Colour,
+}
+
+const MODEL_IR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/models/anchor-ir.onnx"
+));
+const MODEL_RGB: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/models/anchor-rgb.onnx"
+));
 
 pub const MODEL_SIDE: usize = 1280;
 const NUM_ANCHORS: usize = 33_600;
@@ -228,7 +251,8 @@ impl AnchorDetector {
     ///
     /// # Errors
     /// Fails if ONNX Runtime cannot build a session from the embedded model.
-    pub fn new() -> Result<Self, Error> {
+    /// Load the detector for `stream`.
+    pub fn new(stream: Stream) -> Result<Self, Error> {
         // Capped pool + no spinning, same rationale as the blazepose sessions:
         // ort's defaults are a per-session pool sized to all cores that
         // busy-spins between runs — hostile to a VPX plugin sharing the CPU
@@ -245,7 +269,10 @@ impl AnchorDetector {
             .unwrap_or_else(|e| e.recover())
             .with_inter_op_spinning(false)
             .unwrap_or_else(|e| e.recover())
-            .commit_from_memory(MODEL_BYTES)?;
+            .commit_from_memory(match stream {
+                Stream::Infrared => MODEL_IR,
+                Stream::Colour => MODEL_RGB,
+            })?;
         Ok(Self {
             model,
             score_threshold: DEFAULT_SCORE_THRESHOLD,

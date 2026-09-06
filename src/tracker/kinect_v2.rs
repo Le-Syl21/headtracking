@@ -211,6 +211,10 @@ impl HeadTracker for KinectV2Backend {
         ))
     }
 
+    fn calibration_stream(&self) -> anchor::Stream {
+        anchor::Stream::Infrared
+    }
+
     fn calibration_intrinsics(&self) -> Option<[f32; 4]> {
         let c = &self.ir_intr;
         Some([c.fx, c.fy, c.cx, c.cy])

@@ -6,7 +6,14 @@ fn main() {
     let img = image::open(&path).expect("open image").to_rgb8();
     let (w, h) = img.dimensions();
 
-    let mut det = anchor::AnchorDetector::new().expect("load model");
+    let mut det = anchor::AnchorDetector::new(
+        // second argument: "rgb" selects the colour model, infrared otherwise
+        match std::env::args().nth(2).as_deref() {
+            Some("rgb") => anchor::Stream::Colour,
+            _ => anchor::Stream::Infrared,
+        },
+    )
+    .expect("load model");
     let Some(d) = det.detect(img.as_raw(), w, h, anchor::PixelLayout::Rgb888) else {
         println!("no detection");
         return;

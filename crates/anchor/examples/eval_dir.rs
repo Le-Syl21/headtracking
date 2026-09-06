@@ -12,7 +12,14 @@ use std::collections::BTreeMap;
 
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: eval_dir <dir>");
-    let mut det = anchor::AnchorDetector::new().expect("load model");
+    let mut det = anchor::AnchorDetector::new(
+        // second argument: "rgb" selects the colour model, infrared otherwise
+        match std::env::args().nth(2).as_deref() {
+            Some("rgb") => anchor::Stream::Colour,
+            _ => anchor::Stream::Infrared,
+        },
+    )
+    .expect("load model");
 
     // (detections, total, score sum) per backend prefix.
     let mut per_backend: BTreeMap<String, (u32, u32, f32)> = BTreeMap::new();

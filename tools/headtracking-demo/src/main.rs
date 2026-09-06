@@ -2462,6 +2462,8 @@ struct App {
     /// The USB window, opened from the toolbar badge. A plain window, never a
     /// modal: someone reading their bus tree usually wants to unplug something
     /// and watch the list change, which a modal makes impossible.
+    /// Unit the point-of-view figures are shown in. Presentation only.
+    pov_unit: PovUnit,
     usb_window_open: bool,
     /// What the freshly opened device can deliver, shown once. `None` when
     /// there is nothing to say or the user has dismissed it.
@@ -2696,6 +2698,9 @@ impl App {
 
 struct Active {
     backend: Backend,
+    /// Width of the last displayed frame, so the read-out can say which focal
+    /// the distance was worked out with.
+    last_frame_w: u32,
     intrinsics: Intrinsics,
     rgb_texture: Option<TextureHandle>,
     /// Dedicated capture thread that owns the device + models + 1€ filter and
@@ -2774,6 +2779,7 @@ impl Active {
     fn new_live(worker: CaptureWorker, intrinsics: Intrinsics) -> Self {
         let backend = worker.backend;
         Self {
+            last_frame_w: 0,
             backend,
             intrinsics,
             rgb_texture: None,
@@ -2963,6 +2969,8 @@ impl Capture {
     fn poll_once(&mut self, bypass: bool, compute_head: bool) -> bool {
         let depth_min = if bypass { 4 } else { 16 };
         let mut got_rgb = false;
+        // Same for infrared: the anchor submits whichever stream is on screen.
+        let mut got_ir = false;
         match &mut self.inner {
             Inner::KinectV2 { device, .. } => {
                 // Unlike the v1, both streams flow at once here, so selecting IR
@@ -3051,6 +3059,7 @@ impl Capture {
                         }
                     }
                     self.last_ir = Some(Arc::new((ir.width, ir.height, mm)));
+                    got_ir = true;
                 }
                 if device.poll_depth_into(&mut self.v2_depth) {
                     let depth = &self.v2_depth;
@@ -3078,7 +3087,6 @@ impl Capture {
                     // the IR path exists to gain.
                     self.bigdepth_ok = false;
                     self.head_window_ok = false;
-                    let want_view = self.selected_stream == StreamKind::Depth;
                     if !track_on_ir && let Some(reg) = self.registration.as_mut() {
                         let t0 = Instant::now();
                         let mut ok = true;
@@ -3091,11 +3099,6 @@ impl Capture {
                                 &mut self.head_window,
                             );
                             ok = self.head_window_ok;
-                        }
-                        if want_view {
-                            self.bigdepth_ok =
-                                reg.bigdepth(&self.rgb_scratch, &depth.data, &mut self.bigdepth);
-                            ok = ok && self.bigdepth_ok;
                         }
                         self.reg_ms = t0.elapsed().as_secs_f32() * 1000.0;
                         // The windowed projection is meant to be *identical*
@@ -3124,16 +3127,29 @@ impl Capture {
                             );
                         }
                     }
-                    // Rebuild the colour-space depth view only while it's the
-                    // stream on screen: it's a 2 M pixel conversion per frame.
-                    self.depth_color = (self.bigdepth_ok
-                        && self.selected_stream == StreamKind::Depth)
-                        .then(|| Arc::new((1920, 1080, bigdepth_to_mm_u16(&self.bigdepth))));
+                    // Nothing displays the colour-space depth any more: the
+                    // view it existed for is gone, and it cost a 2 M pixel
+                    // conversion per frame. The depth the plugin uses is the
+                    // sensor's own grid, which needs no projection.
+                    self.depth_color = None;
                     if compute_head {
                         let head = self
                             .last_pose
                             .as_ref()
                             .and_then(|p| {
+                                // On the colour stream a Kinect is treated as a
+                                // plain webcam would treat itself: nominal focal
+                                // from the frame width, distance triangulated
+                                // from shoulder width, depth sensor untouched.
+                                // That is not a fallback -- it is the point. The
+                                // same board, same scene, same instant then
+                                // yields both the webcam estimate and the
+                                // sensor's own measurement, so the contribution
+                                // screenshots say directly how far the
+                                // no-depth method is off.
+                                if !track_on_ir && self.selected_stream == StreamKind::Rgb {
+                                    return head_pixel_from_pose_webcam(p, 1920, 1080);
+                                }
                                 if track_on_ir {
                                     // Tracking on IR: the pose already lives in
                                     // the depth camera's own grid (IR and depth
@@ -3226,6 +3242,7 @@ impl Capture {
                             ir.height,
                             ir.data.iter().map(|&v| u16::from(v)).collect(),
                         )));
+                        got_ir = true;
                         self.last_rgb_frame =
                             Some((ir.width, ir.height, rgb888, FrameLayout::Rgb888));
                     }
@@ -3256,6 +3273,12 @@ impl Capture {
                         // full-frame u16→f32 widen copied 1.2 MB per frame to
                         // feed a 17×17 window.
                         let head = self.last_pose.as_ref().and_then(|p| {
+                            // Same deal as the v2: on the colour stream this
+                            // Kinect estimates distance the way a webcam has to,
+                            // so the two methods can be compared on one board.
+                            if self.selected_stream == StreamKind::Rgb {
+                                return head_pixel_from_pose_webcam(p, 640, 480);
+                            }
                             head_pixel_from_pose_depth(
                                 p,
                                 (640, 480),
@@ -3319,14 +3342,42 @@ impl Capture {
                 }
             }
         }
-        // Anchor model (RGB): submit the freshest frame until it locks (the
-        // worker throttles internally); snapshot the result every call.
-        let anchor_frame = self.last_rgb_frame.clone(); // cheap Arc bump
-        if let Some((w, h, buf, layout)) = anchor_frame {
-            if got_rgb && !self.anchor_worker.is_locked() {
+        // Anchor model: submit the stream that is on screen, prepared the way
+        // that stream's model was trained. Infrared goes through the same
+        // square-root and contrast equalisation the corpus was rendered with --
+        // feeding it the raw rescale would hand the model a distribution it
+        // never saw, which is the whole reason there are two models.
+        let anchor_frame = if self.selected_stream == StreamKind::Ir {
+            self.last_ir.as_ref().map(|ir| {
+                let (w, h, raw) = &**ir;
+                let sensor = match self.backend {
+                    Backend::KinectV1 => anchor::IrSensor::KinectV1,
+                    _ => anchor::IrSensor::KinectV2,
+                };
+                (
+                    *w,
+                    *h,
+                    Arc::new(anchor::prepare_ir_rgb888(raw, *w, *h, sensor)),
+                    FrameLayout::Rgb888,
+                    anchor::Stream::Infrared,
+                )
+            })
+        } else {
+            self.last_rgb_frame
+                .clone()
+                .map(|(w, h, buf, layout)| (w, h, buf, layout, anchor::Stream::Colour))
+        };
+        if let Some((w, h, buf, layout, stream)) = anchor_frame {
+            let fresh = if stream == anchor::Stream::Infrared {
+                got_ir
+            } else {
+                got_rgb
+            };
+            if fresh && !self.anchor_worker.is_locked() {
                 // Arc bump — the warmup window used to full-frame-copy here,
                 // right when the 1280² inference is already at its priciest.
-                self.anchor_worker.submit(Arc::clone(&buf), w, h, layout);
+                self.anchor_worker
+                    .submit(Arc::clone(&buf), w, h, layout, stream);
             }
             let a_out = self.anchor_worker.snapshot();
             if let Some(g) = a_out.geom {
@@ -3390,7 +3441,6 @@ impl Capture {
 enum StreamKind {
     Rgb,
     Ir,
-    Depth,
     /// Kinect v1 only: the 1280×1024 video mode. Nothing is disabled for it --
     /// tracking simply runs at the 10 fps the sensor gives in this mode.
     RgbHigh,
@@ -3401,7 +3451,6 @@ impl StreamKind {
         match self {
             StreamKind::Rgb => "RGB",
             StreamKind::Ir => "IR",
-            StreamKind::Depth => "Depth",
             StreamKind::RgbHigh => "RGB hi-res",
         }
     }
@@ -3522,13 +3571,11 @@ fn stream_specs(backend: Backend, cam: Option<(u32, u32, u32)>) -> Vec<StreamSpe
         Backend::KinectV2 => vec![
             s(StreamKind::Rgb, 1920, 1080, 30),
             s(StreamKind::Ir, 512, 424, 30),
-            s(StreamKind::Depth, 512, 424, 30),
         ],
         Backend::KinectV1 => vec![
             s(StreamKind::Rgb, 640, 480, 30),
             s(StreamKind::RgbHigh, 1280, 1024, 10),
             s(StreamKind::Ir, 640, 480, 30),
-            s(StreamKind::Depth, 640, 480, 30),
         ],
         Backend::Webcam(_) => {
             let (w, h, fps) = cam.unwrap_or((640, 480, 30));
@@ -4014,7 +4061,7 @@ fn capture_thread_loop(
                             // Depth streams on its own endpoint, so viewing it
                             // leaves the colour stream running.
                             StreamKind::RgbHigh => freenect::VideoStream::RgbHigh,
-                            StreamKind::Rgb | StreamKind::Depth => freenect::VideoStream::Rgb,
+                            StreamKind::Rgb => freenect::VideoStream::Rgb,
                         };
                         if device.video_stream() != want {
                             match device.set_video_stream(want) {
@@ -4127,6 +4174,9 @@ struct HeadJob {
     w: u32,
     h: u32,
     layout: FrameLayout,
+    /// Infrared or colour. The detector carries one model per stream, so the
+    /// submitter has to say which image this is.
+    stream: anchor::Stream,
 }
 
 /// Byte layout of a published frame. Mirrors `blazepose::PixelLayout` and
@@ -4231,6 +4281,10 @@ impl BlazePoseWorker {
             w,
             h,
             layout,
+            // Meaningless here: the pose model is the same one whatever the
+            // image is. The field exists for the anchor worker, which shares
+            // this job type and does carry one model per stream.
+            stream: anchor::Stream::Colour,
         });
         self.job.1.notify_one();
     }
@@ -4288,6 +4342,7 @@ fn blazepose_worker_loop(
             w,
             h,
             layout,
+            stream: _,
         }) = job_item
         else {
             continue;
@@ -4375,12 +4430,20 @@ impl AnchorWorker {
         self.job.1.notify_one();
     }
 
-    fn submit(&self, pixels: Arc<Vec<u8>>, w: u32, h: u32, layout: FrameLayout) {
+    fn submit(
+        &self,
+        pixels: Arc<Vec<u8>>,
+        w: u32,
+        h: u32,
+        layout: FrameLayout,
+        stream: anchor::Stream,
+    ) {
         *self.job.0.lock() = Some(HeadJob {
             pixels,
             w,
             h,
             layout,
+            stream,
         });
         self.job.1.notify_one();
     }
@@ -4407,13 +4470,10 @@ fn anchor_worker_loop(
     locked: &Arc<AtomicBool>,
     reset: &Arc<AtomicBool>,
 ) {
-    let mut det = match anchor::AnchorDetector::new() {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("anchor init failed: {e}");
-            return;
-        }
-    };
+    // One detector per stream, built on first use. The demo can switch source
+    // while running, and loading both up front would cost a second ONNX session
+    // for a model that may never be asked for.
+    let mut dets: [Option<anchor::AnchorDetector>; 2] = [None, None];
     // Throttle inference; the cabinet is fixed so a low rate is plenty.
     const INTERVAL: Duration = Duration::from_millis(400);
     // Keep the best-scoring detection for this long after the first hit, then
@@ -4458,11 +4518,28 @@ fn anchor_worker_loop(
             w,
             h,
             layout,
+            stream,
         }) = job_item
         else {
             continue;
         };
         last_run = Instant::now();
+        // Load the model for this stream the first time it is asked for. The
+        // demo can switch source while running; loading both up front would
+        // cost a second ONNX session for a model that may never be used.
+        let idx = usize::from(stream == anchor::Stream::Colour);
+        if dets[idx].is_none() {
+            match anchor::AnchorDetector::new(stream) {
+                Ok(d) => dets[idx] = Some(d),
+                Err(e) => {
+                    warn!(?stream, "anchor init failed: {e}");
+                    continue;
+                }
+            }
+        }
+        let Some(det) = dets[idx].as_mut() else {
+            continue;
+        };
         // Start the warmup clock on the first INFERENCE RUN, not the first
         // detection. The 1280² model on CPU costs ~180 ms; the proof model
         // detects only sporadically on a real scene, so gating the clock (and
@@ -4815,30 +4892,6 @@ fn head_pixel_from_window(
         x_mm: (f64::from(hx - color.cx) * zf / f64::from(color.fx)) as f32,
         y_mm: (f64::from(hy - color.cy) * zf / f64::from(color.fy)) as f32,
     })
-}
-
-/// Crop `bigdepth` to the 1920×1080 colour window and round to `u16`
-/// millimetres, mapping libfreenect2's `+inf` "no reading" to `0` — the same
-/// sentinel [`depth_to_turbo_rgb888`] already renders as near-black, so the
-/// colour-space depth view reuses the existing colormap unchanged.
-fn bigdepth_to_mm_u16(bigdepth: &[f32]) -> Vec<u16> {
-    let mut out = vec![0u16; BIGDEPTH_W * BIGDEPTH_H];
-    if bigdepth.len() < (BIGDEPTH_H + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W {
-        return out;
-    }
-    for y in 0..BIGDEPTH_H {
-        let src = (y + BIGDEPTH_ROW_OFFSET) * BIGDEPTH_W;
-        let dst = y * BIGDEPTH_W;
-        for x in 0..BIGDEPTH_W {
-            let z = bigdepth[src + x];
-            out[dst + x] = if z.is_finite() && z > 0.0 {
-                z.min(f32::from(u16::MAX)) as u16
-            } else {
-                0
-            };
-        }
-    }
-    out
 }
 
 /// Generic over the depth sample type so the v1's native `u16` grid is
@@ -5470,6 +5523,7 @@ impl App {
             selected: Backend::None,
             usb_cache: None,
             usb_probe: None,
+            pov_unit: PovUnit::default(),
             usb_window_open: false,
             brief: None,
             available,
@@ -5914,6 +5968,7 @@ impl App {
             }
             upload_texture(egui_ctx, &mut active.rgb_texture, img);
             active.metrics.note_output_frame();
+            active.last_frame_w = frame.w;
             active.last_rgb_at = frame.last_rgb_at;
             active.last_ir_at = frame.last_ir_at;
             active.last_depth_at = frame.last_depth_at;
@@ -6714,33 +6769,122 @@ impl App {
                                 let (vx, vy, vz) =
                                     pose_delta_to_view_delta_vpu(dx_mm, dy_mm, dz_mm);
                                 cols[1].label(
-                                    RichText::new(format!(
-                                        "baseline (mm)  ({:>6.0}, {:>6.0}, {:>6.0})\n\
-                                         current  (mm)  ({:>6.0}, {:>6.0}, {:>6.0})\n\
-                                         Δ pose   (mm)  ({:>+6.0}, {:>+6.0}, {:>+6.0})\n\n\
-                                         Δ view  (VPU)  ({:>+6.2}, {:>+6.2}, {:>+6.2})\n\
-                                                       viewX += {:>+6.2}\n\
-                                                       viewY += {:>+6.2}\n\
-                                                       viewZ += {:>+6.2}",
-                                        base.x_mm,
-                                        base.y_mm,
-                                        base.z_mm,
-                                        head.x_mm,
-                                        head.y_mm,
-                                        head.depth_mm,
-                                        dx_mm,
-                                        dy_mm,
-                                        dz_mm,
-                                        vx,
-                                        vy,
-                                        vz,
-                                        vx,
-                                        vy,
-                                        vz,
-                                    ))
+                                    RichText::new({
+                                        let u = self.pov_unit;
+                                        let d = u.pose_decimals();
+                                        let c = |v: f32| u.from_mm(v);
+                                        format!(
+                                            "baseline ({unit:<4}) ({:>7.d$}, {:>7.d$}, {:>7.d$})\n\
+                                             current  ({unit:<4}) ({:>7.d$}, {:>7.d$}, {:>7.d$})\n\
+                                             Δ pose   ({unit:<4}) ({:>+7.d$}, {:>+7.d$}, {:>+7.d$})",
+                                            c(base.x_mm),
+                                            c(base.y_mm),
+                                            c(base.z_mm),
+                                            c(head.x_mm),
+                                            c(head.y_mm),
+                                            c(head.depth_mm),
+                                            c(dx_mm),
+                                            c(dy_mm),
+                                            c(dz_mm),
+                                            unit = u.label(),
+                                            d = d,
+                                        )
+                                    })
                                     .monospace()
                                     .size(15.0),
                                 );
+                                cols[1].add_space(6.0);
+                                // Which focal the distance was worked out with,
+                                // and where it came from. On the colour stream a
+                                // Kinect is deliberately treated as a webcam, so
+                                // it uses the nominal guess rather than its own
+                                // factory intrinsics -- that is what makes the
+                                // comparison with the infrared reading mean
+                                // something, and it is worth saying out loud
+                                // rather than leaving the reader to wonder which
+                                // number produced the millimetres above.
+                                let on_cam = self.selected_stream != StreamKind::Ir;
+                                let fw = active.last_frame_w.max(1);
+                                let (fx, how) = if on_cam {
+                                    (
+                                        fw as f32 * WEBCAM_FX_PER_WIDTH,
+                                        "assumed from frame width, as a webcam must",
+                                    )
+                                } else {
+                                    (color_focal_px(active.backend, fw), "the sensor's own")
+                                };
+                                cols[1].label(
+                                    RichText::new(format!("focal: {fx:>6.0} px  ({how})"))
+                                        .monospace()
+                                        .size(13.0)
+                                        .color(Color32::GRAY),
+                                );
+                                cols[1].add_space(4.0);
+                                cols[1].horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.label(
+                                        RichText::new("units")
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(Color32::DARK_GRAY),
+                                    );
+                                    for u in PovUnit::ALL {
+                                        if ui
+                                            .selectable_label(
+                                                self.pov_unit == u,
+                                                RichText::new(u.label()).monospace().size(12.0),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.pov_unit = u;
+                                        }
+                                    }
+                                });
+                                // The point of view the plugin would send to
+                                // VPX, one line per axis. Named rather than
+                                // numbered because the mapping is not obvious
+                                // from the letters alone, and coloured so a
+                                // figure that runs away is spotted without
+                                // reading it: this is the readout that says
+                                // whether the tracking is producing something
+                                // sane.
+                                //
+                                // These are in the PLAYER's frame, not the
+                                // camera's -- the mirror between the two is
+                                // absorbed upstream. "left" here is the player's
+                                // left, which is the right of the image on
+                                // screen, so the header says so rather than
+                                // leaving it to be discovered.
+                                cols[1]
+                                    .label(
+                                        RichText::new("point of view — player's frame")
+                                            .monospace()
+                                            .size(13.0)
+                                            .color(Color32::GRAY),
+                                    )
+                                    .on_hover_text(
+                                        "VPU are Visual Pinball's own units, which is what \
+                                         the plugin sends: 50 VPU = 1.0625 inch = 26.99 mm. \
+                                         So a whole VPU is about half a millimetre of head \
+                                         movement -- the figures are small on purpose.",
+                                    );
+                                for (name, sense, v, col) in [
+                                    ("x", "high/low", vx, POV_X),
+                                    ("y", "left/right", vy, POV_Y),
+                                    ("z", "near/far", vz, POV_Z),
+                                ] {
+                                    cols[1].label(
+                                        RichText::new(format!(
+                                            "{name} ({sense}): {:>+8.*} {}",
+                                            self.pov_unit.decimals(),
+                                            self.pov_unit.from_vpu(v),
+                                            self.pov_unit.label(),
+                                        ))
+                                        .monospace()
+                                        .size(15.0)
+                                        .color(col),
+                                    );
+                                }
                             }
                             _ => {
                                 cols[1].label(
@@ -7249,11 +7393,7 @@ impl App {
         let active = &*active;
         // Aged here, at draw time — see [`Active::last_rgb_at`].
         let live = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < STREAM_LIVE_FOR);
-        let (rgb_live, ir_live, depth_live) = (
-            live(active.last_rgb_at),
-            live(active.last_ir_at),
-            live(active.last_depth_at),
-        );
+        let (rgb_live, ir_live) = (live(active.last_rgb_at), live(active.last_ir_at));
         let mut pick: Option<StreamKind> = None;
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -7269,7 +7409,6 @@ impl App {
                     // liveness answers for either.
                     StreamKind::Rgb | StreamKind::RgbHigh => rgb_live,
                     StreamKind::Ir => ir_live,
-                    StreamKind::Depth => depth_live,
                 };
                 let colour = if live {
                     Color32::from_rgb(60, 200, 90)
@@ -7296,7 +7435,18 @@ impl App {
         if let Some(kind) = pick
             && kind != self.selected_stream
         {
+            // Switching between infrared and colour changes which model the
+            // anchor runs and which image it sees, so the detection from the
+            // previous stream means nothing now: start it over rather than
+            // leave a frozen result that came from the other camera.
+            let was_ir = self.selected_stream == StreamKind::Ir;
+            let now_ir = kind == StreamKind::Ir;
             self.selected_stream = kind;
+            if was_ir != now_ir
+                && let Some(active) = self.active.as_ref()
+            {
+                let _ = active.worker.cmd_tx.send(CaptureCmd::Recalibrate);
+            }
             // The v1 has to physically switch its video endpoint; the others
             // just need to know what's on screen.
             if let Some(active) = self.active.as_ref() {
@@ -8723,17 +8873,6 @@ fn stream_color_image(frame: &LatestFrame, want: StreamKind) -> ColorImage {
                 return rgb888_to_color_image(*w, *h, &gray8_to_rgb888(&gray));
             }
         }
-        StreamKind::Depth => {
-            // Prefer the colour-space projection when the v2 registration
-            // produced one: it shares the colour framing, so the pose and
-            // anchor overlays land exactly, with no lens-parallax offset.
-            // v1 / webcam (and any v2 frame before the registration ran) fall
-            // back to the sensor's native depth grid.
-            if let Some(d) = frame.depth_color.as_deref().or(frame.depth.as_deref()) {
-                let (w, h, mm) = d;
-                return rgb888_to_color_image(*w, *h, &depth_to_turbo_rgb888(mm));
-            }
-        }
         // Both colour modes arrive on the same RGB frame; only the size differs.
         StreamKind::Rgb | StreamKind::RgbHigh => {}
     }
@@ -8931,6 +9070,76 @@ const COLOR_BAD: Color32 = Color32::from_rgb(0xff, 0x5c, 0x5c);
 /// bandwidth while it runs. Amber rather than red: it is a capability, not a
 /// fault, and on a cabinet it is usually the sound card minding its business.
 const COLOR_RESERVES: Color32 = Color32::from_rgb(0xd2, 0x9a, 0x22);
+
+/// Unit the point-of-view read-out is shown in.
+///
+/// VPU is what the plugin actually sends, so it is the honest default -- but it
+/// is Visual Pinball's own unit and means nothing to anyone else, and a whole
+/// VPU is about half a millimetre, so the figures look implausibly small until
+/// you know that. Millimetres and inches are the same number rescaled; nothing
+/// about the tracking changes with this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PovUnit {
+    #[default]
+    Mm,
+    Inch,
+    Vpu,
+}
+
+impl PovUnit {
+    const ALL: [Self; 3] = [Self::Mm, Self::Inch, Self::Vpu];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mm => "mm",
+            Self::Inch => "inch",
+            Self::Vpu => "VPU",
+        }
+    }
+
+    /// Convert a value the plugin expresses in VPU into this unit.
+    fn from_vpu(self, vpu: f32) -> f32 {
+        match self {
+            Self::Mm => headtracking::camera::units::vpu_to_mm(vpu),
+            Self::Inch => headtracking::camera::units::vpu_to_mm(vpu) / 25.4,
+            Self::Vpu => vpu,
+        }
+    }
+
+    /// Convert a value measured in millimetres into this unit.
+    fn from_mm(self, mm: f32) -> f32 {
+        match self {
+            Self::Mm => mm,
+            Self::Inch => mm / 25.4,
+            Self::Vpu => headtracking::camera::units::mm_to_vpu(mm),
+        }
+    }
+
+    /// Decimals for a distance rather than a delta: a head sits about a metre
+    /// away, so millimetres need none and inches need one.
+    fn pose_decimals(self) -> usize {
+        match self {
+            Self::Mm => 0,
+            Self::Inch => 1,
+            Self::Vpu => 0,
+        }
+    }
+
+    /// Decimals worth showing: an inch of head movement is a lot, a VPU is not.
+    fn decimals(self) -> usize {
+        match self {
+            Self::Mm => 1,
+            Self::Inch => 3,
+            Self::Vpu => 2,
+        }
+    }
+}
+
+/// One colour per point-of-view axis. Distinct enough to tell apart at a
+/// glance, and legible on both the light and dark themes the demo runs in.
+const POV_X: Color32 = Color32::from_rgb(0xe8, 0x8a, 0x3c);
+const POV_Y: Color32 = Color32::from_rgb(0x5c, 0xc9, 0x6a);
+const POV_Z: Color32 = Color32::from_rgb(0x5a, 0xa9, 0xe6);
 
 /// One USB reading, produced entirely on a worker thread.
 ///
@@ -9761,8 +9970,10 @@ fn run_pose_test(
         }
     }
 
-    // --- Anchor model (RGB): cabinet frame → lateral / sidebars→∞ / width ---
-    let anchor_geo = match anchor::AnchorDetector::new() {
+    // --- Anchor model: cabinet frame → lateral / sidebars→∞ / width ---
+    // Colour model: this path analyses a still image file, which is a colour
+    // capture. An infrared still would need `anchor::prepare_ir` first.
+    let anchor_geo = match anchor::AnchorDetector::new(anchor::Stream::Colour) {
         Ok(mut det) => match det.detect(img.as_raw(), w, h, anchor::PixelLayout::Rgb888) {
             Some(d) => {
                 let geo = d.geometry(w, h);

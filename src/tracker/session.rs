@@ -60,7 +60,7 @@ fn run_anchor_calibration(
     backend: &mut Box<dyn HeadTracker>,
     stop: &AtomicBool,
 ) -> Option<CameraCalibration> {
-    let mut det = match anchor::AnchorDetector::new() {
+    let mut det = match anchor::AnchorDetector::new(backend.calibration_stream()) {
         Ok(d) => d,
         Err(e) => {
             warn!("anchor: detector init failed ({e}); skipping calibration");
