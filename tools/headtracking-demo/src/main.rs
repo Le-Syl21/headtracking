@@ -6772,7 +6772,7 @@ impl App {
                                     RichText::new({
                                         let u = self.pov_unit;
                                         let d = u.pose_decimals();
-                                        let c = |v: f32| u.from_mm(v);
+                                        let c = |v: f32| u.convert_mm(v);
                                         format!(
                                             "baseline ({unit:<4}) ({:>7.d$}, {:>7.d$}, {:>7.d$})\n\
                                              current  ({unit:<4}) ({:>7.d$}, {:>7.d$}, {:>7.d$})\n\
@@ -6877,7 +6877,7 @@ impl App {
                                         RichText::new(format!(
                                             "{name} ({sense}): {:>+8.*} {}",
                                             self.pov_unit.decimals(),
-                                            self.pov_unit.from_vpu(v),
+                                            self.pov_unit.convert_vpu(v),
                                             self.pov_unit.label(),
                                         ))
                                         .monospace()
@@ -9098,7 +9098,7 @@ impl PovUnit {
     }
 
     /// Convert a value the plugin expresses in VPU into this unit.
-    fn from_vpu(self, vpu: f32) -> f32 {
+    fn convert_vpu(self, vpu: f32) -> f32 {
         match self {
             Self::Mm => headtracking::camera::units::vpu_to_mm(vpu),
             Self::Inch => headtracking::camera::units::vpu_to_mm(vpu) / 25.4,
@@ -9107,7 +9107,7 @@ impl PovUnit {
     }
 
     /// Convert a value measured in millimetres into this unit.
-    fn from_mm(self, mm: f32) -> f32 {
+    fn convert_mm(self, mm: f32) -> f32 {
         match self {
             Self::Mm => mm,
             Self::Inch => mm / 25.4,
