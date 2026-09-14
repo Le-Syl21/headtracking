@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download headtracking: VPX head tracking plugin for Linux, Windows and macOS</title>
+<meta name="description" content="Download and install headtracking, the free head tracking plugin for Visual Pinball X 10.8.1: Linux, Windows and macOS archives, VPX plugin folder, F12 settings, Kinect drivers and udev rules.">
+<link rel="canonical" href="https://le-syl21.github.io/headtracking/download.html">
+<link rel="alternate" hreflang="en" href="https://le-syl21.github.io/headtracking/download.html">
+<link rel="alternate" hreflang="fr" href="https://le-syl21.github.io/headtracking/fr/download.html">
+<link rel="alternate" hreflang="x-default" href="https://le-syl21.github.io/headtracking/download.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="headtracking">
+<meta property="og:title" content="Download headtracking: VPX head tracking plugin for Linux, Windows and macOS">
+<meta property="og:description" content="Download and install headtracking, the free head tracking plugin for Visual Pinball X 10.8.1: Linux, Windows and macOS archives, VPX plugin folder, F12 settings, Kinect drivers and udev rules.">
+<meta property="og:url" content="https://le-syl21.github.io/headtracking/download.html">
+<meta property="og:image" content="https://le-syl21.github.io/headtracking/img/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A pincab running Visual Pinball X with head-tracking cameras on the backbox">
+<meta property="og:locale" content="en_GB">
+<meta property="og:locale:alternate" content="fr_FR">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Download headtracking: VPX head tracking plugin for Linux, Windows and macOS">
+<meta name="twitter:description" content="Download and install headtracking, the free head tracking plugin for Visual Pinball X 10.8.1: Linux, Windows and macOS archives, VPX plugin folder, F12 settings, Kinect drivers and udev rules.">
+<meta name="twitter:image" content="https://le-syl21.github.io/headtracking/img/og.jpg">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/svg+xml" href="img/favicon.svg">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@graph": [{"@type": "SoftwareApplication", "@id": "https://le-syl21.github.io/headtracking/#app", "name": "headtracking", "description": "Open-source head tracking plugin for Visual Pinball X, from a webcam or a Kinect v1/v2, self-calibrating from the cabinet's lockbar and side rails.", "applicationCategory": "GameApplication", "operatingSystem": "Linux, Windows, macOS", "softwareRequirements": "Visual Pinball X 10.8.1 or later", "url": "https://le-syl21.github.io/headtracking/", "downloadUrl": "https://github.com/Le-Syl21/headtracking/releases", "image": "https://le-syl21.github.io/headtracking/img/og.jpg", "license": "https://www.gnu.org/licenses/gpl-3.0.html", "codeRepository": "https://github.com/Le-Syl21/headtracking", "isAccessibleForFree": true, "offers": {"@type": "Offer", "price": "0", "priceCurrency": "EUR"}, "softwareVersion": "0.0.40"}, {"@type": "WebPage", "name": "Download headtracking: VPX head tracking plugin for Linux, Windows and macOS", "description": "Download and install headtracking, the free head tracking plugin for Visual Pinball X 10.8.1: Linux, Windows and macOS archives, VPX plugin folder, F12 settings, Kinect drivers and udev rules.", "url": "https://le-syl21.github.io/headtracking/download.html", "inLanguage": "en", "about": {"@id": "https://le-syl21.github.io/headtracking/#app"}}]}</script>
+</head>
+<body>
+<header class="site"><div class="wrap">
+<a class="brand" href="./"><img src="img/favicon.svg" alt="" width="24" height="24"><span>head<b>tracking</b></span></a>
+<nav class="main"><a href="./">Home</a><a href="how-it-works.html">How it works</a><a href="download.html" aria-current="page">Download</a><a href="hardware.html">Cameras</a><a href="contribute.html">Contribute</a><a href="faq.html">FAQ</a></nav>
+<a class="lang" href="fr/download.html" hreflang="fr" lang="fr"><img src="img/fr.svg" alt="" width="21" height="14">Version française</a>
+</div></header>
+<main><div class="wrap">
+<h1>Download and install headtracking</h1>
+<p class="lead">headtracking is published as a <strong>preview</strong> on GitHub. Each release has one archive per
+system, containing the VPX plugin and the demo app. The file names include the version number, so pick the file for
+your system on the releases page.</p>
+<p class="actions"><a class="btn big" href="https://github.com/Le-Syl21/headtracking/releases">Open the releases page</a></p>
+<div class="table"><table class="dl"><thead><tr><th>System</th><th>File name ends with</th></tr></thead><tbody><tr><td><strong>Linux</strong><br><span class="muted">PC with an Intel or AMD 64-bit processor (x86_64)</span></td><td><code>headtracking-…-linux-x86_64.tar.gz</code></td></tr><tr><td><strong>Linux</strong><br><span class="muted">ARM 64-bit processor (aarch64)</span></td><td><code>headtracking-…-linux-aarch64.tar.gz</code></td></tr><tr><td><strong>macOS</strong><br><span class="muted">Apple silicon Mac (M-series chip), macOS 11 or later</span></td><td><code>headtracking-…-macos-aarch64.tar.gz</code></td></tr><tr><td><strong>Windows</strong><br><span class="muted">64-bit Windows PC (x86_64)</span></td><td><code>headtracking-…-windows-x86_64.zip</code></td></tr></tbody></table></div>
+<p>There is currently no build for Intel Macs or Windows on ARM. The Windows files are digitally signed, and the macOS
+programs are signed and notarized by Apple.</p>
+
+<h2>What is in the archive</h2>
+<ul>
+<li>The plugin: <code>headtracking.dll</code> (Windows), <code>libheadtracking.so</code> (Linux) or
+<code>libheadtracking.dylib</code> (macOS), with its <code>plugin.cfg</code>.</li>
+<li><code>headtracking-demo</code>, the <a href="how-it-works.html#demo">demo app</a>: test your camera without VPX,
+and <a href="contribute.html">share a capture</a> of your cabinet.</li>
+<li>On Windows, a <code>setup</code> folder with the Kinect driver installer.</li>
+<li>The licence and the README.</li>
+</ul>
+
+<h2 id="install">Install the plugin in Visual Pinball X</h2>
+<p>You need <a href="https://github.com/vpinball/vpinball">Visual Pinball X</a> 10.8.1 or later.</p>
+<ol class="steps">
+<li>Create a <code>headtracking</code> folder in the <code>plugins</code> folder of your VPX installation, and copy the
+plugin library <strong>and</strong> <code>plugin.cfg</code> into it. Both must be in the same folder.
+<pre><code>&lt;VPX_install&gt;/plugins/headtracking/
+├── plugin.cfg
+├── headtracking.dll          (Windows)
+├── libheadtracking.so        (Linux)
+└── libheadtracking.dylib     (macOS)</code></pre></li>
+<li>Start VPX once: it finds the new plugin by itself.</li>
+<li>Load any table, press <kbd>F12</kbd> → <strong>Plugin Settings</strong> → <strong>Head Tracking</strong> and tick
+<strong>Enable</strong>. Quit and reload the table: tracking starts with the game.</li>
+</ol>
+
+<h2 id="setup">Set up the view</h2>
+<p>The plugin reminds you of these points in a notification when a game starts.</p>
+<ol class="steps">
+<li>In <kbd>F12</kbd> → <strong>Cabinet Settings</strong>, enter your real <strong>lockbar width</strong> and
+<strong>screen inclination</strong>. The automatic calibration and the head position are based on them.</li>
+<li>For the table's point of view, choose the <strong>Window</strong> view layout with <strong>rotation 0</strong>, and
+turn on <strong>cabinet autofit</strong>. Window is the layout designed for head tracking.</li>
+<li>Stand in your normal playing position while the table loads: the first stable head position becomes the neutral
+position. Later, hold the lockbar button for 2 seconds to recenter.</li>
+</ol>
+<div class="note"><p><strong>Measure those two values, do not guess them.</strong> The plugin trusts them
+completely.</p>
+<ul>
+<li>A wrong lockbar width scales every distance by the same error: the effect feels too strong or too weak
+everywhere.</li>
+<li>A missing or wrong screen inclination mixes up/down with closer/farther: the view drifts diagonally when you move,
+and it feels wrong with no obvious cause.</li>
+</ul></div>
+
+<h2 id="settings">Settings</h2>
+<p>Every setting is on the same <kbd>F12</kbd> → Plugin Settings → Head Tracking page and applies live while you play,
+except <strong>Backend</strong> and <strong>Camera</strong>, which are read when the game starts (reload the table after
+changing them).</p>
+<div class="table"><table><thead><tr><th>Setting</th><th>What it does</th></tr></thead><tbody><tr><td><strong>Backend</strong></td><td><em>Auto</em> (the first camera found: Kinect v2, then Kinect v1, then webcam), <em>Kinect v2</em>, <em>Kinect v1</em> or <em>Webcam</em>. Read when the game starts.</td></tr><tr><td><strong>Camera</strong></td><td>Which webcam the Webcam backend uses; the list shows the real device names. A Kinect backend always uses the first Kinect found. Read when the game starts.</td></tr><tr><td><strong>Gain (all axes)</strong></td><td>How much your head movement moves the view, on all three axes. Default 1.0; 0.5 is a good start on a cabinet.</td></tr><tr><td><strong>Gain trim, left/right · up/down · near/far</strong></td><td>Per-direction trims on top of the gain: lower one when that direction moves too much. Near/far is the one most often worth calming.</td></tr><tr><td><strong>Smoothing</strong></td><td><em>Stable</em> (the field-tested default), <em>Normal</em>, <em>Reactive</em>, or <em>Custom</em>, which unlocks two extra sliders: responsiveness and motion catch-up.</td></tr><tr><td><strong>Median Window</strong></td><td>Number of frames used to erase tracking spikes (1 = off, default 3). Each extra frame adds about 17 ms of delay at 60 fps.</td></tr><tr><td><strong>Invert X / Y / Z</strong></td><td>Flip left/right, up/down or closer/farther, for mirrored or unusual camera mountings.</td></tr><tr><td><strong>Webcam Focal (px)</strong></td><td>Webcam focal length in pixels; 0 = automatic. Only needed if the webcam depth feels off.</td></tr><tr><td><strong>Baseline Offset X / Y / Z (mm)</strong></td><td>Trim added to the neutral head position captured at the start of the game, without capturing it again.</td></tr></tbody></table></div>
+<p>They are stored in <code>VPinballX.ini</code>, in the <code>[Plugin.HeadTracking]</code> section. If you edit that
+file by hand, do it with VPX closed: VPX rewrites the whole file when it exits.</p>
+
+<h2 id="linux">Linux</h2>
+<ul>
+<li><strong>Webcam</strong>: your user must be allowed to use the camera. On most distributions it already is (the
+<code>video</code> group); otherwise run <code>sudo usermod -aG video "$USER"</code> and log out and back in.</li>
+<li><strong>Kinect</strong>: without udev rules, only the administrator can open the Kinect, and VPX fails silently.
+If a Kinect is plugged in but missing from its camera list, the demo app offers an <strong>Install udev rule</strong>
+button, which asks for your password. You can also add the rules yourself, then unplug and replug the Kinect:
+<details><summary>udev rules for Kinect v2 and Kinect v1</summary>
+<pre><code>sudo tee /etc/udev/rules.d/90-kinect2.rules &gt; /dev/null &lt;&lt;&#x27;EOF&#x27;
+# Microsoft Kinect v2 (Xbox One)
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02c4&quot;, MODE=&quot;0666&quot;
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02d8&quot;, MODE=&quot;0666&quot;
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02d9&quot;, MODE=&quot;0666&quot;
+EOF
+sudo tee /etc/udev/rules.d/51-kinect.rules &gt; /dev/null &lt;&lt;&#x27;EOF&#x27;
+# Microsoft Kinect v1 (Xbox 360) and Kinect for Windows v1
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02b0&quot;, MODE=&quot;0666&quot;
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02ad&quot;, MODE=&quot;0666&quot;
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02ae&quot;, MODE=&quot;0666&quot;
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02c2&quot;, MODE=&quot;0666&quot;
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02be&quot;, MODE=&quot;0666&quot;
+SUBSYSTEM==&quot;usb&quot;, ATTR{idVendor}==&quot;045e&quot;, ATTR{idProduct}==&quot;02bf&quot;, MODE=&quot;0666&quot;
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger</code></pre></details></li>
+<li>No other library to install: only system libraries present by default on Debian, Ubuntu, Fedora and Arch are
+used.</li>
+</ul>
+
+<h2 id="windows">Windows</h2>
+<div class="note danger"><p><strong>Windows + Kinect: read this before installing the driver.</strong> To reach a
+Kinect, the bundled driver setup <strong>replaces Microsoft's official Kinect driver</strong> with a generic WinUSB
+one. This breaks everything built on the Microsoft Kinect SDK, <strong>including a working BAM head-tracking
+setup</strong>, until you restore the original driver (Device Manager, the &ldquo;Xbox NUI&rdquo; devices: uninstall
+the driver and scan for hardware changes, or reinstall the Kinect SDK/runtime). Only run it if you accept that trade.
+<strong>Webcam users are not affected</strong> and have nothing to install.</p></div>
+<p>Out of the box, Windows installs no usable driver for a Kinect v1 or v2: it shows up as an unknown device. To
+install one:</p>
+<ol class="steps">
+<li>Plug in the Kinect and start <code>headtracking-demo.exe</code>. If no usable driver is found, a yellow banner
+offers <strong>Install Kinect drivers (UAC prompt)</strong>. You can also double-click
+<code>setup\setup-kinect.cmd</code>.</li>
+<li>Accept the administrator prompt. The PowerShell window lists what will change and asks you to type
+<code>yes</code>; anything else cancels without touching the system.</li>
+<li>Wait for the script to finish (about 10 to 30 seconds), click <strong>rescan</strong> in the demo, then restart
+VPX.</li>
+</ol>
+<p>The script is signed in release archives. It works for both Kinect v1 and v2. If you prefer not to run it, you can
+bind WinUSB by hand with <a href="https://zadig.akeo.ie/">Zadig</a>; the steps are in the
+<a href="https://github.com/Le-Syl21/headtracking/blob/main/docs/INSTALL.md">detailed install guide</a>. On Windows 7, install Microsoft Security Advisory 3033929
+first.</p>
+<p>A Kinect v2 also needs a <strong>dedicated USB 3.0 port</strong> on the back of the motherboard, not a hub.</p>
+
+<h2 id="macos">macOS</h2>
+<p>A Kinect needs no extra driver on macOS. For a webcam, allow VPX in <strong>System Settings → Privacy &amp; Security →
+Camera</strong> the first time. The build runs natively on Apple silicon.</p>
+
+<h2 id="source">Build from source</h2>
+<p>You need a recent stable Rust, <code>cmake</code> 3.20 or later and <code>libclang</code>. The native libraries
+are included as submodules and built statically.</p>
+<pre><code>git clone --recurse-submodules https://github.com/Le-Syl21/headtracking
+cd headtracking
+cargo build --release</code></pre>
+<p>Full details, including every Windows and Linux troubleshooting step: <a href="https://github.com/Le-Syl21/headtracking/blob/main/docs/INSTALL.md">docs/INSTALL.md</a>.</p>
+</div></main>
+<footer class="site"><div class="wrap">
+<a href="https://github.com/Le-Syl21/headtracking">Source code and issues on GitHub</a>
+<a href="https://discord.gg/cFcNrt9AY">Discord</a>
+<span>headtracking is free software under the GNU GPL v3 or later. Visual Pinball X, BAM and the Kinect are separate products by their own authors.</span>
+</div></footer>
+</body>
+</html>

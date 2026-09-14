@@ -15,7 +15,7 @@ alternative to BAM, that works from a plain **webcam** or a **Kinect v1 / v2**.
 [![Discord](https://img.shields.io/badge/Discord-support%20%26%20beta-5865F2?logo=discord&logoColor=white)](https://discord.gg/cFcNrt9AY)
 [![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen)](#-contributors-wanted)
 
-**🇬🇧 [English](#-what-makes-it-different) · 🇫🇷 [Français](#-français)**
+**🌐 [Website](https://le-syl21.github.io/headtracking/) · 🇬🇧 [English](#-what-makes-it-different) · 🇫🇷 [Français](#-français)**
 
 <table><tr>
 <td><img src="docs/images/setup.jpeg" alt="A pinball cabinet running VPX, with a Kinect v2 and a webcam mounted on the backbox"/></td>
@@ -293,7 +293,7 @@ GPL-3.0-or-later. See [LICENSE](LICENSE).
 
 ## 🇫🇷 Français
 
-**🇬🇧 [English](#-what-makes-it-different) · 🇫🇷 Français**
+**🌐 [Site web](https://le-syl21.github.io/headtracking/fr/) · 🇬🇧 [English](#-what-makes-it-different) · 🇫🇷 Français**
 
 **Head tracking POV temps réel pour Visual Pinball X, en Rust pur.** Tu bouges la
 tête, la perspective de la table suit — l'effet *fish-tank VR* qui donne à un

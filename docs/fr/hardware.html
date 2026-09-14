@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Webcam ou Kinect pour le suivi de tête d&#x27;un pincab : caméras et fixation – headtracking</title>
+<meta name="description" content="Quelle caméra pour le suivi de tête dans Visual Pinball X : Kinect v2, Kinect v1 ou webcam. Suivi infrarouge dans le noir, distances minimales, USB 3.0, fixation sur le fronton, conseils minicab.">
+<link rel="canonical" href="https://le-syl21.github.io/headtracking/fr/hardware.html">
+<link rel="alternate" hreflang="en" href="https://le-syl21.github.io/headtracking/hardware.html">
+<link rel="alternate" hreflang="fr" href="https://le-syl21.github.io/headtracking/fr/hardware.html">
+<link rel="alternate" hreflang="x-default" href="https://le-syl21.github.io/headtracking/hardware.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="headtracking">
+<meta property="og:title" content="Webcam ou Kinect pour le suivi de tête d&#x27;un pincab : caméras et fixation – headtracking">
+<meta property="og:description" content="Quelle caméra pour le suivi de tête dans Visual Pinball X : Kinect v2, Kinect v1 ou webcam. Suivi infrarouge dans le noir, distances minimales, USB 3.0, fixation sur le fronton, conseils minicab.">
+<meta property="og:url" content="https://le-syl21.github.io/headtracking/fr/hardware.html">
+<meta property="og:image" content="https://le-syl21.github.io/headtracking/img/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Un pincab sous Visual Pinball X avec des caméras de suivi de tête sur le fronton">
+<meta property="og:locale" content="fr_FR">
+<meta property="og:locale:alternate" content="en_GB">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Webcam ou Kinect pour le suivi de tête d&#x27;un pincab : caméras et fixation – headtracking">
+<meta name="twitter:description" content="Quelle caméra pour le suivi de tête dans Visual Pinball X : Kinect v2, Kinect v1 ou webcam. Suivi infrarouge dans le noir, distances minimales, USB 3.0, fixation sur le fronton, conseils minicab.">
+<meta name="twitter:image" content="https://le-syl21.github.io/headtracking/img/og.jpg">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/svg+xml" href="../img/favicon.svg">
+<link rel="stylesheet" href="../style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@graph": [{"@type": "SoftwareApplication", "@id": "https://le-syl21.github.io/headtracking/#app", "name": "headtracking", "description": "Plugin libre de suivi de tête pour Visual Pinball X, avec une webcam ou une Kinect v1/v2, calibré automatiquement par la lockbar et les rails latéraux du meuble.", "applicationCategory": "GameApplication", "operatingSystem": "Linux, Windows, macOS", "softwareRequirements": "Visual Pinball X 10.8.1 or later", "url": "https://le-syl21.github.io/headtracking/", "downloadUrl": "https://github.com/Le-Syl21/headtracking/releases", "image": "https://le-syl21.github.io/headtracking/img/og.jpg", "license": "https://www.gnu.org/licenses/gpl-3.0.html", "codeRepository": "https://github.com/Le-Syl21/headtracking", "isAccessibleForFree": true, "offers": {"@type": "Offer", "price": "0", "priceCurrency": "EUR"}, "softwareVersion": "0.0.40"}, {"@type": "WebPage", "name": "Webcam ou Kinect pour le suivi de tête d'un pincab : caméras et fixation – headtracking", "description": "Quelle caméra pour le suivi de tête dans Visual Pinball X : Kinect v2, Kinect v1 ou webcam. Suivi infrarouge dans le noir, distances minimales, USB 3.0, fixation sur le fronton, conseils minicab.", "url": "https://le-syl21.github.io/headtracking/fr/hardware.html", "inLanguage": "fr", "about": {"@id": "https://le-syl21.github.io/headtracking/#app"}}]}</script>
+</head>
+<body>
+<header class="site"><div class="wrap">
+<a class="brand" href="./"><img src="../img/favicon.svg" alt="" width="24" height="24"><span>head<b>tracking</b></span></a>
+<nav class="main"><a href="./">Accueil</a><a href="how-it-works.html">Fonctionnement</a><a href="download.html">Télécharger</a><a href="hardware.html" aria-current="page">Caméras</a><a href="contribute.html">Contribuer</a><a href="faq.html">FAQ</a></nav>
+<a class="lang" href="../hardware.html" hreflang="en" lang="en"><img src="../img/gb.svg" alt="" width="21" height="14">English version</a>
+</div></header>
+<main><div class="wrap">
+<h1>Webcam ou Kinect ?</h1>
+<p class="lead">Toutes les caméras fonctionnent avec headtracking. Le meilleur rapport qualité-prix est une Kinect v2
+d'occasion, mais une webcam que vous avez déjà ne coûte rien, et la calibration automatique lui donne aussi une vraie
+3D.</p>
+<div class="table"><table><thead><tr><th>Caméra</th><th>Suit la tête grâce à</th><th>Distance de la tête</th><th>Distance minimale</th></tr></thead><tbody><tr><td><strong>Kinect v2 (Xbox One)</strong></td><td>L'infrarouge : le capteur éclaire lui-même la scène</td><td>Mesurée par le capteur de profondeur</td><td>Environ 0,5 m (limite matérielle)</td></tr><tr><td><strong>Kinect v1 (Xbox 360)</strong></td><td>La couleur pour repérer le meuble, puis l'infrarouge pour le suivi</td><td>Mesurée par le capteur de profondeur</td><td>Environ 0,8 m (limite matérielle)</td></tr><tr><td><strong>Webcam</strong></td><td>L'image couleur</td><td>Déduite de la largeur de vos épaules</td><td>Environ 0,4 à 0,5 m : la tête et les épaules doivent tenir dans l'image ; un objectif grand-angle abaisse cette limite</td></tr></tbody></table></div>
+
+<h2 id="kinect-v2">Kinect v2 (Xbox One) : le meilleur choix</h2>
+<figure class="side"><img src="../img/kinect-v2.webp" width="700" height="358" alt="Barre de capteurs Kinect v2 (Xbox One)" loading="lazy"><figcaption>Kinect v2 (Xbox One).</figcaption></figure>
+<ul>
+<li><strong>Peu chère d'occasion</strong> depuis son arrêt par Microsoft : à partir d'environ 20 € sur les petites
+annonces, par exemple <a href="https://www.leboncoin.fr/recherche?text=%22Kinect%22%20Xbox%20One&amp;shippable=1&amp;price=20-max&amp;transaction_status=search__no_value&amp;owner_type=private&amp;sort=price&amp;order=asc">leboncoin</a> ou <a href="https://www.ebay.fr/sch/i.html?_nkw=kinect+xbox+one&amp;_sacat=54968&amp;_from=R40&amp;LH_TitleDesc=0&amp;_sop=2&amp;Marque=Microsoft&amp;_dcat=54968">eBay</a>.</li>
+<li>Elle suit sur son <strong>flux infrarouge</strong> : le capteur éclaire lui-même la scène, ce qui donne 30 images
+par seconde dans une salle de jeu plongée dans le noir, là où une webcam peine.</li>
+<li>Son <strong>capteur de profondeur</strong> mesure la distance de votre tête en millimètres au lieu de
+l'estimer.</li>
+<li><strong>Prévoyez l'adaptateur Kinect</strong> (alimentation et USB 3.0, environ 29 € neuf) si l'annonce ne
+l'inclut pas : vérifiez avant d'acheter.</li>
+<li>Branchez-la sur un <strong>port USB 3.0 dédié</strong> à l'arrière de la carte mère. Elle n'apparaît pas derrière
+un hub partagé.</li>
+</ul>
+<div class="note clear"><strong>La Kinect v2 consomme beaucoup de bande passante USB.</strong> Elle envoie en même temps
+la couleur (1920×1080 à 30 images par seconde), l'infrarouge et la profondeur (512×424 à 30 images par seconde, non
+compressés) et ses quatre micros. À elle seule, elle remplit presque un lien USB 3.0. Avant d'accuser la caméra ou
+l'adaptateur, vérifiez qu'elle est sur un port USB 3.0 racine dédié : pas de hub, pas de port en façade, pas de
+rallonge douteuse.</div>
+
+<h2>Kinect v1 (Xbox 360)</h2>
+<p>Encore moins chère et éprouvée elle aussi. Sa résolution est plus faible, mais elle reste tout à fait utilisable :
+elle se sert de la couleur pour repérer le meuble, puis suit en infrarouge avec son capteur de profondeur. Sa distance
+minimale d'environ 0,8 m peut poser problème sur les petits meubles.</p>
+
+<h2>Webcam</h2>
+<p>Une simple webcam fonctionne : la calibration par la lockbar et les rails retrouve sa focale, et la distance de
+votre tête est déduite de la largeur de vos épaules. Elle suit sur l'image couleur : une salle de jeu sombre lui
+est donc plus difficile qu'à une Kinect. La tête et les épaules doivent tenir dans l'image.</p>
+
+<h2 id="mounting">Fixation</h2>
+<figure><img src="../img/setup-backbox.webp" width="1280" height="964" alt="Une Kinect pour Xbox 360, une Kinect pour Xbox One et une petite webcam sur le haut du fronton d&#x27;un flipper" loading="lazy"><figcaption>Des caméras sur le fronton d'un vrai pincab : Kinect v1, Kinect v2 et une webcam.</figcaption></figure>
+<ul>
+<li>Placez la caméra sur le haut du fronton (backbox) ou du topper, tournée vers le joueur. Elle doit voir la
+<strong>lockbar et les rails latéraux</strong> pour la calibration, et votre <strong>tête et vos épaules</strong> pour
+le suivi.</li>
+<li>Un kit d'assortiment de vis 1/4"-20 suffit pour fixer le capteur. Le projet tient à jour une
+<a href="https://www.amazon.fr/hz/wishlist/ls/ZFKFTI03HIJ3">liste Amazon « Headtracking »</a> avec l'adaptateur Kinect et un kit de vis.</li>
+<li>Monter la caméra haut et l'incliner vers le bas l'éloigne de la tête du joueur, ce qui aide face aux distances
+minimales ci-dessus.</li>
+<li>Si la gauche et la droite (ou le haut et le bas) sont inversées à cause d'un montage inhabituel, utilisez les
+réglages Invert du plugin.</li>
+</ul>
+
+<h2 id="minicab">Minicabs et petits meubles</h2>
+<p>Le suivi de tête fonctionne sur un minicab, mais la faible distance entre le joueur et la caméra décide de tout.</p>
+<ul>
+<li>Joueur à <strong>60 cm ou plus</strong> de la caméra : la Kinect v2 d'occasion reste le meilleur choix.</li>
+<li>Joueur à <strong>moins d'environ 60 cm</strong> : une <strong>webcam grand-angle</strong> est la meilleure option.
+Elle n'a pas de distance plancher stricte, et un minicab vit souvent dans une pièce éclairée, où l'éclairage
+infrarouge de la Kinect compte moins.</li>
+<li>La <strong>Kinect v1 est risquée</strong> sur un minicab : son plancher de 0,8 m dépasse souvent toute la distance
+entre le joueur et le fronton.</li>
+<li>Saisissez la <strong>vraie largeur de votre lockbar</strong> dans VPX : celle d'un minicab est bien plus étroite que
+celle d'un flipper classique, et la calibration repose sur cette valeur. Saisissez l'inclinaison de l'écran comme sur
+un meuble classique.</li>
+<li>La détection de la lockbar et des rails fonctionne quelle que soit la taille du meuble, et une caméra proche les
+voit même plus grands. Le modèle n'a encore jamais vu de minicab : <a href="contribute.html">votre relevé</a> est
+particulièrement bienvenu.</li>
+</ul>
+<p>Plus de détails : <a href="https://github.com/Le-Syl21/headtracking/blob/main/docs/MINICAB.md">docs/MINICAB.md</a>.</p>
+</div></main>
+<footer class="site"><div class="wrap">
+<a href="https://github.com/Le-Syl21/headtracking">Code source et tickets sur GitHub</a>
+<a href="https://discord.gg/cFcNrt9AY">Discord</a>
+<span>headtracking est un logiciel libre sous licence GNU GPL v3 ou ultérieure. Visual Pinball X, BAM et la Kinect sont des produits distincts, développés par leurs propres auteurs.</span>
+</div></footer>
+</body>
+</html>

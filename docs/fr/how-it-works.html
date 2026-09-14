@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fonctionnement du suivi de tête pour VPX : calibration automatique par la lockbar – headtracking</title>
+<meta name="description" content="Comment headtracking donne à Visual Pinball X un point de vue qui suit la tête : position de la caméra par la lockbar et les rails, tête trouvée par un modèle du corps, distance par Kinect ou webcam, vue en direct dans le plugin VPX.">
+<link rel="canonical" href="https://le-syl21.github.io/headtracking/fr/how-it-works.html">
+<link rel="alternate" hreflang="en" href="https://le-syl21.github.io/headtracking/how-it-works.html">
+<link rel="alternate" hreflang="fr" href="https://le-syl21.github.io/headtracking/fr/how-it-works.html">
+<link rel="alternate" hreflang="x-default" href="https://le-syl21.github.io/headtracking/how-it-works.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="headtracking">
+<meta property="og:title" content="Fonctionnement du suivi de tête pour VPX : calibration automatique par la lockbar – headtracking">
+<meta property="og:description" content="Comment headtracking donne à Visual Pinball X un point de vue qui suit la tête : position de la caméra par la lockbar et les rails, tête trouvée par un modèle du corps, distance par Kinect ou webcam, vue en direct dans le plugin VPX.">
+<meta property="og:url" content="https://le-syl21.github.io/headtracking/fr/how-it-works.html">
+<meta property="og:image" content="https://le-syl21.github.io/headtracking/img/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Un pincab sous Visual Pinball X avec des caméras de suivi de tête sur le fronton">
+<meta property="og:locale" content="fr_FR">
+<meta property="og:locale:alternate" content="en_GB">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Fonctionnement du suivi de tête pour VPX : calibration automatique par la lockbar – headtracking">
+<meta name="twitter:description" content="Comment headtracking donne à Visual Pinball X un point de vue qui suit la tête : position de la caméra par la lockbar et les rails, tête trouvée par un modèle du corps, distance par Kinect ou webcam, vue en direct dans le plugin VPX.">
+<meta name="twitter:image" content="https://le-syl21.github.io/headtracking/img/og.jpg">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/svg+xml" href="../img/favicon.svg">
+<link rel="stylesheet" href="../style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@graph": [{"@type": "SoftwareApplication", "@id": "https://le-syl21.github.io/headtracking/#app", "name": "headtracking", "description": "Plugin libre de suivi de tête pour Visual Pinball X, avec une webcam ou une Kinect v1/v2, calibré automatiquement par la lockbar et les rails latéraux du meuble.", "applicationCategory": "GameApplication", "operatingSystem": "Linux, Windows, macOS", "softwareRequirements": "Visual Pinball X 10.8.1 or later", "url": "https://le-syl21.github.io/headtracking/", "downloadUrl": "https://github.com/Le-Syl21/headtracking/releases", "image": "https://le-syl21.github.io/headtracking/img/og.jpg", "license": "https://www.gnu.org/licenses/gpl-3.0.html", "codeRepository": "https://github.com/Le-Syl21/headtracking", "isAccessibleForFree": true, "offers": {"@type": "Offer", "price": "0", "priceCurrency": "EUR"}, "softwareVersion": "0.0.40"}, {"@type": "WebPage", "name": "Fonctionnement du suivi de tête pour VPX : calibration automatique par la lockbar – headtracking", "description": "Comment headtracking donne à Visual Pinball X un point de vue qui suit la tête : position de la caméra par la lockbar et les rails, tête trouvée par un modèle du corps, distance par Kinect ou webcam, vue en direct dans le plugin VPX.", "url": "https://le-syl21.github.io/headtracking/fr/how-it-works.html", "inLanguage": "fr", "about": {"@id": "https://le-syl21.github.io/headtracking/#app"}}]}</script>
+</head>
+<body>
+<header class="site"><div class="wrap">
+<a class="brand" href="./"><img src="../img/favicon.svg" alt="" width="24" height="24"><span>head<b>tracking</b></span></a>
+<nav class="main"><a href="./">Accueil</a><a href="how-it-works.html" aria-current="page">Fonctionnement</a><a href="download.html">Télécharger</a><a href="hardware.html">Caméras</a><a href="contribute.html">Contribuer</a><a href="faq.html">FAQ</a></nav>
+<a class="lang" href="../how-it-works.html" hreflang="en" lang="en"><img src="../img/gb.svg" alt="" width="21" height="14">English version</a>
+</div></header>
+<main><div class="wrap">
+<h1>Le fonctionnement de headtracking</h1>
+<p class="lead">Une caméra posée sur le meuble regarde le joueur. Le plugin déduit la position de cette caméra à
+partir du meuble lui-même, trouve votre tête dans chaque image, la convertit en position en millimètres, et déplace le
+point de vue de Visual Pinball X en conséquence.</p>
+
+<h2>L'effet « fish-tank »</h2>
+<p>Quand vous bougez la tête devant un vrai flipper, vous voyez le plateau sous un angle légèrement différent : les
+objets proches se décalent plus que les objets lointains. headtracking reproduit cet effet sur un écran. Visual Pinball
+X propose une disposition de vue <strong>Window</strong> conçue pour cela : l'écran devient une fenêtre fixe sur le
+meuble, et quand votre tête bouge, le plugin déplace le point de vue pour que la table 3D reste en place derrière la
+vitre.</p>
+
+<h2 id="calibration">Une calibration tirée du meuble lui-même</h2>
+<p>Pour transformer une tête vue dans une image en position réelle, un programme doit savoir où se trouve la caméra et
+comment elle voit (sa focale). La plupart des solutions vous demandent des mesures ou une procédure de calibration.
+headtracking se sert de ce que tout meuble possède déjà : la <strong>lockbar</strong> et les <strong>deux rails
+latéraux</strong>.</p>
+<figure><img src="../img/lockbar-detection.webp" width="657" height="179" alt="Lockbar encadrée et rails latéraux marqués par des lignes sur un vrai meuble" loading="lazy"><figcaption>La détection sur un vrai meuble : la lockbar (le cadre) et les rails latéraux.</figcaption></figure>
+<ul>
+<li>Un réseau de neurones, le modèle <em>anchor</em>, repère la lockbar et les rails dans l'image de la caméra. Il
+existe un modèle pour les images couleur et un autre pour les images infrarouges.</li>
+<li>Ensemble, ils forment un rectangle de forme connue. Vu en perspective, il donne la focale de la caméra et sa
+position par rapport à la table, grâce aux points de fuite et à une homographie plane. Les calculs ont été vérifiés à
+0 à 3&nbsp;% près d'un mètre ruban.</li>
+<li>La taille réelle vient de la <strong>largeur de la lockbar</strong>, que vous saisissez dans VPX.
+L'<strong>inclinaison de l'écran</strong> indique au plugin comment le plateau est penché. Ce sont les deux seules
+valeurs à saisir ; <a href="download.html#setup">mesurez-les, ne les devinez pas</a>.</li>
+<li>Au lancement d'une table, le plugin cherche le meuble pendant un moment, garde sa meilleure détection, et affiche
+dans une notification de VPX la position de caméra trouvée. S'il ne reconnaît rien, il suit quand même votre tête par
+rapport à votre position de départ, simplement sans cette notification.</li>
+</ul>
+<figure><img src="../img/anchor-check.webp" width="1280" height="720" alt="Vue de la caméra depuis le fronton, avec quatre lignes tracées le long de la lockbar et des rails, et leurs points d&#x27;intersection" loading="lazy"><figcaption>Le repère tracé sur un relevé : les deux bords de la lockbar, les deux rails latéraux et leurs six points d'intersection.</figcaption></figure>
+
+<h2>Trouver votre tête</h2>
+<p>La tête est trouvée par <strong>BlazePose</strong>, un modèle de pose du corps qui tourne en quelques millisecondes
+par image. Il repère d'un coup la tête, les épaules et les poignets, y compris sur les images infrarouges. C'est un
+détecteur de corps, pas de visage : un détecteur de visage décroche dès que vous vous penchez sur le plateau et que la
+caméra ne voit plus que le haut de votre crâne. En contrepartie, votre buste (tête et épaules) doit être dans
+l'image.</p>
+
+<h2>Mesurer la distance</h2>
+<ul>
+<li><strong>Kinect v2 et Kinect v1</strong> : le capteur de profondeur mesure l'éloignement de votre tête en
+millimètres. Les deux suivent sur leur flux infrarouge, éclairé par le capteur lui-même, et continuent donc de
+fonctionner dans une salle de jeu sombre. La Kinect v2 tient 30 images par seconde en infrarouge.</li>
+<li><strong>Webcam</strong> : la distance est déduite de la largeur de vos épaules, grâce à la focale retrouvée à
+partir du meuble. C'est ce qui fait d'une simple webcam un suivi de tête en 3D.</li>
+</ul>
+<p>Voir <a href="hardware.html">choisir une caméra</a> pour les différences en pratique.</p>
+
+<h2>Dans Visual Pinball X</h2>
+<ul>
+<li>headtracking est un plugin pour le système de plugins de <a href="https://github.com/vpinball/vpinball">Visual Pinball X</a> 10.8.1 et plus
+récent. Il s'active et se règle depuis le menu en jeu, <kbd>F12</kbd> → Plugin Settings → Head Tracking.</li>
+<li>Le suivi tourne dans son propre fil d'exécution ; VPX lit la dernière position de la tête à chaque image sans
+attendre, et le plugin met la vue à jour.</li>
+<li>La première position de tête stable d'une partie devient la position neutre. Maintenir le <strong>bouton de la
+lockbar pendant 2 secondes</strong> recentre sur votre position actuelle.</li>
+<li>Des préréglages de lissage (Stable, Normal, Reactive ou Custom) filtrent les tremblements, et chaque réglage se
+modifie en direct pendant la partie. Voir <a href="download.html#settings">les réglages</a>.</li>
+<li>Les problèmes s'affichent à l'écran, pas seulement dans un journal : par exemple quand aucune caméra n'est trouvée,
+ou quand un autre programme utilise déjà la Kinect.</li>
+</ul>
+
+<h2 id="demo">L'application de démonstration</h2>
+<p>Chaque version contient aussi <strong>headtracking-demo</strong>, un programme autonome qui n'a pas besoin de VPX.
+Il affiche l'image de la caméra avec ce que voit la détection, permet de régler la largeur de la lockbar et
+l'inclinaison du plateau, et ouvre une fenêtre de parallaxe en 3D où bouger la tête déplace la scène : un moyen rapide
+de juger le suivi. Il propose aussi une correction en un clic quand une Kinect est branchée mais inaccessible, et le
+bouton <strong>🎁 Contribute</strong> qui <a href="contribute.html">partage un relevé</a> de votre meuble.</p>
+
+<h2>Tout dans un seul plugin</h2>
+<p>Les bibliothèques Kinect (libfreenect et libfreenect2), libjpeg-turbo et le moteur ONNX qui fait tourner les
+réseaux de neurones sont intégrés au plugin, et les modèles sont embarqués dans le programme. Il n'y a ni SDK Kinect de
+Microsoft ni Python à installer. Tout le projet est écrit en Rust ; <a href="https://github.com/Le-Syl21/headtracking/blob/main/CLAUDE.md">CLAUDE.md</a> décrit
+l'architecture pour les développeurs.</p>
+</div></main>
+<footer class="site"><div class="wrap">
+<a href="https://github.com/Le-Syl21/headtracking">Code source et tickets sur GitHub</a>
+<a href="https://discord.gg/cFcNrt9AY">Discord</a>
+<span>headtracking est un logiciel libre sous licence GNU GPL v3 ou ultérieure. Visual Pinball X, BAM et la Kinect sont des produits distincts, développés par leurs propres auteurs.</span>
+</div></footer>
+</body>
+</html>

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Contribute a capture of your pincab – headtracking for Visual Pinball X</title>
+<meta name="description" content="Help the open-source VPX head tracking project: share a capture of your pinball cabinet from the demo app in two minutes, annotate photos, or test on Windows and macOS.">
+<link rel="canonical" href="https://le-syl21.github.io/headtracking/contribute.html">
+<link rel="alternate" hreflang="en" href="https://le-syl21.github.io/headtracking/contribute.html">
+<link rel="alternate" hreflang="fr" href="https://le-syl21.github.io/headtracking/fr/contribute.html">
+<link rel="alternate" hreflang="x-default" href="https://le-syl21.github.io/headtracking/contribute.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="headtracking">
+<meta property="og:title" content="Contribute a capture of your pincab – headtracking for Visual Pinball X">
+<meta property="og:description" content="Help the open-source VPX head tracking project: share a capture of your pinball cabinet from the demo app in two minutes, annotate photos, or test on Windows and macOS.">
+<meta property="og:url" content="https://le-syl21.github.io/headtracking/contribute.html">
+<meta property="og:image" content="https://le-syl21.github.io/headtracking/img/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A pincab running Visual Pinball X with head-tracking cameras on the backbox">
+<meta property="og:locale" content="en_GB">
+<meta property="og:locale:alternate" content="fr_FR">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Contribute a capture of your pincab – headtracking for Visual Pinball X">
+<meta name="twitter:description" content="Help the open-source VPX head tracking project: share a capture of your pinball cabinet from the demo app in two minutes, annotate photos, or test on Windows and macOS.">
+<meta name="twitter:image" content="https://le-syl21.github.io/headtracking/img/og.jpg">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/svg+xml" href="img/favicon.svg">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@graph": [{"@type": "SoftwareApplication", "@id": "https://le-syl21.github.io/headtracking/#app", "name": "headtracking", "description": "Open-source head tracking plugin for Visual Pinball X, from a webcam or a Kinect v1/v2, self-calibrating from the cabinet's lockbar and side rails.", "applicationCategory": "GameApplication", "operatingSystem": "Linux, Windows, macOS", "softwareRequirements": "Visual Pinball X 10.8.1 or later", "url": "https://le-syl21.github.io/headtracking/", "downloadUrl": "https://github.com/Le-Syl21/headtracking/releases", "image": "https://le-syl21.github.io/headtracking/img/og.jpg", "license": "https://www.gnu.org/licenses/gpl-3.0.html", "codeRepository": "https://github.com/Le-Syl21/headtracking", "isAccessibleForFree": true, "offers": {"@type": "Offer", "price": "0", "priceCurrency": "EUR"}, "softwareVersion": "0.0.40"}, {"@type": "WebPage", "name": "Contribute a capture of your pincab – headtracking for Visual Pinball X", "description": "Help the open-source VPX head tracking project: share a capture of your pinball cabinet from the demo app in two minutes, annotate photos, or test on Windows and macOS.", "url": "https://le-syl21.github.io/headtracking/contribute.html", "inLanguage": "en", "about": {"@id": "https://le-syl21.github.io/headtracking/#app"}}]}</script>
+</head>
+<body>
+<header class="site"><div class="wrap">
+<a class="brand" href="./"><img src="img/favicon.svg" alt="" width="24" height="24"><span>head<b>tracking</b></span></a>
+<nav class="main"><a href="./">Home</a><a href="how-it-works.html">How it works</a><a href="download.html">Download</a><a href="hardware.html">Cameras</a><a href="contribute.html" aria-current="page">Contribute</a><a href="faq.html">FAQ</a></nav>
+<a class="lang" href="fr/contribute.html" hreflang="fr" lang="fr"><img src="img/fr.svg" alt="" width="21" height="14">Version française</a>
+</div></header>
+<main><div class="wrap">
+<h1>Teach it your cabinet</h1>
+<p class="lead">The automatic calibration learns what lockbars and side rails look like from real cabinets: every wood
+tone, every lighting, every camera angle. It has seen very few so far. This is the project's biggest bottleneck, and
+anyone with a pincab can help, in two minutes, without coding.</p>
+
+<h2 id="capture">Send a capture</h2>
+<ol class="steps">
+<li>Download <strong>headtracking-demo</strong> from the <a href="https://github.com/Le-Syl21/headtracking/releases">releases page</a> (it is in the same
+archive as the plugin). Nothing to install.</li>
+<li>Point your webcam or Kinect at the playfield and select it in the demo.</li>
+<li>Click <strong>🎁 Contribute</strong>, read the terms, tick the consent box and confirm.</li>
+</ol>
+<p>Empty cabinet or mid-game, day or night, every variation helps. The detector learns the cabinet, so you do not need
+to stand in the picture, but captures with a player at the cabinet are the rarest. Minicabs are exactly the kind of
+cabinet the model has never seen.</p>
+<figure><img src="img/anchor-check.webp" width="1280" height="720" alt="Camera view from the backbox with four traced lines along the lockbar and side rails and their intersection points" loading="lazy"><figcaption>What is extracted from a capture: the lockbar's two edges, the two side rails and their six intersection points.</figcaption></figure>
+
+<h2 id="privacy">What gets shared</h2>
+<p>The demo shows everything below in its consent window before anything is sent.</p>
+<ul>
+<li><strong>The images</strong>: one image per stream your sensor has (colour, and infrared and depth on a Kinect),
+with what the detector saw. They show your cabinet and whatever is around it, possibly people and their faces: check
+the preview before accepting, and only share images you have the right to share.</li>
+<li><strong>A diagnostics log</strong>: the app version, your operating system, the sensor model, its USB speed and
+how many devices share its controller, the frame-rate measurements, your account name, your computer name, and a
+random id created for this installation, so one cabinet can be followed from one release to the next.</li>
+<li><strong>Sole use</strong>: training and improving the head-tracking model. Captures are never published, sold or
+shared with third parties.</li>
+<li><strong>Storage</strong>: uploads go to the maintainer's private, write-only server, without an account. You can
+also keep your own copy in a folder of your choice.</li>
+<li><strong>Removal</strong>: give the exact file name shown after the upload on <a href="https://discord.gg/cFcNrt9AY">Discord</a>.</li>
+</ul>
+
+<h2>If the upload cannot go through</h2>
+<p>A firewall, a proxy or an antivirus that intercepts HTTPS can block the upload. The demo says so in red
+<em>before</em> you capture, and keeps the capture in a folder it shows on screen. Send that folder on
+<a href="https://discord.gg/cFcNrt9AY">Discord</a>: it is worth exactly as much as an upload. <code>headtracking-demo --upload-test</code>
+tells you in one line whether this computer can reach the server.</p>
+
+<h2>Other ways to help</h2>
+<ul class="features">
+<li><strong>Annotate photos</strong>: trace 4 lines per photo in a browser tool, in
+<a href="https://github.com/Le-Syl21/headtracking/tree/main/tools/anchor">tools/anchor</a>. More cabinets make a model that works everywhere.</li>
+<li><strong>Test on Windows or macOS</strong>: builds are published for both, and real-world reports are what is
+missing.</li>
+<li><strong>VPX and pinball players</strong>: try the plugin on real tables, and tell us how the point of view feels
+and what a good cabinet setup needs.</li>
+<li><strong>Rust developers</strong>: the VPX plugin, the calibration decoder, the filtering and the mapping to the
+VPX view.</li>
+<li><strong>Computer vision and machine learning</strong>: the head and anchor models, the vanishing-point and
+homography solver, webcam focal recovery.</li>
+</ul>
+<p>No permission needed: open an issue on <a href="https://github.com/Le-Syl21/headtracking/issues">GitHub</a> or say hi on
+<a href="https://discord.gg/cFcNrt9AY">Discord</a>. <a href="https://github.com/Le-Syl21/headtracking/blob/main/CLAUDE.md">CLAUDE.md</a> is a tour of the architecture, and issues
+labelled <em>good first issue</em> are a soft landing.</p>
+</div></main>
+<footer class="site"><div class="wrap">
+<a href="https://github.com/Le-Syl21/headtracking">Source code and issues on GitHub</a>
+<a href="https://discord.gg/cFcNrt9AY">Discord</a>
+<span>headtracking is free software under the GNU GPL v3 or later. Visual Pinball X, BAM and the Kinect are separate products by their own authors.</span>
+</div></footer>
+</body>
+</html>
