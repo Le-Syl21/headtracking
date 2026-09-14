@@ -106,9 +106,8 @@ const CONTRIB_TERMS: &[(&str, &str)] = &[
     ),
     (
         "Withdrawal",
-        "uploads are anonymous and can't be searched by author — to have one removed, give \
-         its exact file name (shown after upload) on Discord #headtracking \
-         (https://discord.gg/cFcNrt9AY).",
+        "to have a capture removed, give its exact file name (shown after upload) on \
+         Discord #headtracking (https://discord.gg/cFcNrt9AY).",
     ),
 ];
 
@@ -2539,7 +2538,7 @@ struct App {
     /// Receiver for the reachability probe running off the UI thread.
     drop_probe: Option<mpsc::Receiver<contribute::Reach>>,
     /// Stem of the last capture shared, shown so the user can note it (needed
-    /// to request a removal, since the drop is anonymous).
+    /// to request a removal: the drop has no accounts to look it up by).
     contrib_last: Option<String>,
     /// Where the user wants their own copy of a shared capture, if anywhere.
     contrib_local: LocalCopy,

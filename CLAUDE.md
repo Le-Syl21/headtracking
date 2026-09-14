@@ -166,16 +166,16 @@ Décision : **un seul chemin de code par capteur**, pas d'utilisation des SDK pr
 
 | Backend     | Cross-platform via         | Statut         | Crate Rust                              |
 |-------------|----------------------------|----------------|-----------------------------------------|
-| Kinect v1   | `libfreenect` (C API)      | P2 ✅ capture + algo blob | `freenect-sys` (bindgen) + `freenect`   |
-| Kinect v2   | `libfreenect2` (C++ API)   | P1 ✅ capture + algo blob | `freenect2-sys` (cxx) + `freenect2`     |
-| Webcam      | **SDL3** `SDL_Camera`       | capture ✅, tracker P3 | `webcam` (sdl3-sys + safe wrapper) ; tracker via `rust-faces` ONNX (P3) |
+| Kinect v1   | `libfreenect` (C API)      | ✅ capture + BlazePose (IR) | `freenect-sys` (bindgen) + `freenect`   |
+| Kinect v2   | `libfreenect2` (C++ API)   | ✅ capture + BlazePose | `freenect2-sys` (cxx) + `freenect2`     |
+| Webcam      | **SDL3** `SDL_Camera`       | ✅ capture + BlazePose | `webcam` (sdl3-sys + safe wrapper) ; profondeur par triangulation de la largeur d'épaules |
 
 **Stratégie "zéro dep utilisateur final"** :
 - libfreenect / libfreenect2 compilés en static via `cmake` dans `build.rs` (CPU pipeline only pour libfreenect2 — pas de GPU dep).
 - libjpeg-turbo (requis par libfreenect2 même si on n'utilise pas le RGB) tiré du crate `turbojpeg-sys` feature `cmake` : build static PIC depuis les sources vendorées du crate. Le linker élimine en dead-code l'encodeur JPEG (libfreenect2 n'appelle que `tjInitDecompress` / `tjDecompress2` / `tjGetErrorStr` / `tjDestroy`).
 - Lien statique imposé dans `build.rs` **après** `libfreenect2` (les archives `.a` sont scannées une seule fois ; libfreenect2 référence les symboles `tj*` donc libturbojpeg.a doit suivre).
 - SDL3 vendoré via `sdl3-sys` features `build-from-source-static` + `sdl-camera` + `sdl-video` **dans `headtracking-demo`**. Aucun dep utilisateur sur SDL3 (qui n'est de toute façon pas encore packagé partout).
-- `libusb-1.0` reste linké dynamiquement contre la lib système (universelle sur Linux/macOS).
+- `libusb-1.0` est vendoré (`crates/libusb-sys/vendor/libusb`) et compilé statiquement par `libusb-sys` sur les trois OS (hotplug NETLINK sur Linux, sans libudev).
 
 **Cas particulier SDL3 dans le plugin (P3, à ne pas oublier)** :
 - VPX 10.8+ utilise SDL3 lui-même (`find_package(SDL3)` dans son `CMakeLists.txt`, `libSDL3.so` à côté du binaire) ⇒ une copie de SDL3 vit déjà dans le process VPX au moment où notre `cdylib` se charge.
@@ -188,13 +188,14 @@ Compilation conditionnelle via features Cargo :
 
 ```toml
 [features]
-default = []
-kinect-v1 = []                  # déclenche `dep:freenect` quand le crate sera prêt
-kinect-v2 = ["dep:freenect2"]   # opérationnel
-all-trackers = ["kinect-v1", "kinect-v2"]
+default = ["all-trackers"]
+kinect-v1 = ["dep:freenect", "dep:blazepose", "dep:anchor"]
+kinect-v2 = ["dep:freenect2", "dep:blazepose", "dep:anchor"]
+webcam = ["dep:libloading", "dep:blazepose", "dep:anchor"]
+all-trackers = ["kinect-v1", "kinect-v2", "webcam"]
 ```
 
-Activation runtime via la config (toml) : un seul backend actif à la fois pour le MVP.
+Sélection runtime via le réglage `Backend` (Auto / Kinect v2 / Kinect v1 / Webcam) ; Auto essaie v2 → v1 → webcam.
 
 ---
 
@@ -206,9 +207,8 @@ Activation runtime via la config (toml) : un seul backend actif à la fois pour 
 - `bindgen` requiert `libclang` (paquet `libclang1-X` ou `clang`). `build.rs` cherche le sysroot dans plusieurs emplacements et tombe sur les headers GCC en dernier recours.
 - `cmake` ≥ 3.20
 - Selon backend :
-  - Linux : `libusb-1.0-0-dev`
-  - macOS : `brew install libusb`
-  - Windows : `cargo-xwin` (cible MSVC) ; libusb via vcpkg
+  - libusb : rien à installer, vendoré et compilé statiquement sur les trois OS
+  - Windows : `cargo-xwin` (cible MSVC)
 - **Pas besoin** d'installer `libfreenect-dev` / `libfreenect2-dev` / `libturbojpeg0-dev` ni de SDK Microsoft : tout est vendoré.
   - libfreenect / libfreenect2 : submodules dans `crates/*-sys/vendor/`
   - libjpeg-turbo : via le crate [`turbojpeg-sys`](https://crates.io/crates/turbojpeg-sys) feature `cmake` (build statique PIC à partir de sources bundled)
@@ -216,16 +216,16 @@ Activation runtime via la config (toml) : un seul backend actif à la fois pour 
 
 ### Runtime utilisateur (côté pincab)
 
-Pour exécuter le `.so`/`.dll`/`.dylib` : aucune dépendance applicative à installer. Les seules `NEEDED` sur Linux sont les libs systèmes universelles : `libusb-1.0`, `libstdc++`, `libgcc_s`, `libm`, `libc`, plus `libudev` / `libcap` via libusb. Toutes déjà présentes par défaut sur Ubuntu/Debian/Fedora/Arch.
+Pour exécuter le `.so`/`.dll`/`.dylib` : aucune dépendance applicative à installer. Les seules `NEEDED` sur Linux sont les libs systèmes universelles : `libstdc++`, `libgcc_s`, `libm`, `libc` (libusb est lié statiquement). Toutes déjà présentes par défaut sur Ubuntu/Debian/Fedora/Arch.
 
 ### Commandes
 
 ```bash
-# Build release
-cargo build --release --features kinect-v2
+# Build release (tous les backends, feature par défaut)
+cargo build --release
 
-# Build avec tous les backends
-cargo build --release --features all-trackers
+# Build avec un seul backend
+cargo build --release --no-default-features --features kinect-v2
 
 # Tests
 cargo test --all-features

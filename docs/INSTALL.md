@@ -36,19 +36,16 @@ supported too. Building a **minicab**? See the dedicated
 ### Install the plugin
 
 Grab the binary for your OS from the
-[Releases page](https://github.com/Le-Syl21/headtracking/releases) — or, for
-the freshest build, from the artifacts of any `main`-branch run on the
-[Actions tab](https://github.com/Le-Syl21/headtracking/actions/workflows/release.yml)
-(every commit builds the plugin + demo for all platforms; dev builds are
-**unsigned** and need a GitHub login to download). Drop it into VPX's
-plugin folder:
+[Releases page](https://github.com/Le-Syl21/headtracking/releases) (builds
+come from release tags only; a push to `main` builds nothing). Drop it into
+VPX's plugin folder:
 
 ```
 <VPX_install>/plugins/headtracking/
 ├── plugin.cfg
 ├── headtracking.dll          # Windows
 ├── libheadtracking.so        # Linux (x86_64 or aarch64)
-└── libheadtracking.dylib     # macOS (arm64 or x86_64)
+└── libheadtracking.dylib     # macOS (Apple silicon)
 ```
 
 Both files (the binary **and** `plugin.cfg`) must live in the same folder —
@@ -72,7 +69,12 @@ VPX scans `plugins/<id>/plugin.cfg` to discover plugins.
    Backend         = 0     ; 0=Auto (Kinect v2 → v1 → Webcam), 1=Kinect v2, 2=Kinect v1, 3=Webcam
    DeviceIndex     = 0     ; which webcam — the in-game dropdown shows real device names
    Gain            = 1.0   ; multiplier on the head-motion delta (0.5 is a good cab start)
-   Smoothing       = 0     ; 0=Stable (field-tested default), 1=Normal, 2=Reactive
+   GainX           = 1.0   ; per-axis trims multiplying Gain (0.0–3.0): left/right
+   GainY           = 1.0   ; up/down
+   GainZ           = 1.0   ; near/far (a shallow playfield often wants less)
+   Smoothing       = 0     ; 0=Stable (field-tested default), 1=Normal, 2=Reactive, 3=Custom
+   SmoothingResponsiveness = 1.0  ; Custom only: 0.05–5.0, low = steadier at rest, high = follows sooner
+   SmoothingCatchUp        = 0.01 ; Custom only: 0.0–1.5, higher = catches fast moves quicker
    MedianWindow    = 3     ; frames of spike-killing median pre-filter (1 = off)
    InvertX         = 0     ; flip left/right for mirrored / unusual mountings
    InvertY         = 0
@@ -166,6 +168,11 @@ sudo udevadm trigger
 
 Same: unplug/replug.
 
+The demo app can do this for you: when it cannot open a Kinect, it shows an
+**Install udev rule** button that installs the rule after asking for your
+password. Click *rescan* afterwards (unplug/replug the sensor if it still
+doesn't show up).
+
 ##### Verification
 
 ```bash
@@ -191,9 +198,9 @@ sudo usermod -aG video "$USER"   # logout/login required afterwards
 
 ##### System libraries
 
-No application dependency to install — `libfreenect`, `libfreenect2` and
-`libjpeg-turbo` are statically linked. Only `libusb-1.0`, `libstdc++`,
-`libgcc_s` and the libc are required, all present by default on
+No application dependency to install — `libfreenect`, `libfreenect2`, libusb
+and `libjpeg-turbo` are statically linked. Only `libstdc++`, `libgcc_s` and
+the libc are required, all present by default on
 Debian/Ubuntu/Fedora/Arch.
 
 #### Windows — libusb drivers for the Kinect
@@ -414,21 +421,16 @@ aussi pleinement supportées. Vous montez un **minicab** ? Voir les
 ### Installation du plugin
 
 Récupérer le binaire correspondant à votre OS depuis la
-[page Releases](https://github.com/Le-Syl21/headtracking/releases) — ou, pour
-la version la plus fraîche, depuis les artefacts de n'importe quel run de la
-branche `main` dans l'onglet
-[Actions](https://github.com/Le-Syl21/headtracking/actions/workflows/release.yml)
-(chaque commit compile plugin + démo pour toutes les plateformes ; les dev
-builds sont **non signées** et demandent un compte GitHub pour le
-téléchargement). Puis le déposer dans le dossier des plugins de votre
-install VPX :
+[page Releases](https://github.com/Le-Syl21/headtracking/releases) (les builds
+viennent uniquement des tags de release ; un push sur `main` ne compile rien).
+Puis le déposer dans le dossier des plugins de votre install VPX :
 
 ```
 <VPX_install>/plugins/headtracking/
 ├── plugin.cfg
 ├── headtracking.dll          # Windows
 ├── libheadtracking.so        # Linux (x86_64 ou aarch64)
-└── libheadtracking.dylib     # macOS (arm64 ou x86_64)
+└── libheadtracking.dylib     # macOS (Apple silicon)
 ```
 
 Les deux fichiers (le binaire **et** `plugin.cfg`) doivent vivre dans le même
@@ -453,7 +455,12 @@ dossier — VPX scanne `plugins/<id>/plugin.cfg` pour découvrir les plugins.
    Backend         = 0     ; 0=Auto (Kinect v2 → v1 → Webcam), 1=Kinect v2, 2=Kinect v1, 3=Webcam
    DeviceIndex     = 0     ; quelle webcam — la dropdown in-game affiche les vrais noms
    Gain            = 1.0   ; multiplicateur sur le delta tête (0.5 = bon départ sur cab)
-   Smoothing       = 0     ; 0=Stable (défaut éprouvé), 1=Normal, 2=Reactive
+   GainX           = 1.0   ; correctifs par axe multipliant Gain (0.0–3.0) : gauche/droite
+   GainY           = 1.0   ; haut/bas
+   GainZ           = 1.0   ; près/loin (un plateau peu profond en demande souvent moins)
+   Smoothing       = 0     ; 0=Stable (défaut éprouvé), 1=Normal, 2=Reactive, 3=Custom
+   SmoothingResponsiveness = 1.0  ; Custom seulement : 0.05–5.0, bas = plus stable à l'arrêt, haut = suit plus tôt
+   SmoothingCatchUp        = 0.01 ; Custom seulement : 0.0–1.5, plus haut = rattrape plus vite les mouvements rapides
    MedianWindow    = 3     ; frames de médiane anti-pics avant le filtre (1 = off)
    InvertX         = 0     ; inverse gauche/droite (montage caméra atypique)
    InvertY         = 0
@@ -550,6 +557,11 @@ sudo udevadm trigger
 
 Idem : débrancher/rebrancher.
 
+L'application de démo peut le faire pour vous : quand elle n'arrive pas à ouvrir
+une Kinect, elle affiche un bouton **Install udev rule** qui installe la règle
+après vous avoir demandé votre mot de passe. Cliquez ensuite sur *rescan*
+(débranchez/rebranchez le capteur s'il n'apparaît toujours pas).
+
 ##### Vérification
 
 ```bash
@@ -575,9 +587,9 @@ sudo usermod -aG video "$USER"   # logout/login requis ensuite
 
 ##### Bibliothèques système
 
-Aucune dépendance applicative à installer (libfreenect, libfreenect2 et
-libjpeg-turbo sont linkés statiquement dans le `.so`). Seules `libusb-1.0`,
-`libstdc++`, `libgcc_s` et la libc sont requises — elles sont présentes par
+Aucune dépendance applicative à installer (libfreenect, libfreenect2, libusb et
+libjpeg-turbo sont linkés statiquement dans le `.so`). Seules `libstdc++`,
+`libgcc_s` et la libc sont requises — elles sont présentes par
 défaut sur Debian/Ubuntu/Fedora/Arch.
 
 #### Windows — drivers libusb pour la Kinect

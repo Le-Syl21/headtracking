@@ -18,7 +18,7 @@ alternative to BAM, that works from a plain **webcam** or a **Kinect v1 / v2**.
 **🌐 [Website](https://le-syl21.github.io/headtracking/) · 🇬🇧 [English](#-what-makes-it-different) · 🇫🇷 [Français](#-français)**
 
 <table><tr>
-<td><img src="docs/images/setup.jpeg" alt="A pinball cabinet running VPX, with a Kinect v2 and a webcam mounted on the backbox"/></td>
+<td><img src="docs/images/setup.jpeg" alt="A pinball cabinet running VPX, with a Kinect v1, a Kinect v2 and a webcam mounted on the backbox"/></td>
 <td><img src="docs/images/setup-backbox.jpeg" alt="Close-up of the cameras mounted on top of the backbox"/></td>
 <td><img src="docs/images/lockbar-detection.jpeg" alt="Detected lockbar (box) and side rails overlaid on a real cabinet"/></td>
 </tr></table>
@@ -31,14 +31,15 @@ alternative to BAM, that works from a plain **webcam** or a **Kinect v1 / v2**.
 
 ## ✨ What makes it different
 
-Head tracking for pinball isn't new. Doing it **without asking the user to
-calibrate anything** is. That's the whole bet of this project:
+Head tracking for pinball isn't new. Doing it **without a calibration routine**
+is. That's the whole bet of this project:
 
-- **Zero manual calibration.** The cabinet itself is the calibration target. The
+- **No calibration routine.** The cabinet itself is the calibration target. The
   lockbar and the two side rails form a **known rectangle** of the playfield. Seen
   in perspective, that's enough to recover the camera's focal length *and* its
   pose relative to the table — from the image alone. No checkerboard, no wizard,
-  no "look here and press space".
+  no "look here and press space": you only enter your lockbar width and screen
+  inclination in VPX.
 
   ![Detected lockbar (box) and side rails on a real cabinet](docs/images/lockbar-detection.jpeg)
 
@@ -125,7 +126,7 @@ picks — see the dedicated notes:
 
 ## 🚧 Status — honestly
 
-This is **early development**, released as **beta**. It builds for Linux,
+This is **early development**, published as **preview** releases. It builds for Linux,
 Windows and macOS, and the full chain — camera → auto-calibration →
 live POV inside a running VPX — is now **field-validated on a real Linux
 pincab** (Kinect v2, Kinect v1 and webcam, Window view mode). Windows and
@@ -144,10 +145,10 @@ macOS runs are exactly what we need testers for.
 | Piece | State |
 |-------|-------|
 | VPX plugin loads & builds (Linux/Windows/macOS) | ✅ |
-| Kinect v2 capture + head blob | ✅ operational |
+| Kinect v2 capture | ✅ operational |
 | Kinect v1 capture | ✅ |
 | Webcam capture (SDL3) | ✅ |
-| BlazePose head tracking (ONNX, ~7 ms) | ✅ proven on real captures |
+| BlazePose head tracking (ONNX, ~7 ms), on all three backends | ✅ proven on real captures |
 | Standalone demo + fish-tank parallax window | ✅ `headtracking-demo` |
 | Auto-calibration maths (focal + pose) | ✅ validated to ±0–3 % vs tape measure |
 | `anchor` training pipeline (lines → ONNX) | ✅ validated end-to-end |
@@ -179,8 +180,11 @@ training data.
 rails, and their 6 intersection points — the cabinet's reference frame.</sub>
 
 **What gets shared, honestly:** the images show your cabinet and whatever is
-around it — check the preview before accepting. Uploads need no account and carry no identity; each capture has a printed ID you can quote on Discord
-to have it removed. Empty cab or mid-game, day or night, every variation
+around it — check the preview before accepting. Uploads need no account. The diagnostics log sent with a capture includes your
+account name, your computer name and a random install id, so one cabinet can be
+followed from one release to the next; the consent window lists everything before
+you accept. To have a capture removed, quote its file name (shown after upload) on
+Discord. Empty cab or mid-game, day or night, every variation
 helps — captures with **a player standing at the cab** are the rarest and
 most valuable.
 
@@ -220,15 +224,15 @@ git clone --recurse-submodules https://github.com/Le-Syl21/headtracking
 cd headtracking
 
 # Build the plugin (pick your backend)
-cargo build --release --features kinect-v2      # or: all-trackers
+cargo build --release      # all backends (default); one only: --no-default-features --features kinect-v2
 
 # Try the trackers + fish-tank parallax window, no VPX needed
-cargo run --release -p headtracking-demo --features kinect-v2
+cargo run --release -p headtracking-demo
 ```
 
-No user-facing dependencies to install: `libfreenect`, `libfreenect2`,
+No user-facing dependencies to install: `libfreenect`, `libfreenect2`, libusb,
 libjpeg-turbo and the ONNX runtime are vendored and statically linked. You need a
-recent Rust (2024 edition), `cmake`, `libclang` (for bindgen) and `libusb-1.0`.
+recent Rust (2024 edition), `cmake` and `libclang` (for bindgen).
 Full install / VPX config / per-OS Kinect setup: **[`docs/INSTALL.md`](docs/INSTALL.md)**.
 
 ### Install into VPX
@@ -247,12 +251,9 @@ Then in a table press **F12 → Plugin Settings → Head Tracking → Enable**.
 Every setting (gain, smoothing, camera…) is tunable live from that page —
 full walkthrough in [`docs/INSTALL.md`](docs/INSTALL.md).
 
-Don't want to build? Besides the
-[releases](https://github.com/Le-Syl21/headtracking/releases), **every
-commit on `main` uploads fresh dev builds** (plugin + demo, all platforms)
-as artifacts on the
-[Actions tab](https://github.com/Le-Syl21/headtracking/actions/workflows/release.yml)
-— unsigned, GitHub login required.
+Don't want to build? Grab the plugin and the demo from the
+[releases](https://github.com/Le-Syl21/headtracking/releases). A push to
+`main` builds nothing; builds come from release tags.
 
 ## 🗺️ Architecture
 
@@ -319,8 +320,11 @@ C'est tout. La démo envoie un relevé (image couleur + ce que le détecteur a v
 données d'entraînement.
 
 **Ce qui est partagé, honnêtement :** les images montrent votre cab et ce qu'il
-y a autour — vérifiez l'aperçu avant d'accepter. L'envoi ne demande aucun compte et n'embarque aucune identité ; chaque relevé a un identifiant affiché que vous
-pouvez citer sur Discord pour demander sa suppression. Cab vide ou en pleine
+y a autour — vérifiez l'aperçu avant d'accepter. L'envoi ne demande aucun compte. Le journal de diagnostic envoyé avec un relevé
+contient votre nom de compte, le nom de votre ordinateur et un identifiant
+d'installation tiré au hasard, pour suivre un même cab d'une version à l'autre ;
+la fenêtre de consentement liste tout avant que vous acceptiez. Pour faire retirer
+un relevé, citez son nom de fichier (affiché après l'envoi) sur Discord. Cab vide ou en pleine
 partie, jour ou nuit, toute variation aide — les relevés avec **un joueur
 devant le cab** sont les plus rares et les plus précieux.
 
@@ -332,10 +336,11 @@ en une ligne si la machine atteint le serveur.
 
 **Ce qui le rend unique :**
 
-- **Zéro calibration manuelle.** Le cab EST la mire : la lockbar + les 2 rails
+- **Aucune routine de calibration.** Le cab EST la mire : la lockbar + les 2 rails
   latéraux forment un rectangle connu du plateau. Vu en perspective, ça suffit à
   retrouver la focale **et** la pose de la caméra — depuis l'image seule. Pas de
-  mire à damier, pas d'assistant, rien à régler.
+  mire à damier, pas d'assistant : vous saisissez seulement la largeur de votre
+  lockbar et l'inclinaison de l'écran dans VPX.
 - **3D depuis une simple webcam** — pas besoin de capteur de profondeur ; la
   focale récupérée transforme une caméra unique en tracker 3D métrique.
 - **Zéro install côté utilisateur** — un seul binaire plugin, aucun SDK
@@ -378,15 +383,14 @@ webcam, c'est tout l'objet du projet.
 notes dédiées : [🇫🇷 Notes minicab](docs/MINICAB.md#-français) ·
 [🇬🇧 Minicab notes](docs/MINICAB.md#-english).
 
-**État :** début de développement, publié en **beta**. Ça compile pour Linux,
+**État :** début de développement, publié en versions **preview**. Ça compile pour Linux,
 Windows et macOS, et la chaîne complète — caméra → auto-calibration → POV
 live dans VPX — est **validée sur le terrain sur un vrai pincab Linux**
 (Kinect v2, Kinect v1 et webcam, mode Window, réglages live via F12). Les
 retours Windows/macOS sont exactement ce qu'on cherche. Voir le tableau
-d'état plus haut. En bonus : chaque commit sur `main` publie des dev builds
-fraîches (plugin + démo, toutes plateformes) dans l'onglet
-[Actions](https://github.com/Le-Syl21/headtracking/actions/workflows/release.yml)
-— non signées, compte GitHub requis.
+d'état plus haut. Les binaires (plugin + démo) sont sur la page
+[Releases](https://github.com/Le-Syl21/headtracking/releases) : un push sur
+`main` ne compile rien, les builds viennent des tags de release.
 
 > [!CAUTION]
 > ### ⚠️ Utilisateurs Windows + Kinect — à lire AVANT toute installation

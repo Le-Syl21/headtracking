@@ -418,17 +418,16 @@ jobs:
       # no longer — touch them.
 
       # On Windows we ship a `setup/` folder with a one-click setup
-      # script (downloads UsbDk on demand, blocks PnP for Kinect
-      # VID/PIDs, removes existing partial driver bindings). The
-      # signed MSI itself is NOT bundled — Daynix's own GitHub release
-      # is the authoritative source, and the script pulls it from
-      # there at runtime. Other OSes don't need any of this.
+      # script: it removes existing Kinect driver bindings and installs
+      # the bundled WinUSB driver packages for every Kinect VID/PID
+      # (no UsbDk, no Zadig — see docs/INSTALL.md). Other OSes don't
+      # need any of this.
 
       - name: Stage artifacts
         shell: bash
         run: |
           set -euo pipefail
-          # Tag push → the release version; main push / dispatch → a
+          # Tag push → the release version; manual dispatch → a
           # `dev-<shortsha>` marker so testers can tell dev builds apart.
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             version="${GITHUB_REF_NAME#v}"

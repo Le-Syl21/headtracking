@@ -6,10 +6,10 @@
 //!   and pull `msvc/config.h` for the MSVC defines. Side-effects: emits
 //!   `cargo:rustc-link-lib=` for the Win32 system libs libusb pulls in
 //!   (`setupapi`, `advapi32`, `user32`, `ole32`).
-//! - **Linux / macOS**: probe the system copy via `pkg-config`. The
-//!   vendored sources are *not* used here — distros ship a stable
-//!   libusb already, building from source would just diverge from
-//!   what end-users have on their machines.
+//! - **Linux / macOS**: build the same vendored sources statically too
+//!   (NETLINK hot-plug on Linux, no libudev), so the plugin needs no
+//!   system libusb at runtime.
+//! - **Other Unix targets**: probe the system copy via `pkg-config`.
 //!
 //! In both cases we emit three metadata keys consumed by downstream
 //! sys crates:
