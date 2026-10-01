@@ -76,7 +76,7 @@ anchor = { path = "crates/anchor", optional = true }
 libloading = { version = "0.9", optional = true }
 
 [build-dependencies]
-bindgen = "0.72"
+bindgen = "0.73"
 
 [profile.release]
 lto = "thin"
