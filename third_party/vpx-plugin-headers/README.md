@@ -26,8 +26,10 @@ the headers ship at. Until then we refresh manually when upstream
 changes — the headers explicitly warn the API is unstable.
 
 Snapshot: vpinball `master` as of 2026-10-07 (plugin API v1, message
-names suffixed `:1`, since commit `595d1fd` on 2026-09-05). A 10.8.1
-build from before that date will not load this plugin.
+names suffixed `:1`, since commit `595d1fd` on 2026-09-05). Hosts from
+before that date speak the unversioned API, whose headers are frozen in
+`../vpx-plugin-headers-v0/`; the plugin detects which one it is talking
+to at load time (`src/plugin/host_api.rs`).
 
 ## Refreshing
 

@@ -13,10 +13,8 @@ use tracing::{error, info, warn};
 
 use std::time::{Duration, Instant};
 
-use super::messages::{
-    VPXPI_EVT_ON_ACTION_CHANGED, VPXPI_EVT_ON_GAME_END, VPXPI_EVT_ON_GAME_START,
-    VPXPI_EVT_ON_PREPARE_FRAME, VPXPI_MSG_GET_API, VPXPI_NAMESPACE, VPX_API_VERSION,
-};
+use super::host_api::{self, AdoptError};
+use super::messages::VPXPI_NAMESPACE;
 use super::vpx_sys::{
     MsgPluginAPI, VPXAction_VPXACTION_Lockbar, VPXActionEvent, VPXPluginAPI, VPXViewSetupDef,
 };
@@ -159,17 +157,16 @@ pub unsafe extern "C" fn HeadTrackingPluginUnload() {
     }));
 }
 
-unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), LoadError> {
-    // SAFETY: caller guarantees `api_ptr` is valid for at least the duration
-    // of this call (and beyond — the host keeps it live until unload).
+unsafe fn do_load(session_id: u32, host_ptr: *const MsgPluginAPI) -> Result<(), LoadError> {
+    // Pick the API revision from the table itself (see `host_api` for why
+    // that is safe). From here on `api_ptr` is always in the current layout:
+    // the host's own table, or a converted copy of a legacy one.
+    // SAFETY: caller guarantees `host_ptr` is the live non-null host table.
+    let (revision, api_ptr) = unsafe { host_api::adopt_msg_api(host_ptr) }?;
+    info!(api = revision.label(), "VPX plugin API detected");
+    let names = revision.names();
+    // SAFETY: valid for the plugin session (host table or leaked copy).
     let api = unsafe { &*api_ptr };
-
-    // The leading `version` field landed in the same change as the `:1`
-    // message names. Calling through an older table would invoke the wrong
-    // function. Refuse instead.
-    if api.version != VPX_API_VERSION {
-        return Err(LoadError::UnsupportedApiVersion(api.version));
-    }
 
     let get_msg_id = api.GetMsgID.ok_or(LoadError::MissingFunction("GetMsgID"))?;
     let subscribe = api
@@ -183,57 +180,53 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     // SAFETY: `get_msg_id` is a valid C function pointer per the API contract,
     // and the namespace/name pointers are static null-terminated strings.
     let msg_ids = SubscribedMsgs {
-        get_vpx_api: unsafe { get_msg_id(VPXPI_NAMESPACE.as_ptr(), VPXPI_MSG_GET_API.as_ptr()) },
+        get_vpx_api: unsafe { get_msg_id(VPXPI_NAMESPACE.as_ptr(), names.vpx_get_api.as_ptr()) },
         on_game_start: unsafe {
-            get_msg_id(VPXPI_NAMESPACE.as_ptr(), VPXPI_EVT_ON_GAME_START.as_ptr())
+            get_msg_id(VPXPI_NAMESPACE.as_ptr(), names.on_game_start.as_ptr())
         },
-        on_game_end: unsafe {
-            get_msg_id(VPXPI_NAMESPACE.as_ptr(), VPXPI_EVT_ON_GAME_END.as_ptr())
-        },
+        on_game_end: unsafe { get_msg_id(VPXPI_NAMESPACE.as_ptr(), names.on_game_end.as_ptr()) },
         on_prepare_frame: unsafe {
-            get_msg_id(
-                VPXPI_NAMESPACE.as_ptr(),
-                VPXPI_EVT_ON_PREPARE_FRAME.as_ptr(),
-            )
+            get_msg_id(VPXPI_NAMESPACE.as_ptr(), names.on_prepare_frame.as_ptr())
         },
         on_action_changed: unsafe {
-            get_msg_id(
-                VPXPI_NAMESPACE.as_ptr(),
-                VPXPI_EVT_ON_ACTION_CHANGED.as_ptr(),
-            )
+            get_msg_id(VPXPI_NAMESPACE.as_ptr(), names.on_action_changed.as_ptr())
         },
     };
 
     // Resolve the VPXPluginAPI via the GetAPI broadcast — the host responds
     // synchronously by writing the API pointer into our out-parameter.
-    let mut vpx_api: *mut VPXPluginAPI = ptr::null_mut();
-    // SAFETY: BroadcastMsg writes the api pointer into `vpx_api` if a host
-    // is listening on the GetAPI channel.
+    let mut host_vpx_api: *mut c_void = ptr::null_mut();
+    // SAFETY: BroadcastMsg writes the api pointer into `host_vpx_api` if a
+    // host is listening on the GetAPI channel.
     unsafe {
         broadcast(
             session_id,
             msg_ids.get_vpx_api,
-            (&raw mut vpx_api).cast::<c_void>(),
+            (&raw mut host_vpx_api).cast::<c_void>(),
         );
     }
-    if vpx_api.is_null() {
-        return Err(LoadError::NoVpxApi);
-    }
-    // SAFETY: non-null host pointer, live until unload.
-    let vpx_version = unsafe { (*vpx_api).version };
-    if vpx_version != VPX_API_VERSION {
-        // IDs were allocated but nothing was subscribed yet.
-        if let Some(release) = api.ReleaseMsgID {
-            unsafe {
-                release(msg_ids.get_vpx_api);
-                release(msg_ids.on_game_start);
-                release(msg_ids.on_game_end);
-                release(msg_ids.on_prepare_frame);
-                release(msg_ids.on_action_changed);
+    let resolved = if host_vpx_api.is_null() {
+        Err(LoadError::NoVpxApi(revision.label()))
+    } else {
+        // SAFETY: non-null host pointer returned for this revision's name.
+        unsafe { host_api::adopt_vpx_api(revision, host_vpx_api) }.map_err(LoadError::from)
+    };
+    let vpx_api: *mut VPXPluginAPI = match resolved {
+        Ok(p) => p,
+        Err(err) => {
+            // IDs were allocated but nothing was subscribed yet.
+            if let Some(release) = api.ReleaseMsgID {
+                unsafe {
+                    release(msg_ids.get_vpx_api);
+                    release(msg_ids.on_game_start);
+                    release(msg_ids.on_game_end);
+                    release(msg_ids.on_prepare_frame);
+                    release(msg_ids.on_action_changed);
+                }
             }
+            return Err(err);
         }
-        return Err(LoadError::UnsupportedApiVersion(vpx_version));
-    }
+    };
     info!("VPX plugin API resolved");
 
     // Copy the host paths now — the plugin later reads VPinballX.ini
@@ -255,7 +248,7 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     // emitted by the plugin appears in VPX's plugin log panel as well
     // as on stderr. SAFETY: `api` is a live `&MsgPluginAPI` for the
     // duration of the plugin session, see top-of-file contract.
-    unsafe { super::logging::resolve_and_install(api, session_id) };
+    unsafe { super::logging::resolve_and_install(api, session_id, revision) };
 
     // Subscribe to game lifecycle + per-frame hook.
     // SAFETY: callbacks are FFI-safe (extern "C" fn with the documented
@@ -885,7 +878,9 @@ fn host_native_path(p: *const std::ffi::c_char) -> Option<std::path::PathBuf> {
                 .encode_utf16()
                 .collect::<Vec<_>>()
         });
-        return Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(&wide)));
+        return Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            &wide,
+        )));
     }
     #[cfg(not(windows))]
     {
@@ -942,15 +937,10 @@ fn acp_to_wide(bytes: &[u8]) -> Option<Vec<u16>> {
 enum LoadError {
     #[error("MsgPluginAPI is missing required function: {0}")]
     MissingFunction(&'static str),
-    #[error(
-        "host did not expose VPXPluginAPI (no responder for VPX/GetAPI:1 — needs VPX 10.8.1 from 2026-09-05 or newer)"
-    )]
-    NoVpxApi,
-    #[error(
-        "VPX plugin API version {0} is not {expected} — this build only speaks the versioned 10.8.1 dispatch table",
-        expected = VPX_API_VERSION
-    )]
-    UnsupportedApiVersion(i32),
+    #[error("host did not expose VPXPluginAPI (no responder for VPX/GetAPI, {0})")]
+    NoVpxApi(&'static str),
+    #[error("unsupported VPX plugin API: {0}")]
+    Api(#[from] AdoptError),
 }
 
 #[cfg(test)]

@@ -11,6 +11,11 @@ const DEV_PLUGINS_DIR: &str = "../vpinball/plugins/plugins";
 /// vpinball source tree isn't available; refreshed by hand when upstream
 /// changes the API (see that directory's README).
 const VENDORED_PLUGINS_DIR: &str = "third_party/vpx-plugin-headers";
+/// Headers of the last unversioned plugin API (vpinball af26b2d93,
+/// 2026-08-20, the base of the 10.8.1-5436 pre-release). Always vendored:
+/// we only bind the three dispatch tables from them, so the plugin can
+/// still talk to hosts that predate the `:1` message names.
+const LEGACY_PLUGINS_DIR: &str = "third_party/vpx-plugin-headers-v0";
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -45,43 +50,7 @@ fn main() {
         );
     }
 
-    // Parse as C++20, which is what current VPX itself compiles as.
-    // The headers use a self-referential typedef idiom
-    // (`typedef struct Foo { ... Foo* ... } Foo;`) that's only legal in
-    // C++; switching to `-xc` breaks bindgen. C++20 is also required for
-    // ControllerPlugin.h: it defines `operator==` on `CtlResId` and then
-    // writes `a.id != b.id`, which only resolves via C++20's reversed
-    // comparison rewrite. C++17 rejects that and bindgen aborts.
-    let mut builder = bindgen::Builder::default()
-        .header("wrapper.h")
-        .clang_arg(format!("-I{}", plugins_dir.display()))
-        .clang_arg("-xc++")
-        .clang_arg("-std=c++20");
-
-    // macOS bindgen quirk: libclang must be told where libc++ lives,
-    // otherwise <cstddef> resolves to the C SDK <stddef.h> first and
-    // libc++ template parsing falls over. `xcrun --show-sdk-path`
-    // returns the active SDK root; <sysroot>/usr/include/c++/v1 is the
-    // libc++ headers. We also force `-stdlib=libc++` so clang picks
-    // them up.
-    #[cfg(target_os = "macos")]
-    if let Some(sdk) = macos_sdk_path() {
-        builder = builder
-            .clang_arg("-stdlib=libc++")
-            .clang_arg(format!("-isysroot{}", sdk.display()))
-            .clang_arg(format!("-isystem{}/usr/include/c++/v1", sdk.display()));
-    }
-
-    // libclang ships compiler-internal headers (stddef.h, stdarg.h, …) in its
-    // resource directory; on Debian/Ubuntu these only land when the
-    // `libclang-common-*-dev` package (or `clang`) is installed. Without them
-    // any system include that pulls in `stddef.h` fails to parse. Locate the
-    // most appropriate include directory and fall back to GCC's if needed.
-    if let Some(dir) = compiler_resource_include_dir() {
-        builder = builder
-            .clang_arg("-isystem")
-            .clang_arg(dir.to_string_lossy().into_owned());
-    }
+    let builder = base_builder(&plugins_dir).header("wrapper.h");
 
     let bindings = builder
         // Only translate the VPX API we use; let bindgen prune the rest.
@@ -115,6 +84,74 @@ fn main() {
     bindings
         .write_to_file(&out_path)
         .expect("failed to write VPX bindings");
+
+    // Legacy (unversioned) dispatch tables. Only the three structs are
+    // generated; every type they point to (VPXInfo, MsgSettingDef, ...) is
+    // left undefined so `vpx_sys_v0.rs` resolves it to the current
+    // bindings. The compiler then rejects any signature drift between the
+    // two header sets when the tables are converted in `host_api.rs`.
+    let legacy_dir = root.join(LEGACY_PLUGINS_DIR);
+    println!("cargo:rerun-if-changed={}", legacy_dir.display());
+    let mut legacy = base_builder(&legacy_dir);
+    for h in ["MsgPlugin.h", "VPXPlugin.h", "LoggingPlugin.h"] {
+        legacy = legacy.header(legacy_dir.join(h).to_string_lossy().into_owned());
+    }
+    let legacy = legacy
+        .allowlist_type("MsgPluginAPI")
+        .allowlist_type("VPXPluginAPI")
+        .allowlist_type("LoggingPluginAPI")
+        .allowlist_recursively(false)
+        .derive_default(true)
+        .derive_debug(true)
+        // Size/offset asserts computed by clang from the old headers.
+        .layout_tests(true)
+        .generate()
+        .expect("bindgen failed for legacy VPX plugin headers");
+    legacy
+        .write_to_file(PathBuf::from(env::var("OUT_DIR").unwrap()).join("vpx_bindings_v0.rs"))
+        .expect("failed to write legacy VPX bindings");
+}
+
+/// Common clang setup for both header sets.
+fn base_builder(include_dir: &Path) -> bindgen::Builder {
+    // Parse as C++20, which is what current VPX itself compiles as.
+    // The headers use a self-referential typedef idiom
+    // (`typedef struct Foo { ... Foo* ... } Foo;`) that's only legal in
+    // C++; switching to `-xc` breaks bindgen. C++20 is also required for
+    // ControllerPlugin.h: it defines `operator==` on `CtlResId` and then
+    // writes `a.id != b.id`, which only resolves via C++20's reversed
+    // comparison rewrite. C++17 rejects that and bindgen aborts.
+    #[allow(unused_mut)]
+    let mut builder = bindgen::Builder::default()
+        .clang_arg(format!("-I{}", include_dir.display()))
+        .clang_arg("-xc++")
+        .clang_arg("-std=c++20");
+
+    // macOS bindgen quirk: libclang must be told where libc++ lives,
+    // otherwise <cstddef> resolves to the C SDK <stddef.h> first and
+    // libc++ template parsing falls over. `xcrun --show-sdk-path`
+    // returns the active SDK root; <sysroot>/usr/include/c++/v1 is the
+    // libc++ headers. We also force `-stdlib=libc++` so clang picks
+    // them up.
+    #[cfg(target_os = "macos")]
+    if let Some(sdk) = macos_sdk_path() {
+        builder = builder
+            .clang_arg("-stdlib=libc++")
+            .clang_arg(format!("-isysroot{}", sdk.display()))
+            .clang_arg(format!("-isystem{}/usr/include/c++/v1", sdk.display()));
+    }
+
+    // libclang ships compiler-internal headers (stddef.h, stdarg.h, …) in its
+    // resource directory; on Debian/Ubuntu these only land when the
+    // `libclang-common-*-dev` package (or `clang`) is installed. Without them
+    // any system include that pulls in `stddef.h` fails to parse. Locate the
+    // most appropriate include directory and fall back to GCC's if needed.
+    if let Some(dir) = compiler_resource_include_dir() {
+        builder = builder
+            .clang_arg("-isystem")
+            .clang_arg(dir.to_string_lossy().into_owned());
+    }
+    builder
 }
 
 /// Find a directory containing `stddef.h` that we can hand to clang via

@@ -1,6 +1,7 @@
 //! Bridge from `tracing` to VPX's `LoggingPluginAPI`.
 //!
-//! At PluginLoad we broadcast `Login/GetAPI:1` (the upstream typo —
+//! At PluginLoad we broadcast `Login/GetAPI:1` (`Login/GetAPI` on hosts
+//! older than 2026-09-05; the upstream typo —
 //! `LOGPI_NAMESPACE = "Login"` per `LoggingPlugin.h:19`) and store the
 //! returned `LoggingPluginAPI*` in an `AtomicPtr`. Every `tracing`
 //! event we emit then runs through [`VpxLogLayer`], which reads the
@@ -173,6 +174,7 @@ impl tracing::field::Visit for MessageVisitor<'_> {
 pub unsafe fn resolve_and_install(
     msg_api: &crate::plugin::vpx_sys::MsgPluginAPI,
     endpoint_id: u32,
+    host_api: crate::plugin::host_api::HostApi,
 ) {
     let Some(get_msg_id) = msg_api.GetMsgID else {
         return;
@@ -184,10 +186,10 @@ pub unsafe fn resolve_and_install(
     let id = unsafe {
         get_msg_id(
             crate::plugin::messages::LOGPI_NAMESPACE.as_ptr(),
-            crate::plugin::messages::LOGPI_MSG_GET_API.as_ptr(),
+            host_api.names().log_get_api.as_ptr(),
         )
     };
-    let mut api: *mut LoggingPluginAPI = ptr::null_mut();
+    let mut api: *mut std::ffi::c_void = ptr::null_mut();
     // SAFETY: BroadcastMsg writes the API pointer into our out-param
     // if a host endpoint is registered on Login/GetAPI; otherwise the
     // pointer stays null.
@@ -197,15 +199,11 @@ pub unsafe fn resolve_and_install(
     if api.is_null() {
         return;
     }
-    // SAFETY: BroadcastMsg just published a live host pointer.
-    let version = unsafe { (*api).version };
-    if version == crate::plugin::messages::VPX_API_VERSION {
-        install(api);
-    } else {
-        tracing::warn!(
-            version,
-            "LoggingPluginAPI version mismatch; VPX console bridge left disabled"
-        );
+    // SAFETY: BroadcastMsg just published a live host pointer for this
+    // revision's name.
+    match unsafe { crate::plugin::host_api::adopt_logging_api(host_api, api) } {
+        Ok(api) => install(api),
+        Err(err) => tracing::warn!(%err, "VPX console bridge left disabled"),
     }
     // We don't ReleaseMsgID for getLoggingApiId here: the upstream
     // pattern (LPI_IMPLEMENT_CPP) does it, but the id is cheap and
