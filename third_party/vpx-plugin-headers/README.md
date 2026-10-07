@@ -25,6 +25,10 @@ When VPX's plugin API stabilises, we'll switch to whichever release tag
 the headers ship at. Until then we refresh manually when upstream
 changes — the headers explicitly warn the API is unstable.
 
+Snapshot: vpinball `master` as of 2026-10-07 (plugin API v1, message
+names suffixed `:1`, since commit `595d1fd` on 2026-09-05). A 10.8.1
+build from before that date will not load this plugin.
+
 ## Refreshing
 
 ```sh

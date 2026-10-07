@@ -30,18 +30,18 @@
 #define VPXPI_NAMESPACE "VPX" // Namespace used for all VPX message definition
 
 // Core VPX messages
-#define VPXPI_MSG_GET_API               "GetAPI"              // Get the main VPX plugin API
+#define VPXPI_MSG_GET_API               "GetAPI:1"              // Get the main VPX plugin API
 
 // Core VPX events
-#define VPXPI_EVT_ON_GAME_START         "OnGameStart"         // Broadcasted during player creation, before script initialization
-#define VPXPI_EVT_ON_GAME_END           "OnGameEnd"           // Broadcasted during player shutdown
-#define VPXPI_EVT_ON_PREPARE_FRAME      "OnPrepareFrame"      // Broadcasted when player starts preparing a new frame
-#define VPXPI_EVT_ON_UPDATE_PHYSICS     "OnUpdatePhysics"     // Broadcasted when player update physics (happens often, so must be used with care)
-#define VPXPI_EVT_ON_ACTION_CHANGED     "OnActionChanged"     // Broadcasted when an action state change, event data is an VPXActionEvent whose isPressed field can be modified by plugins
+#define VPXPI_EVT_ON_GAME_START         "OnGameStart:1"         // Broadcasted during player creation, before script initialization
+#define VPXPI_EVT_ON_GAME_END           "OnGameEnd:1"           // Broadcasted during player shutdown
+#define VPXPI_EVT_ON_PREPARE_FRAME      "OnPrepareFrame:1"      // Broadcasted when player starts preparing a new frame
+#define VPXPI_EVT_ON_UPDATE_PHYSICS     "OnUpdatePhysics:1"     // Broadcasted when player update physics (happens often, so must be used with care)
+#define VPXPI_EVT_ON_ACTION_CHANGED     "OnActionChanged:1"     // Broadcasted when an action state change, event data is an VPXActionEvent whose isPressed field can be modified by plugins
 
 // Ancillary window rendering
-#define VPXPI_MSG_GET_AUX_RENDERER      "GetAuxRenderer"      // Broadcasted with a GetAncillaryRendererMsg to discover ancillary window renderer implemented in plugins
-#define VPXPI_EVT_AUX_RENDERER_CHG      "AuxRendererChanged"  // Broadcasted when an ancillary renderer is added or removed
+#define VPXPI_MSG_GET_AUX_RENDERER      "GetAuxRenderer:1"      // Broadcasted with a GetAncillaryRendererMsg to discover ancillary window renderer implemented in plugins
+#define VPXPI_EVT_AUX_RENDERER_CHG      "AuxRendererChanged:1"  // Broadcasted when an ancillary renderer is added or removed
 
 typedef void* VPXTexture;
 
@@ -174,15 +174,18 @@ typedef struct GetAncillaryRendererMsg
 #define VPUTOINCHES(x) ((x) * (float)(1.0625 / 50.))
 #endif
 
+// VPXInfo and VPXTableInfo paths are native narrow, unlike the other API strings (UTF-8): with MSVC the process code page (legacy
+// ANSI, or UTF-8 since Windows 10 1903) with '_' for characters it lacks, UTF-8 elsewhere. Convert them with PluginStrings::PathFromNative,
+// which also accepts nullptr (VPXTableInfo::path outside of play). VPX owns them until the next call: copy them
 typedef struct VPXInfo
 {
-   const char* path;              // [R_]
-   const char* prefPath;          // [R_]
+   const char* path;              // [R_] Application folder (native narrow path)
+   const char* prefPath;          // [R_] Preferences folder (native narrow path)
 } VPXInfo;
 
 typedef struct VPXTableInfo
 {
-   const char* path;              // [R_]
+   const char* path;              // [R_] Table file (native narrow path), or nullptr
    float tableWidth, tableHeight; // [R_]
 } VPXTableInfo;
 
@@ -255,27 +258,35 @@ typedef struct VPXInputState
 
 typedef struct VPXPluginAPI
 {
-   // General information API
+   int version; // Must be 1. Included to allow extending the API with new functions at a later point in time
+
+   // --- General information API
    void (MSGPIAPI *GetVpxInfo)(VPXInfo* info);
    void (MSGPIAPI *GetTableInfo)(VPXTableInfo* info);
 
-   // User Interface
+   // --- User Interface
    unsigned int (MSGPIAPI *PushNotification)(const char* msg, const int lengthMs);
    void (MSGPIAPI *UpdateNotification)(const unsigned int handle, const char* msg, const int lengthMs);
 
-   // View management
+   // --- View management
    void (MSGPIAPI *DisableStaticPrerendering)(const int /* bool */ disable);
    void (MSGPIAPI *GetActiveViewSetup)(VPXViewSetupDef* view);
    void (MSGPIAPI *SetActiveViewSetup)(VPXViewSetupDef* view);
 
-   // Input management
+   // --- Input management
+   // GetInputState: actionMask and stateMask are request masks selecting which fields are filled in (unsupported action bits are cleared)
+   // SetInputState: actionMask and stateMask select which inputs are driven by the plugin. Action bits in actionMask are applied
+   //                from actionState as direct states. Plunger (bits 0 & 1) and nudge (bit 2) overrides are enabled while the
+   //                corresponding bit is set, and released back to local sensors when cleared. Plunger position/velocity are
+   //                expressed relative to the full plunger range (0 = rest position, 1 = fully retracted), nudge acceleration
+   //                in m/s^2 and nudge displacement in m.
    void(MSGPIAPI* GetInputState)(VPXInputState* state);
    void(MSGPIAPI* SetInputState)(VPXInputState* state);
 
-   // Game state
+   // --- Game state
    double(MSGPIAPI* GetGameTime)(); // Game time in seconds
 
-   // Rendering
+   // --- Rendering
    
    // Create a texture from encoded data (Webp, Exr, ...).
    // Texture must be destroyed by the caller using DeleteTexture.
@@ -294,5 +305,8 @@ typedef struct VPXPluginAPI
    // Destroy a texture created through this API.
    // Thread safe
    void(MSGPIAPI* DeleteTexture)(VPXTexture texture);
+
+   // --- Scripting
+   void(MSGPIAPI* RunScript)(const char* script);
 
 } VPXPluginAPI;

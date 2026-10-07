@@ -121,7 +121,7 @@ Plugin de **head tracking temps réel pour Visual Pinball X (VPX) 10.8.1+** qui 
 ### 3.2bis API VPX cible (depuis l'audit des sources)
 
 - **Subscribe à** `VPX/OnPrepareFrame` pour modifier la POV chaque frame, plus `VPX/OnGameStart` / `VPX/OnGameEnd` pour le cycle de vie.
-- **Récupérer `VPXPluginAPI`** via `BroadcastMsg(endpoint, GetMsgID("VPX","GetAPI"), &mut ptr)` au load. Le host répond synchroniquement.
+- **Récupérer `VPXPluginAPI`** via `BroadcastMsg(endpoint, GetMsgID("VPX","GetAPI:1"), &mut ptr)` au load. Le host répond synchroniquement. Les noms de message portent le suffixe `:1` depuis vpinball `595d1fd` (2026-09-05) ; la table de dispatch commence par `version == 1`.
 - **Modifier la caméra** : `vpxApi->GetActiveViewSetup(&view)` puis muter `view.viewX/viewY/viewZ` (RW), puis `vpxApi->SetActiveViewSetup(&view)`.
 - **Mode VPX recommandé** pour head tracking : `VLM_CAMERA` (position relative au centre bas de la table). `VLM_WINDOW` est aussi conçu pour ça mais moins testé côté upstream.
 - **Threading** : tous les appels API sont attendus sur le thread principal (assertion côté VPX). Le tracker tourne sur son propre thread et publie via `ArcSwap<Pose>` ; le callback `OnPrepareFrame` (sur main thread) lit sans bloquer. Pour marshaller l'inverse il y a `MsgPluginAPI::RunOnMainThread`.
