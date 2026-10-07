@@ -114,6 +114,11 @@ fn main() {
     // the paths, pass them straight through rather than relying on a CMake
     // policy to resolve `OpenCL_ROOT` inside a project whose
     // `cmake_minimum_required` predates it.
+    // These are optional. Without the rerun lines, a later build that
+    // finally has the loader keeps the CPU-only cmake result from the
+    // first configure.
+    println!("cargo:rerun-if-env-changed=HT_OPENCL_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=HT_OPENCL_LIBRARY");
     if let Ok(dir) = env::var("HT_OPENCL_INCLUDE_DIR") {
         config.define("OpenCL_INCLUDE_DIR", &dir);
     }

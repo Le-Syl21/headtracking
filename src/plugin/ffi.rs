@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::messages::{
     VPXPI_EVT_ON_ACTION_CHANGED, VPXPI_EVT_ON_GAME_END, VPXPI_EVT_ON_GAME_START,
-    VPXPI_EVT_ON_PREPARE_FRAME, VPXPI_MSG_GET_API, VPXPI_NAMESPACE,
+    VPXPI_EVT_ON_PREPARE_FRAME, VPXPI_MSG_GET_API, VPXPI_NAMESPACE, VPX_API_VERSION,
 };
 use super::vpx_sys::{
     MsgPluginAPI, VPXAction_VPXACTION_Lockbar, VPXActionEvent, VPXPluginAPI, VPXViewSetupDef,
@@ -164,6 +164,13 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     // of this call (and beyond — the host keeps it live until unload).
     let api = unsafe { &*api_ptr };
 
+    // The leading `version` field landed in the same change as the `:1`
+    // message names. Calling through an older table would invoke the wrong
+    // function. Refuse instead.
+    if api.version != VPX_API_VERSION {
+        return Err(LoadError::UnsupportedApiVersion(api.version));
+    }
+
     let get_msg_id = api.GetMsgID.ok_or(LoadError::MissingFunction("GetMsgID"))?;
     let subscribe = api
         .SubscribeMsg
@@ -212,28 +219,34 @@ unsafe fn do_load(session_id: u32, api_ptr: *const MsgPluginAPI) -> Result<(), L
     if vpx_api.is_null() {
         return Err(LoadError::NoVpxApi);
     }
+    // SAFETY: non-null host pointer, live until unload.
+    let vpx_version = unsafe { (*vpx_api).version };
+    if vpx_version != VPX_API_VERSION {
+        // IDs were allocated but nothing was subscribed yet.
+        if let Some(release) = api.ReleaseMsgID {
+            unsafe {
+                release(msg_ids.get_vpx_api);
+                release(msg_ids.on_game_start);
+                release(msg_ids.on_game_end);
+                release(msg_ids.on_prepare_frame);
+                release(msg_ids.on_action_changed);
+            }
+        }
+        return Err(LoadError::UnsupportedApiVersion(vpx_version));
+    }
     info!("VPX plugin API resolved");
 
     // Copy the host paths now — the plugin later reads VPinballX.ini
-    // (cabinet lockbar geometry) from them.
+    // (cabinet lockbar geometry) from them. VPX 10.8.1 (b2fa07b, 2026-10-03)
+    // documents these as native narrow paths, not UTF-8.
     let pref_path = {
         let mut info = super::vpx_sys::VPXInfo::default();
         // SAFETY: vpx_api verified non-null; `info` is a valid out-pointer.
         if let Some(get_info) = unsafe { (*vpx_api).GetVpxInfo } {
             unsafe { get_info(&raw mut info) };
         }
-        let to_path = |p: *const std::ffi::c_char| {
-            if p.is_null() {
-                None
-            } else {
-                // SAFETY: host guarantees a NUL-terminated string for the
-                // duration of the call; we copy it right away.
-                let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
-                (!s.is_empty()).then(|| std::path::PathBuf::from(s.into_owned()))
-            }
-        };
         let _ = info.path; // install path: nothing reads it today
-        to_path(info.prefPath)
+        host_native_path(info.prefPath)
     };
     info!(?pref_path, "host preference path");
 
@@ -850,17 +863,109 @@ fn init_tracing_once() {
     });
 }
 
+/// Decode a VPX path (`VPXInfo::path` / `prefPath`, `VPXTableInfo::path`).
+///
+/// The host owns the pointer only until the next API call. On Windows the
+/// bytes are the process ANSI code page (UTF-8 when the process code page
+/// is 65001). Everywhere else they are already a filesystem path.
+fn host_native_path(p: *const std::ffi::c_char) -> Option<std::path::PathBuf> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: host guarantees a NUL-terminated string for this call.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let wide = acp_to_wide(bytes).unwrap_or_else(|| {
+            String::from_utf8_lossy(bytes)
+                .encode_utf16()
+                .collect::<Vec<_>>()
+        });
+        return Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(&wide)));
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+}
+
+/// Process ANSI code page → UTF-16. `dwFlags` stays 0: `MB_ERR_INVALID_CHARS`
+/// is illegal for the legacy ANSI pages and makes the call fail.
+#[cfg(windows)]
+fn acp_to_wide(bytes: &[u8]) -> Option<Vec<u16>> {
+    unsafe extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            mb: *const u8,
+            mb_len: i32,
+            wide: *mut u16,
+            wide_len: i32,
+        ) -> i32;
+    }
+    const CP_ACP: u32 = 0;
+    unsafe {
+        let n = MultiByteToWideChar(
+            CP_ACP,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            ptr::null_mut(),
+            0,
+        );
+        if n <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; n as usize];
+        let n2 = MultiByteToWideChar(
+            CP_ACP,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            n,
+        );
+        if n2 <= 0 {
+            return None;
+        }
+        wide.truncate(n2 as usize);
+        Some(wide)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum LoadError {
     #[error("MsgPluginAPI is missing required function: {0}")]
     MissingFunction(&'static str),
-    #[error("host did not expose VPXPluginAPI (no responder for VPX/GetAPI)")]
+    #[error(
+        "host did not expose VPXPluginAPI (no responder for VPX/GetAPI:1 — needs VPX 10.8.1 from 2026-09-05 or newer)"
+    )]
     NoVpxApi,
+    #[error(
+        "VPX plugin API version {0} is not {expected} — this build only speaks the versioned 10.8.1 dispatch table",
+        expected = VPX_API_VERSION
+    )]
+    UnsupportedApiVersion(i32),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TrackingFault, fault_note};
+    use super::{TrackingFault, fault_note, host_native_path};
+
+    #[test]
+    fn host_native_path_keeps_an_ascii_pref_path() {
+        let raw = c"C:\\Users\\player\\AppData\\Roaming\\VPinballX\\10.8\\";
+        let path = host_native_path(raw.as_ptr()).expect("path");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(r"C:\Users\player\AppData\Roaming\VPinballX\10.8\")
+        );
+    }
 
     /// Every cause must have wording a player can act on. `fault_note`
     /// matches exhaustively, so a new variant cannot compile without one —

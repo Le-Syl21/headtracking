@@ -45,14 +45,18 @@ fn main() {
         );
     }
 
-    // Parse as C++17. The VPX headers use a self-referential typedef
-    // idiom (`typedef struct Foo { ... Foo* ... } Foo;`) that's only
-    // legal in C++; switching to `-xc` breaks bindgen.
+    // Parse as C++20, which is what current VPX itself compiles as.
+    // The headers use a self-referential typedef idiom
+    // (`typedef struct Foo { ... Foo* ... } Foo;`) that's only legal in
+    // C++; switching to `-xc` breaks bindgen. C++20 is also required for
+    // ControllerPlugin.h: it defines `operator==` on `CtlResId` and then
+    // writes `a.id != b.id`, which only resolves via C++20's reversed
+    // comparison rewrite. C++17 rejects that and bindgen aborts.
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", plugins_dir.display()))
         .clang_arg("-xc++")
-        .clang_arg("-std=c++17");
+        .clang_arg("-std=c++20");
 
     // macOS bindgen quirk: libclang must be told where libc++ lives,
     // otherwise <cstddef> resolves to the C SDK <stddef.h> first and

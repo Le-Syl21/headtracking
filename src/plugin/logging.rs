@@ -1,6 +1,6 @@
 //! Bridge from `tracing` to VPX's `LoggingPluginAPI`.
 //!
-//! At PluginLoad we broadcast `Login/GetAPI` (the upstream typo —
+//! At PluginLoad we broadcast `Login/GetAPI:1` (the upstream typo —
 //! `LOGPI_NAMESPACE = "Login"` per `LoggingPlugin.h:19`) and store the
 //! returned `LoggingPluginAPI*` in an `AtomicPtr`. Every `tracing`
 //! event we emit then runs through [`VpxLogLayer`], which reads the
@@ -194,8 +194,18 @@ pub unsafe fn resolve_and_install(
     unsafe {
         broadcast(endpoint_id, id, (&raw mut api).cast());
     }
-    if !api.is_null() {
+    if api.is_null() {
+        return;
+    }
+    // SAFETY: BroadcastMsg just published a live host pointer.
+    let version = unsafe { (*api).version };
+    if version == crate::plugin::messages::VPX_API_VERSION {
         install(api);
+    } else {
+        tracing::warn!(
+            version,
+            "LoggingPluginAPI version mismatch; VPX console bridge left disabled"
+        );
     }
     // We don't ReleaseMsgID for getLoggingApiId here: the upstream
     // pattern (LPI_IMPLEMENT_CPP) does it, but the id is cheap and
