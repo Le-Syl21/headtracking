@@ -25,9 +25,9 @@ nalgebra = "0.35"
 # raw_input before egui sees it and the tessellated primitives before the
 # paint — a seam eframe doesn't expose. Needed for the physically-rotated
 # pincab display (270° default, ⟳ button cycles 90°).
-egui = "0.36"
-egui_glow = "0.36"
-egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui = "0.37"
+egui_glow = "0.37"
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 egui-rotate = { version = "3.1", features = ["software-cursor", "inspection"] }
 glutin = "0.32"
 glutin-winit = "0.5"
@@ -59,7 +59,7 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # which hid the Kinect v2's CPU depth pipeline saturating on Windows.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 nusb = "0.2.7"
-egui_extras = "0.36"
+egui_extras = "0.37"
 
 [build-dependencies]
 # Embeds assets/icon.ico as the .exe icon on Windows; inert elsewhere.
