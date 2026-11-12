@@ -11,7 +11,7 @@ publish = false
 # binary stays free of runtime application deps (matches our libfreenect /
 # libfreenect2 / libjpeg-turbo strategy). `sdl-camera` enables the
 # `SDL_OpenCamera` / `SDL_AcquireCameraFrame` family.
-sdl3-sys = { version = "0.6", default-features = false, features = [
+sdl3-sys = { version = "0.7", default-features = false, features = [
     "build-from-source-static",
     "sdl-camera",
     "sdl-video",
