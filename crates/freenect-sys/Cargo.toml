@@ -15,7 +15,7 @@ publish = false
 libusb-sys = { path = "../libusb-sys" }
 
 [build-dependencies]
-bindgen = "0.72"
+bindgen = "0.73"
 cmake = "0.1"
 
 # libusb-sys is a build-time *link* dependency: build.rs reads its
