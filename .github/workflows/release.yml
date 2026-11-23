@@ -56,7 +56,7 @@ jobs:
   # on its own. A gate nothing triggers is not a gate.
   check:
     name: fmt + clippy + tests
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -116,7 +116,7 @@ jobs:
   # as the fallback for local builds.
   fetch-models:
     name: Fetch ONNX models (shared)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
 
@@ -171,17 +171,17 @@ jobs:
       matrix:
         include:
           - suffix: linux-x86_64
-            os: ubuntu-24.04
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             plugin_lib: libheadtracking.so
             demo_bin: headtracking-demo
             archive: tar.gz
 
-          # GitHub started offering free `ubuntu-24.04-arm` runners for
+          # GitHub started offering free `ubuntu-22.04-arm` runners for
           # public repos late 2024 — native ARM Linux removes the whole
           # cross-compile / Docker container song-and-dance.
           - suffix: linux-aarch64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             plugin_lib: libheadtracking.so
             demo_bin: headtracking-demo
@@ -679,7 +679,7 @@ jobs:
     name: Sign Windows binaries
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     environment: signing
     steps:
       - name: Install ssign (prebuilt binary from the latest release)
@@ -807,7 +807,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [build, sign-windows, sign-apple]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     # Only publish on a real tag push AND only if every matrix target
     # built. `workflow_dispatch` runs are dry-runs (no tag, no
     # publish). Removing the `if: always()` ensures we never ship a
